@@ -1,0 +1,1776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 2 — Data ingestion</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 2 &middot; 5 days</p>
+    <h1><span class="grad">Data ingestion</span>: from arXiv to your database, every weekday</h1>
+    <p class="lede">
+      A RAG system is only as good as the documents it can retrieve. This module builds the pipeline that gets them:
+      an arXiv API client with rate limiting and retries, PDF parsing with Docling, a concurrent orchestrator that stores
+      everything through your repository, and an Airflow DAG that runs it on a schedule. By the end, real papers from
+      yesterday are in your Postgres.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: the arXiv API and XML</span>
+      <span class="pill">Day 2: rate limits, retries, downloads</span>
+      <span class="pill">Day 3: PDF parsing with Docling</span>
+      <span class="pill">Day 4: the concurrent pipeline</span>
+      <span class="pill">Day 5: Airflow</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 2</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: The arXiv API, Atom XML, and the client</a></li>
+      <li><a href="#day2">Day 2: Rate limiting, retries with backoff, and PDF downloads</a></li>
+      <li><a href="#day3">Day 3: PDF parsing with Docling</a></li>
+      <li><a href="#day4">Day 4: The metadata fetcher: concurrency and per-paper errors</a></li>
+      <li><a href="#day5">Day 5: Airflow: running the pipeline on a schedule</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 3</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>Scope of this module</b>
+    You'll write <code>src/services/arxiv/</code>, <code>src/services/pdf_parser/</code>, <code>src/services/metadata_fetcher.py</code>,
+    their schemas, and the Airflow folder. The reference DAG also indexes into OpenSearch; you'll leave that out until Modules 3 and 4, and
+    I'll say exactly where. Your API from Module 1 doesn't change this module.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>The arXiv API, Atom XML, and the client</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    arXiv is where AI papers appear first. Its API is free, old, and strict: it answers in XML, not JSON, and asks you to
+    wait 3 seconds between requests. Every paper your RAG system will ever cite enters through this client, so it has to parse
+    reliably and fail loudly.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>The query</h4>
+  <p>One GET request to <code>https://export.arxiv.org/api/query</code> with these query parameters:</p>
+  <table class="plain">
+    <tr><th>Parameter</th><th>Example</th><th>Meaning</th></tr>
+    <tr><td><code>search_query</code></td><td><code>cat:cs.AI AND submittedDate:[202609290000 TO 202609292359]</code></td><td>Category cs.AI, submitted on 29 Sept 2026 (dates as YYYYMMDDHHMM)</td></tr>
+    <tr><td><code>start</code>, <code>max_results</code></td><td><code>0</code>, <code>15</code></td><td>Pagination</td></tr>
+    <tr><td><code>sortBy</code>, <code>sortOrder</code></td><td><code>submittedDate</code>, <code>descending</code></td><td>Newest first</td></tr>
+  </table>
+  <h4>Atom XML and namespaces</h4>
+  <p>
+    The answer is an <b>Atom feed</b>: XML with one <code>&lt;entry&gt;</code> per paper. XML <b>namespaces</b> let one document mix tag
+    vocabularies without name clashes: <code>xmlns="http://www.w3.org/2005/Atom"</code> makes plain tags like <code>&lt;title&gt;</code> Atom
+    tags, and <code>xmlns:arxiv="..."</code> means <code>&lt;arxiv:primary_category&gt;</code> belongs to arXiv's own vocabulary. When you search
+    with Python's <code>xml.etree.ElementTree</code>, you must say which namespace you mean: <code>entry.find("atom:title", namespaces)</code>
+    with <code>namespaces = {"atom": "http://www.w3.org/2005/Atom", ...}</code>. Forgetting this is the classic "why does <code>find</code> return
+    <code>None</code>?" bug.
+  </p>
+  <p>This is a real entry, fetched this morning (trimmed):</p>
+  <pre><code>&lt;feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom"&gt;
+  &lt;opensearch:totalResults&gt;203292&lt;/opensearch:totalResults&gt;
+  &lt;entry&gt;
+    &lt;id&gt;http://arxiv.org/abs/2609.38178v1&lt;/id&gt;
+    &lt;title&gt;Skill-Space Shooting for Autonomous Robot Policy Improvement&lt;/title&gt;
+    &lt;link href="https://arxiv.org/abs/2609.38178v1" rel="alternate" type="text/html"/&gt;
+    &lt;link href="https://arxiv.org/pdf/2609.38178v1" rel="related" type="application/pdf" title="pdf"/&gt;
+    &lt;summary&gt;Robots deployed in the physical world must be able to improve ...&lt;/summary&gt;
+    &lt;category term="cs.RO" scheme="http://arxiv.org/schemas/atom"/&gt;
+    &lt;category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/&gt;
+    &lt;published&gt;2026-09-29T17:59:55Z&lt;/published&gt;
+    &lt;arxiv:primary_category term="cs.RO"/&gt;
+    &lt;author&gt;&lt;name&gt;Zihang Rui&lt;/name&gt;&lt;/author&gt;
+  &lt;/entry&gt;
+&lt;/feed&gt;</code></pre>
+  <p>
+    Notice: the ID is the last part of a URL, and it keeps the <b>version suffix</b> (<code>v1</code>). That's what ends up in your
+    database, and why Module 0's <code>base_arxiv_id</code> exists. Categories are attributes (<code>term="..."</code>), not text. The PDF is
+    the <code>&lt;link&gt;</code> with <code>type="application/pdf"</code>.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/config.py</b> &middot; <code>ArxivSettings</code></p>
+  <pre><code>class ArxivSettings(BaseConfigSettings):
+    model_config = SettingsConfigDict(
+        env_file=[".env", str(ENV_FILE_PATH)],
+        env_prefix="ARXIV__",
+        extra="ignore",
+        frozen=True,
+        case_sensitive=False,
+    )
+
+    base_url: str = "https://export.arxiv.org/api/query"
+    pdf_cache_dir: str = "./data/arxiv_pdfs"
+    rate_limit_delay: float = 3.0
+    timeout_seconds: int = 30
+    max_results: int = 15
+    search_category: str = "cs.AI"
+    download_max_retries: int = 3
+    download_retry_delay_base: float = 5.0
+    max_concurrent_downloads: int = 5
+    max_concurrent_parsing: int = 1
+
+    namespaces: dict = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+
+    @field_validator("pdf_cache_dir")
+    @classmethod
+    def validate_cache_dir(cls, v: str) -&gt; str:
+        os.makedirs(v, exist_ok=True)
+        return v</code></pre>
+  <p>
+    Every knob of the pipeline, overridable with <code>ARXIV__...</code> variables. The validator has a side effect: creating settings
+    creates the PDF folder, even in tests. <code>Settings</code> gets <code>arxiv: ArxivSettings = Field(default_factory=ArxivSettings)</code>.
+    Subtle point: that nested class reads its <b>own</b> <code>.env</code>, so <code>Settings(_env_file=None)</code> does not stop
+    <code>ARXIV__</code> lines in <code>.env</code> reaching <code>settings.arxiv</code>.
+  </p>
+
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; <code>fetch_papers</code>, building the URL</p>
+  <table class="walk">
+    <tr><td><pre><code>def __init__(self, settings: ArxivSettings):
+    self._settings = settings
+    self._last_request_time: Optional[float] = None</code></pre></td>
+      <td>The client keeps its settings and remembers when it last called arXiv (Day 2). Read-only <code>@property</code> methods below expose <code>base_url</code>, <code>max_results</code>, <code>search_category</code>, and friends.</td></tr>
+    <tr><td><pre><code>if max_results is None:
+    max_results = self.max_results
+
+search_query = f"cat:{self.search_category}"</code></pre></td>
+      <td>Defaults from settings; the base query is the category.</td></tr>
+    <tr><td><pre><code>if from_date or to_date:
+    date_from = f"{from_date}0000" if from_date else "*"
+    date_to = f"{to_date}2359" if to_date else "*"
+    search_query += f" AND submittedDate:[{date_from}+TO+{date_to}]"</code></pre></td>
+      <td>Dates arrive as <code>YYYYMMDD</code>; the client adds start-of-day and end-of-day times. <code>*</code> means "open-ended". The <code>+</code> signs are URL-speak for spaces.</td></tr>
+    <tr><td><pre><code>params = {
+    "search_query": search_query,
+    "start": start,
+    "max_results": min(max_results, 2000),
+    "sortBy": sort_by,
+    "sortOrder": sort_order,
+}
+safe = ":+[]"
+url = f"{self.base_url}?{urlencode(params, quote_via=quote, safe=safe)}"</code></pre></td>
+      <td>arXiv caps a page at 2000. <code>urlencode</code> builds <code>a=1&amp;b=2</code>, percent-encoding special characters; <code>safe</code> leaves <code>: + [ ]</code> alone because arXiv's query syntax needs them literally. Spaces become <code>%20</code>.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; <code>fetch_papers</code>, the request and errors</p>
+  <table class="walk">
+    <tr><td><pre><code>async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+    response = await client.get(url)
+    response.raise_for_status()
+    xml_data = response.text
+
+papers = self._parse_response(xml_data)</code></pre></td>
+      <td>An async HTTP call with a timeout, exactly your Module 0 <code>fetch_health</code>. <code>raise_for_status()</code> turns 4xx/5xx into an exception.</td></tr>
+    <tr><td><pre><code>except httpx.TimeoutException as e:
+    raise ArxivAPITimeoutError(f"arXiv API request timed out: {e}")
+except httpx.HTTPStatusError as e:
+    raise ArxivAPIException(f"arXiv API returned error {e.response.status_code}: {e}")
+except Exception as e:
+    raise ArxivAPIException(f"Unexpected error fetching papers from arXiv: {e}")</code></pre></td>
+      <td>Translate library errors into the project's own exceptions (defined in <code>src/exceptions.py</code>), so callers don't need to know about httpx. Watch the last line: it catches <b>everything</b>, including the <code>ArxivParseError</code> raised by parsing, and re-wraps it as a plain <code>ArxivAPIException</code>. The specific type is lost. One of your tests pins this behaviour down.</td></tr>
+  </table>
+  <p>
+    <code>fetch_papers_with_query</code> and <code>fetch_paper_by_id</code> repeat the same shape with a custom query or an
+    <code>id_list</code>. (<code>fetch_paper_by_id</code> strips the version with <code>arxiv_id.split("v")[0]</code> and forgets the timeout.)
+    You may skip both; nothing in the pipeline calls them.
+  </p>
+
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; parsing</p>
+  <table class="walk">
+    <tr><td><pre><code>root = ET.fromstring(xml_data)
+entries = root.findall("atom:entry", self.namespaces)</code></pre></td>
+      <td>Parse the text into a tree; find every <code>&lt;entry&gt;</code> in the Atom namespace. Malformed XML raises <code>ET.ParseError</code>, which becomes <code>ArxivParseError</code>.</td></tr>
+    <tr><td><pre><code>for entry in entries:
+    paper = self._parse_single_entry(entry)
+    if paper:
+        papers.append(paper)</code></pre></td>
+      <td>One bad entry returns <code>None</code> and is skipped; it doesn't sink the whole batch.</td></tr>
+    <tr><td><pre><code>title = self._get_text(entry, "atom:title", clean_newlines=True)
+authors = self._get_authors(entry)
+abstract = self._get_text(entry, "atom:summary", clean_newlines=True)
+published = self._get_text(entry, "atom:published")
+categories = self._get_categories(entry)
+pdf_url = self._get_pdf_url(entry)</code></pre></td>
+      <td>Small helpers, one per field. arXiv wraps long titles with a newline plus indentation; <code>clean_newlines</code> replaces the newline with a space (the indentation spaces stay, which is harmless for search).</td></tr>
+    <tr><td><pre><code>def _get_arxiv_id(self, entry):
+    id_elem = entry.find("atom:id", self.namespaces)
+    ...
+    return id_elem.text.split("/")[-1]</code></pre></td>
+      <td><code>http://arxiv.org/abs/2609.38178v1</code> becomes <code>2609.38178v1</code>.</td></tr>
+    <tr><td><pre><code>for category in entry.findall("atom:category", self.namespaces):
+    term = category.get("term")</code></pre></td>
+      <td><code>.get("term")</code> reads an XML <b>attribute</b>; <code>.text</code> would be empty.</td></tr>
+    <tr><td><pre><code>for link in entry.findall("atom:link", self.namespaces):
+    if link.get("type") == "application/pdf":
+        url = link.get("href", "")
+        if url.startswith("http://arxiv.org/"):
+            url = url.replace("http://arxiv.org/", "https://arxiv.org/")
+        return url
+return ""</code></pre></td>
+      <td>Pick the PDF link and force HTTPS. Today arXiv already sends <code>https</code>, but older responses used <code>http</code>.</td></tr>
+  </table>
+
+  <p class="file"><b>src/schemas/arxiv/paper.py</b> and <b>src/services/arxiv/factory.py</b></p>
+  <pre><code>class ArxivPaper(BaseModel):
+    """Schema for arXiv API response data."""
+
+    arxiv_id: str = Field(..., description="arXiv paper ID")
+    title: str = Field(..., description="Paper title")
+    authors: List[str] = Field(..., description="List of author names")
+    abstract: str = Field(..., description="Paper abstract")
+    categories: List[str] = Field(..., description="Paper categories")
+    published_date: str = Field(..., description="Date published on arXiv (ISO format)")
+    pdf_url: str = Field(..., description="URL to PDF")</code></pre>
+  <pre><code>def make_arxiv_client() -&gt; ArxivClient:
+    settings = get_settings()
+    client = ArxivClient(settings=settings.arxiv)
+    return client</code></pre>
+  <p>
+    <code>ArxivPaper.published_date</code> is a <b>string</b>, unlike <code>PaperBase.published_date</code> (a <code>datetime</code>): this schema is
+    the raw API shape. The conversion happens when storing (Day 4).
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: look at the real thing</h4>
+  <pre><code>curl.exe -s "https://export.arxiv.org/api/query?search_query=cat:cs.AI&amp;start=0&amp;max_results=2&amp;sortBy=submittedDate&amp;sortOrder=descending"</code></pre>
+  <p>Find the <code>id</code>, the PDF link, and the categories in the output. Then add the new settings to <code>.env</code>, copied from the reference <code>.env</code>:</p>
+  <p class="file"><b>.env</b> (append)</p>
+  <pre><code>ARXIV__MAX_RESULTS=5
+ARXIV__BASE_URL=https://export.arxiv.org/api/query
+ARXIV__PDF_CACHE_DIR=./data/arxiv_pdfs
+ARXIV__RATE_LIMIT_DELAY=3.0
+ARXIV__TIMEOUT_SECONDS=30
+ARXIV__SEARCH_CATEGORY=cs.AI
+ARXIV__DOWNLOAD_MAX_RETRIES=3
+ARXIV__DOWNLOAD_RETRY_DELAY_BASE=5.0
+ARXIV__MAX_CONCURRENT_DOWNLOADS=5
+ARXIV__MAX_CONCURRENT_PARSING=1</code></pre>
+  <p>
+    <code>MAX_RESULTS=5</code> instead of the reference's 15 keeps your first Airflow run short (Day 5). Add <code>data/</code> to
+    <code>.gitignore</code>: downloaded PDFs don't belong in git.
+  </p>
+
+  <h4>Step B: write the code</h4>
+  <pre><code>mkdir src\services\arxiv, tests\unit\services
+ni src\services\__init__.py, src\services\arxiv\__init__.py, tests\unit\services\__init__.py</code></pre>
+  <ol>
+    <li><code>src/config.py</code>: add <code>ArxivSettings</code> exactly as in the reference, and the <code>arxiv</code> field on <code>Settings</code>.</li>
+    <li><code>src/exceptions.py</code>: add <code>ArxivAPIException</code>, <code>ArxivAPITimeoutError</code>, <code>ArxivAPIRateLimitError</code>,
+      <code>ArxivParseError</code> (the last three inherit from the first), plus <code>PDFDownloadException</code> and <code>PDFDownloadTimeoutError</code> for tomorrow.</li>
+    <li><code>src/schemas/arxiv/paper.py</code>: add <code>ArxivPaper</code> above <code>PaperBase</code>.</li>
+    <li><code>src/services/arxiv/client.py</code>: <code>ArxivClient</code> with the properties, <code>fetch_papers</code> (skip the rate-limit block until tomorrow),
+      <code>_parse_response</code>, <code>_parse_single_entry</code>, and the <code>_get_*</code> helpers. Same names and signatures as the reference.</li>
+    <li><code>src/services/arxiv/factory.py</code>: <code>make_arxiv_client()</code>.</li>
+  </ol>
+  <details class="hint"><summary>Hint: the helper that everything uses</summary>
+    <p><code>_get_text(element, path, clean_newlines=False)</code>: <code>find</code> the path with the namespaces; return <code>""</code> if the element or its
+      <code>.text</code> is missing; otherwise strip it, and replace <code>"\n"</code> with <code>" "</code> if asked.</p></details>
+
+  <h4>Step C: tests with a fake arXiv</h4>
+  <p>
+    Unit tests must not call the real arXiv: it's slow, rate-limited, and changes daily. httpx has a built-in fake network,
+    <code>httpx.MockTransport</code>: you give it a function that receives each request and returns a response. The fixture below
+    replaces <code>httpx.AsyncClient</code> with a version wired to that fake, and queues up the replies each test wants. (The reference tests
+    use <code>unittest.mock.patch</code> for the same job; Module 9 compares the styles.)
+  </p>
+  <p class="file"><b>tests/unit/services/conftest.py</b></p>
+  <pre><code>import httpx
+import pytest
+
+from src.config import ArxivSettings
+from src.schemas.arxiv.paper import ArxivPaper
+from src.services.arxiv.client import ArxivClient
+
+
+class FakeArxiv:
+    """Stands in for the internet: answers each request with the next queued reply."""
+
+    def __init__(self):
+        self.replies = []
+        self.requests = []
+
+    def handle(self, request: httpx.Request) -&gt; httpx.Response:
+        self.requests.append(request)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+@pytest.fixture
+def fake_arxiv(monkeypatch):
+    fake = FakeArxiv()
+    real_async_client = httpx.AsyncClient
+
+    def async_client_with_fake_transport(**kwargs):
+        return real_async_client(transport=httpx.MockTransport(fake.handle), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", async_client_with_fake_transport)
+    return fake
+
+
+@pytest.fixture
+def arxiv_settings(tmp_path):
+    return ArxivSettings(
+        _env_file=None,
+        rate_limit_delay=0.0,
+        download_retry_delay_base=0.0,
+        download_max_retries=3,
+        timeout_seconds=5,
+        pdf_cache_dir=str(tmp_path / "pdfs"),
+    )
+
+
+@pytest.fixture
+def arxiv_client(arxiv_settings):
+    return ArxivClient(arxiv_settings)
+
+
+@pytest.fixture
+def sample_paper():
+    return ArxivPaper(
+        arxiv_id="2609.38178v1",
+        title="Skill-Space Shooting for Autonomous Robot Policy Improvement",
+        authors=["Zihang Rui", "Renhao Wang"],
+        abstract="Robots deployed in the physical world must be able to improve.",
+        categories=["cs.RO", "cs.AI"],
+        published_date="2026-09-29T17:59:55Z",
+        pdf_url="https://arxiv.org/pdf/2609.38178v1",
+    )</code></pre>
+  <p>
+    <code>tmp_path</code> is a built-in fixture: a fresh empty folder per test. Saving <code>real_async_client</code> before patching matters,
+    because the fake needs the real class to build on.
+  </p>
+  <p class="file"><b>tests/unit/services/test_arxiv_client.py</b> (Day 1 part)</p>
+  <pre><code>import time
+
+import httpx
+import pytest
+
+from src.config import ArxivSettings
+from src.exceptions import ArxivAPIException, ArxivAPITimeoutError, ArxivParseError, PDFDownloadException, PDFDownloadTimeoutError
+from src.services.arxiv.client import ArxivClient
+from src.services.arxiv.factory import make_arxiv_client
+
+SAMPLE_FEED = """&lt;?xml version='1.0' encoding='UTF-8'?&gt;
+&lt;feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom"&gt;
+  &lt;opensearch:totalResults&gt;203292&lt;/opensearch:totalResults&gt;
+  &lt;entry&gt;
+    &lt;id&gt;http://arxiv.org/abs/2609.38178v1&lt;/id&gt;
+    &lt;title&gt;Skill-Space Shooting for
+  Autonomous Robot Policy Improvement&lt;/title&gt;
+    &lt;link href="https://arxiv.org/abs/2609.38178v1" rel="alternate" type="text/html"/&gt;
+    &lt;link href="https://arxiv.org/pdf/2609.38178v1" rel="related" type="application/pdf" title="pdf"/&gt;
+    &lt;summary&gt;Robots deployed in the physical world must be able to improve.&lt;/summary&gt;
+    &lt;category term="cs.RO" scheme="http://arxiv.org/schemas/atom"/&gt;
+    &lt;category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/&gt;
+    &lt;published&gt;2026-09-29T17:59:55Z&lt;/published&gt;
+    &lt;arxiv:primary_category term="cs.RO"/&gt;
+    &lt;author&gt;&lt;name&gt;Zihang Rui&lt;/name&gt;&lt;/author&gt;
+    &lt;author&gt;&lt;name&gt;Renhao Wang&lt;/name&gt;&lt;/author&gt;
+  &lt;/entry&gt;
+  &lt;entry&gt;
+    &lt;id&gt;http://arxiv.org/abs/2609.00002v2&lt;/id&gt;
+    &lt;title&gt;Second Paper&lt;/title&gt;
+    &lt;link href="http://arxiv.org/pdf/2609.00002v2" rel="related" type="application/pdf" title="pdf"/&gt;
+    &lt;summary&gt;Another abstract.&lt;/summary&gt;
+    &lt;category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/&gt;
+    &lt;published&gt;2026-09-28T10:00:00Z&lt;/published&gt;
+    &lt;author&gt;&lt;name&gt;Ada Lovelace&lt;/name&gt;&lt;/author&gt;
+  &lt;/entry&gt;
+&lt;/feed&gt;"""
+
+
+def test_parse_response_reads_every_field(arxiv_client):
+    papers = arxiv_client._parse_response(SAMPLE_FEED)
+    assert len(papers) == 2
+    first = papers[0]
+    assert first.arxiv_id == "2609.38178v1"
+    assert "\n" not in first.title
+    assert first.authors == ["Zihang Rui", "Renhao Wang"]
+    assert first.categories == ["cs.RO", "cs.AI"]
+    assert first.published_date == "2026-09-29T17:59:55Z"
+    assert first.pdf_url == "https://arxiv.org/pdf/2609.38178v1"
+
+
+def test_parse_response_upgrades_http_pdf_links(arxiv_client):
+    papers = arxiv_client._parse_response(SAMPLE_FEED)
+    assert papers[1].pdf_url == "https://arxiv.org/pdf/2609.00002v2"
+
+
+def test_parse_response_rejects_invalid_xml(arxiv_client):
+    with pytest.raises(ArxivParseError):
+        arxiv_client._parse_response("this is not xml")
+
+
+async def test_fetch_papers_builds_the_query_url(arxiv_client, fake_arxiv):
+    fake_arxiv.replies = [httpx.Response(200, text=SAMPLE_FEED)]
+    papers = await arxiv_client.fetch_papers(max_results=2, from_date="20260929", to_date="20260929")
+    assert len(papers) == 2
+    url = str(fake_arxiv.requests[0].url)
+    assert "search_query=cat:cs.AI%20AND%20submittedDate:[202609290000+TO+202609292359]" in url
+    assert "max_results=2" in url
+    assert "sortBy=submittedDate" in url
+
+
+async def test_fetch_papers_timeout_becomes_arxiv_timeout_error(arxiv_client, fake_arxiv):
+    fake_arxiv.replies = [httpx.ReadTimeout("too slow")]
+    with pytest.raises(ArxivAPITimeoutError):
+        await arxiv_client.fetch_papers()
+
+
+async def test_fetch_papers_http_error_reports_the_status(arxiv_client, fake_arxiv):
+    fake_arxiv.replies = [httpx.Response(503)]
+    with pytest.raises(ArxivAPIException, match="503"):
+        await arxiv_client.fetch_papers()
+
+
+async def test_fetch_papers_wraps_bad_xml_in_a_generic_error(arxiv_client, fake_arxiv):
+    fake_arxiv.replies = [httpx.Response(200, text="&lt;html&gt;maintenance&lt;/html")]
+    with pytest.raises(ArxivAPIException, match="Failed to parse") as error:
+        await arxiv_client.fetch_papers()
+    assert type(error.value) is ArxivAPIException
+
+
+def test_factory_reads_arxiv_settings_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ARXIV__MAX_RESULTS", "7")
+    client = make_arxiv_client()
+    assert isinstance(client, ArxivClient)
+    assert client.max_results == 7</code></pre>
+  <p>
+    The imports already include what tomorrow's tests need. The last test proves the whole chain: environment variable, nested settings,
+    factory, client. A real environment variable beats the <code>ARXIV__MAX_RESULTS=5</code> in your <code>.env</code>.
+  </p>
+  <p class="file"><b>tests/unit/test_config.py</b> (add; also import <code>ArxivSettings</code>)</p>
+  <pre><code>def test_nested_arxiv_settings_read_prefixed_variables(monkeypatch):
+    monkeypatch.setenv("ARXIV__MAX_RESULTS", "7")
+    assert Settings(_env_file=None).arxiv.max_results == 7
+    assert ArxivSettings(_env_file=None, max_results=3).max_results == 3</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+uv run python -c "import asyncio; from src.services.arxiv.factory import make_arxiv_client; [print(p.arxiv_id, p.title[:60]) for p in asyncio.run(make_arxiv_client().fetch_papers(max_results=3))]"</code></pre>
+  <p>
+    Tests: <code>64 passed</code> (55 + 9). The one-liner calls the real arXiv and prints three of the newest cs.AI papers, IDs with
+    <code>v1</code> suffixes. If it fails with a certificate error, that's the proxy: on your laptop, httpx trusts certifi's bundle, not
+    Windows. Day 3 shows the fix. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In <code>_parse_response</code>, call <code>root.findall("entry")</code> without namespaces. No error at all: zero papers, and the parse test
+      fails on <code>len == 2</code>. Silent empty results are the worst kind of bug; this is why the test counts.</li>
+    <li>In <code>_get_categories</code>, use <code>category.text</code> instead of <code>.get("term")</code>. Every category list is empty. Attributes are not text.</li>
+    <li>Remove <code>":"</code> from <code>safe</code>. The URL test fails because the colon becomes <code>%3A</code>. arXiv happens to accept it, but now the URL doesn't match
+      what you intended, and your test caught the change.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Rate limiting, retries with backoff, and PDF downloads</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Networks fail, and polite clients don't hammer servers. arXiv asks for 3 seconds between calls and will block clients that
+    ignore it. PDFs are several megabytes each, travel through your office proxy, and sometimes time out: the reference logs from
+    this week show <code>PDF download timeout (attempt 1/3)</code> warnings. Retrying, waiting, and caching are what turn a flaky
+    network into a reliable pipeline.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Rate limiting</td><td>Enforcing a minimum gap between requests. Here: remember the last request time and sleep for the remainder.</td></tr>
+    <tr><td>Retry</td><td>Try again after a failure that might be temporary (timeouts, 503). Don't retry errors that won't change (404).</td></tr>
+    <tr><td>Backoff</td><td>Wait longer after each failure so a struggling server can recover. <b>Linear</b>: 5 s, 10 s, 15 s. <b>Exponential</b>: 5 s, 10 s, 20 s, 40 s.</td></tr>
+    <tr><td>Cache</td><td>Keep the downloaded file; next time, use it instead of downloading again.</td></tr>
+    <tr><td>Streaming download</td><td>Write the response to disk in chunks as it arrives, instead of holding the whole file in memory.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; rate limiting inside <code>fetch_papers</code></p>
+  <pre><code>            if self._last_request_time is not None:
+                time_since_last = time.time() - self._last_request_time
+                if time_since_last &lt; self.rate_limit_delay:
+                    sleep_time = self.rate_limit_delay - time_since_last
+                    await asyncio.sleep(sleep_time)
+
+            self._last_request_time = time.time()</code></pre>
+  <p>
+    The first call goes straight through. A second call within 3 seconds sleeps only for the remainder. <code>await asyncio.sleep</code>
+    (not <code>time.sleep</code>) lets other tasks run meanwhile. The state lives on one client instance, so two client objects would not
+    coordinate; that's fine here because the factory makes one.
+  </p>
+
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; <code>download_pdf</code> and the cache</p>
+  <table class="walk">
+    <tr><td><pre><code>@cached_property
+def pdf_cache_dir(self) -&gt; Path:
+    cache_dir = Path(self._settings.pdf_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir</code></pre></td>
+      <td><code>@cached_property</code>: computed on first access, then stored on the instance. The folder is created once, lazily.</td></tr>
+    <tr><td><pre><code>if not paper.pdf_url:
+    logger.error(f"No PDF URL for paper {paper.arxiv_id}")
+    return None
+
+pdf_path = self._get_pdf_path(paper.arxiv_id)</code></pre></td>
+      <td>No URL, no download. The file name is the arXiv ID with <code>/</code> replaced (old-style IDs like <code>cs/0112017</code> contain one) plus <code>.pdf</code>.</td></tr>
+    <tr><td><pre><code>if pdf_path.exists() and not force_download:
+    logger.info(f"Using cached PDF: {pdf_path.name}")
+    return pdf_path</code></pre></td>
+      <td>The cache check. Re-running the pipeline for the same day costs no downloads.</td></tr>
+    <tr><td><pre><code>if await self._download_with_retry(paper.pdf_url, pdf_path):
+    return pdf_path
+else:
+    return None</code></pre></td>
+      <td>Delegate to the retry loop.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/arxiv/client.py</b> &middot; <code>_download_with_retry</code></p>
+  <table class="walk">
+    <tr><td><pre><code>if max_retries is None:
+    max_retries = self._settings.download_max_retries
+...
+await asyncio.sleep(self.rate_limit_delay)</code></pre></td>
+      <td>Always wait the rate-limit delay before a download. Simple and polite, though it doesn't coordinate across concurrent downloads.</td></tr>
+    <tr><td><pre><code>for attempt in range(max_retries):
+    try:
+        async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                with open(path, "wb") as f:
+                    async for chunk in response.aiter_bytes():
+                        f.write(chunk)
+        logger.info(f"Successfully downloaded to {path.name}")
+        return True</code></pre></td>
+      <td>Three nested context managers: client, streaming response, file. <code>aiter_bytes()</code> yields chunks as they arrive: the async generator from Module 0, Day 2.</td></tr>
+    <tr><td><pre><code>    except httpx.TimeoutException as e:
+        if attempt &lt; max_retries - 1:
+            wait_time = self._settings.download_retry_delay_base * (attempt + 1)
+            ...
+            await asyncio.sleep(wait_time)
+        else:
+            raise PDFDownloadTimeoutError(...)</code></pre></td>
+      <td>On a timeout, wait and retry; on the last attempt, give up with a specific exception. The wait is <code>5 &times; (attempt + 1)</code>: 5 s, then 10 s.</td></tr>
+    <tr><td><pre><code>    except httpx.HTTPError as e:
+        if attempt &lt; max_retries - 1:
+            wait_time = self._settings.download_retry_delay_base * (attempt + 1)  # Exponential backoff
+            ...
+        else:
+            raise PDFDownloadException(...)</code></pre></td>
+      <td>Same for other HTTP errors, including 503s from <code>raise_for_status</code>. Read the comment critically: <code>base &times; (attempt + 1)</code> is <b>linear</b>, not exponential. Your test will prove which it is. It also retries a 404, which will never succeed.</td></tr>
+    <tr><td><pre><code>    except Exception as e:
+        raise PDFDownloadException(f"Unexpected error during PDF download: {e}")
+
+# Clean up partial download
+if path.exists():
+    path.unlink()
+return False</code></pre></td>
+      <td>Anything else fails immediately. The cleanup at the bottom is effectively unreachable: every path through the loop either returns or raises. So a download that dies halfway can leave a partial file, which the cache check would later treat as valid. A real bug worth mentioning in an interview.</td></tr>
+  </table>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Add the rate-limit block to <code>fetch_papers</code>.</li>
+    <li>Add <code>pdf_cache_dir</code>, <code>download_pdf</code>, <code>_get_pdf_path</code>, and <code>_download_with_retry</code> with the reference's behaviour,
+      including the linear wait and the exception types. (You may fix the partial-file bug by deleting the file before re-raising, but the tests don't require it.)</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/test_arxiv_client.py</b> (Day 2 part, append)</p>
+  <pre><code>async def test_rate_limit_spaces_out_requests(tmp_path, fake_arxiv):
+    client = ArxivClient(ArxivSettings(_env_file=None, rate_limit_delay=0.3, pdf_cache_dir=str(tmp_path)))
+    fake_arxiv.replies = [httpx.Response(200, text=SAMPLE_FEED), httpx.Response(200, text=SAMPLE_FEED)]
+    start = time.perf_counter()
+    await client.fetch_papers()
+    await client.fetch_papers()
+    assert time.perf_counter() - start &gt;= 0.3
+
+
+async def test_download_saves_the_pdf_then_uses_the_cache(arxiv_client, fake_arxiv, sample_paper):
+    fake_arxiv.replies = [httpx.Response(200, content=b"%PDF-1.7 fake bytes")]
+    path = await arxiv_client.download_pdf(sample_paper)
+    assert path.name == "2609.38178v1.pdf"
+    assert path.read_bytes().startswith(b"%PDF")
+    again = await arxiv_client.download_pdf(sample_paper)
+    assert again == path
+    assert len(fake_arxiv.requests) == 1
+
+
+async def test_download_retries_after_a_server_error(arxiv_client, fake_arxiv, sample_paper):
+    fake_arxiv.replies = [httpx.Response(503), httpx.Response(200, content=b"%PDF-1.7")]
+    path = await arxiv_client.download_pdf(sample_paper)
+    assert path.exists()
+    assert len(fake_arxiv.requests) == 2
+
+
+async def test_download_gives_up_after_max_retries(arxiv_client, fake_arxiv, sample_paper):
+    fake_arxiv.replies = [httpx.Response(503)] * 3
+    with pytest.raises(PDFDownloadException):
+        await arxiv_client.download_pdf(sample_paper)
+    assert len(fake_arxiv.requests) == 3
+
+
+async def test_download_timeouts_raise_a_timeout_error(arxiv_client, fake_arxiv, sample_paper):
+    fake_arxiv.replies = [httpx.ReadTimeout("slow")] * 3
+    with pytest.raises(PDFDownloadTimeoutError):
+        await arxiv_client.download_pdf(sample_paper)
+
+
+async def test_download_without_a_pdf_url_returns_none(arxiv_client, sample_paper):
+    paper = sample_paper.model_copy(update={"pdf_url": ""})
+    assert await arxiv_client.download_pdf(paper) is None
+
+
+async def test_waits_between_download_attempts_grow(tmp_path, fake_arxiv, sample_paper, monkeypatch):
+    waits = []
+
+    async def record_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("src.services.arxiv.client.asyncio.sleep", record_sleep)
+    client = ArxivClient(
+        ArxivSettings(_env_file=None, rate_limit_delay=1.0, download_retry_delay_base=5.0, pdf_cache_dir=str(tmp_path))
+    )
+    fake_arxiv.replies = [httpx.Response(503)] * 3
+    with pytest.raises(PDFDownloadException):
+        await client.download_pdf(sample_paper)
+    assert waits == [1.0, 5.0, 10.0]</code></pre>
+  <p>
+    The last test replaces <code>asyncio.sleep</code> with a recorder, so it runs instantly yet proves the exact waits: the rate-limit
+    delay, then 5, then 10. Linear.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+uv run python -c "import asyncio; from src.services.arxiv.factory import make_arxiv_client; c = make_arxiv_client(); p = asyncio.run(c.fetch_papers(max_results=1))[0]; print(asyncio.run(c.download_pdf(p)))"
+ls data\arxiv_pdfs</code></pre>
+  <p>
+    Tests: <code>71 passed</code> (64 + 7). The one-liner downloads one real PDF and prints its path; <code>ls</code> shows the file. Run the
+    one-liner again: the log says <code>Using cached PDF</code>. Keep that PDF for tomorrow. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Change the backoff to <code>base * 2 ** attempt</code>. The wait test still passes: with two retries, linear and exponential both wait 5 s, then 10 s.
+      Add <code>download_max_retries=4</code> to that test's settings and queue four 503s: now linear gives 15 s and exponential 20 s for the third wait. Tests need inputs that tell the alternatives apart.</li>
+    <li>Replace <code>await asyncio.sleep(sleep_time)</code> in the rate limiter with <code>time.sleep(sleep_time)</code>. The rate-limit test still passes. Why is it still wrong? (Module 0, Day 3.)</li>
+    <li>Queue only two 503s in <code>test_download_gives_up_after_max_retries</code>. The third request finds no reply: <code>IndexError: pop from empty list</code>, wrapped as
+      <code>PDFDownloadException</code> by the catch-all. The test passes for the wrong reason, which is why it also asserts the request count.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>PDF parsing with Docling</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The abstract is 200 words; the answer to a user's question is usually in the paper body. A PDF stores glyphs at positions on
+    a page, not paragraphs, so "get the text" means reconstructing reading order, headings, and tables. Docling does this with
+    machine-learning layout models. The sections it produces are what Module 4 cuts into chunks.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Layout analysis</td><td>A model looks at each page image and labels regions: title, section header, paragraph, table, figure.</td></tr>
+    <tr><td>OCR</td><td>Optical character recognition: reading text from pixels. Only needed for scanned PDFs; arXiv PDFs have real text, so it's off (and very slow).</td></tr>
+    <tr><td>Table structure</td><td>A second model that recovers rows and columns. On by default.</td></tr>
+    <tr><td>CPU-bound</td><td>Work that keeps the processor busy instead of waiting. Parsing a paper on your CPU takes tens of seconds to minutes.</td></tr>
+    <tr><td><code>asyncio.to_thread</code></td><td>Runs a normal (blocking) function in a worker thread and lets you <code>await</code> it, so the event loop stays free.</td></tr>
+  </table>
+  <p>
+    Docling depends on PyTorch, so it's heavy: about a gigabyte of packages, plus model files downloaded from Hugging Face on first use.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/schemas/pdf_parser/models.py</b> &middot; the output shapes</p>
+  <pre><code>class ParserType(str, Enum):
+    DOCLING = "docling"
+
+
+class PaperSection(BaseModel):
+    title: str = Field(..., description="Section title")
+    content: str = Field(..., description="Section content")
+    level: int = Field(default=1, description="Section hierarchy level")
+
+
+class PdfContent(BaseModel):
+    sections: List[PaperSection] = Field(default_factory=list, description="Paper sections")
+    figures: List[PaperFigure] = Field(default_factory=list, description="Figures")
+    tables: List[PaperTable] = Field(default_factory=list, description="Tables")
+    raw_text: str = Field(..., description="Full extracted text")
+    references: List[str] = Field(default_factory=list, description="References")
+    parser_used: ParserType = Field(..., description="Parser used for extraction")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Parser metadata")</code></pre>
+  <p>
+    An <code>Enum</code> that also inherits <code>str</code> serialises as plain <code>"docling"</code>. The same file defines
+    <code>PaperFigure</code>, <code>PaperTable</code>, <code>ArxivMetadata</code> (the arXiv fields again), and <code>ParsedPaper</code>
+    (metadata + optional <code>PdfContent</code>). Type them all.
+  </p>
+
+  <p class="file"><b>src/services/pdf_parser/docling.py</b> &middot; <code>DoclingParser</code></p>
+  <table class="walk">
+    <tr><td><pre><code>pipeline_options = PdfPipelineOptions(
+    do_table_structure=do_table_structure,
+    do_ocr=do_ocr,  # Usually disabled for speed
+)
+self._converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)})
+self._warmed_up = False
+self.max_pages = max_pages
+self.max_file_size_bytes = max_file_size_mb * 1024 * 1024</code></pre></td>
+      <td>Configure Docling once per parser. Creating the converter is cheap; models load on the first conversion. <code>_warm_up_models</code> in the reference only flips a flag; it doesn't actually warm anything.</td></tr>
+    <tr><td><pre><code>if pdf_path.stat().st_size == 0:
+    raise PDFValidationError(f"PDF file is empty: {pdf_path}")
+...
+if file_size &gt; self.max_file_size_bytes:
+    raise PDFValidationError(f"PDF file too large: ...")</code></pre></td>
+      <td><code>_validate_pdf</code> starts with cheap checks, before paying for the models.</td></tr>
+    <tr><td><pre><code>with open(pdf_path, "rb") as f:
+    header = f.read(8)
+    if not header.startswith(b"%PDF-"):
+        raise PDFValidationError(f"File does not have PDF header: {pdf_path}")</code></pre></td>
+      <td>Every PDF starts with <code>%PDF-</code>. An HTML error page saved as <code>.pdf</code> fails here.</td></tr>
+    <tr><td><pre><code>pdf_doc = pdfium.PdfDocument(str(pdf_path))
+actual_pages = len(pdf_doc)
+pdf_doc.close()
+if actual_pages &gt; self.max_pages:
+    raise PDFValidationError(f"PDF has too many pages: {actual_pages} &gt; {self.max_pages}")</code></pre></td>
+      <td><code>pypdfium2</code> counts pages quickly. More than 30 pages (the <code>PDF_PARSER__MAX_PAGES</code> setting) is skipped to protect memory and time.</td></tr>
+    <tr><td><pre><code>result = self._converter.convert(str(pdf_path), max_num_pages=self.max_pages, max_file_size=self.max_file_size_bytes)
+doc = result.document</code></pre></td>
+      <td><code>parse_pdf</code>: the expensive call. Synchronous, and CPU-bound.</td></tr>
+    <tr><td><pre><code>for element in doc.texts:
+    if hasattr(element, "label") and element.label in ["title", "section_header"]:
+        if current_section["content"].strip():
+            sections.append(PaperSection(...))
+        current_section = {"title": element.text.strip(), "content": ""}
+    else:
+        if hasattr(element, "text") and element.text:
+            current_section["content"] += element.text + "\n"</code></pre></td>
+      <td>Walk the text elements in reading order. A heading starts a new section; everything else is appended to the current one. Text before the first heading goes into a section called <code>"Content"</code>.</td></tr>
+    <tr><td><pre><code>return PdfContent(
+    sections=sections,
+    figures=[], tables=[],
+    raw_text=doc.export_to_text(),
+    references=[],
+    parser_used=ParserType.DOCLING,
+    metadata={"source": "docling", ...},
+)</code></pre></td>
+      <td>Only the text matters for RAG. Figures and tables are deliberately left empty.</td></tr>
+    <tr><td><pre><code>except PDFValidationError as e:
+    error_msg = str(e).lower()
+    if "too large" in error_msg or "too many pages" in error_msg:
+        return None
+    else:
+        raise</code></pre></td>
+      <td>Size and page limits aren't errors, just "skip": return <code>None</code>. A broken file is re-raised. Other exceptions are turned into <code>PDFParsingException</code> with a hint based on the message text.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/pdf_parser/parser.py</b> &middot; the async wrapper (working-tree version)</p>
+  <pre><code>    async def parse_pdf(self, pdf_path: Path) -&gt; Optional[PdfContent]:
+        if not pdf_path.exists():
+            logger.error(f"PDF file not found: {pdf_path}")
+            raise PDFValidationError(f"PDF file not found: {pdf_path}")
+
+        try:
+            # DoclingParser.parse_pdf is synchronous and CPU-bound. Running it in
+            # a worker thread keeps the event loop free so concurrent downloads
+            # continue while a document is being parsed.
+            result = await asyncio.to_thread(self.docling_parser.parse_pdf, pdf_path)
+            if result:
+                logger.info(f"Parsed {pdf_path.name}")
+                return result
+            else:
+                logger.error(f"Docling parsing returned no result for {pdf_path.name}")
+                raise PDFParsingException(f"Docling parsing returned no result for {pdf_path.name}")
+
+        except (PDFValidationError, PDFParsingException):
+            raise
+        except Exception as e:
+            logger.error(f"Docling parsing error for {pdf_path.name}: {e}")
+            raise PDFParsingException(f"Docling parsing error for {pdf_path.name}: {e}")</code></pre>
+  <p>
+    Note that a skipped PDF (<code>None</code> from Docling) becomes an exception here. And <code>factory.py</code> wraps construction in
+    <code>@lru_cache(maxsize=1)</code>, so the whole process shares one parser and its loaded models.
+  </p>
+
+  <div class="callout story">
+    <b>What happened here this week</b>
+    The original course code had <code>result = await self.docling_parser.parse_pdf(pdf_path)</code>. A later upstream commit
+    ("remove unnecessary async from parse_pdf") made <code>DoclingParser.parse_pdf</code> a plain function but left the <code>await</code>. The reference
+    Airflow logs from 25 September show every parse failing with
+    <code>object PdfContent can't be used in 'await' expression</code> (and <code>object NoneType can't be used in 'await' expression</code> for a 37-page paper that was
+    skipped). The PDFs downloaded and parsed fine; awaiting the result crashed. That run stored 15 papers with metadata only. The fix in the
+    working tree is <code>asyncio.to_thread</code>: it makes the call awaitable <em>and</em> keeps the event loop free while a paper is parsed. Two bugs'
+    worth of lessons in one line.
+  </div>
+
+  <h3>4. Build</h3>
+  <h4>Step A: install Docling</h4>
+  <p>
+    The reference project already installed <code>docling 2.52.0</code> on this machine, so its wheels (torch included) are in uv's cache. Ask uv
+    to use only the cache first:
+  </p>
+  <pre><code>uv add python-dateutil
+uv add "docling==2.52.0" --offline</code></pre>
+  <p>
+    That should finish in a couple of minutes with no big downloads. If it fails because something isn't cached, drop <code>--offline</code>
+    and expect roughly a gigabyte through the proxy. If a large wheel fails with a hash mismatch, just run the command again; see the
+    Day 5 story for why. (<code>python-dateutil</code> is for tomorrow.)
+  </p>
+  <div class="callout warn"><b>This also makes your API image huge</b>
+    Docling is now in <code>pyproject.toml</code>, so the next API image build (Module 3) installs torch too. That's how the reference API image
+    reached 12.8 GB. It mirrors the reference; in an interview, say you'd move ingestion-only packages into a separate dependency group.</div>
+
+  <h4>Step B: write the code</h4>
+  <pre><code>mkdir src\services\pdf_parser, src\schemas\pdf_parser
+ni src\services\pdf_parser\__init__.py, src\schemas\pdf_parser\__init__.py</code></pre>
+  <ol>
+    <li><code>src/config.py</code>: add <code>PDFParserSettings</code> (prefix <code>PDF_PARSER__</code>; <code>max_pages=30</code>, <code>max_file_size_mb=20</code>,
+      <code>do_ocr=False</code>, <code>do_table_structure=True</code>) and <code>pdf_parser</code> on <code>Settings</code>. Copy the four <code>PDF_PARSER__</code> lines from the reference <code>.env</code> into yours.</li>
+    <li><code>src/exceptions.py</code>: add <code>ParsingException</code>, <code>PDFParsingException(ParsingException)</code>, <code>PDFValidationError(PDFParsingException)</code>, and <code>PDFCacheException</code>.</li>
+    <li><code>src/schemas/pdf_parser/models.py</code>: all six classes.</li>
+    <li><code>src/services/pdf_parser/docling.py</code>: <code>DoclingParser</code> as walked through (you may shorten the error-message hints).</li>
+    <li><code>src/services/pdf_parser/parser.py</code>: <code>PDFParserService</code> with the <code>asyncio.to_thread</code> version.</li>
+    <li><code>src/services/pdf_parser/factory.py</code>: cached <code>make_pdf_parser_service()</code> built from <code>settings.pdf_parser</code>.</li>
+  </ol>
+
+  <h4>Step C: tests (Docling itself is never run)</h4>
+  <p class="file"><b>tests/unit/services/test_pdf_parser.py</b></p>
+  <pre><code>import asyncio
+import time
+from pathlib import Path
+
+import pytest
+
+from src.exceptions import PDFParsingException, PDFValidationError
+from src.schemas.pdf_parser.models import ParserType, PdfContent
+from src.services.pdf_parser.docling import DoclingParser
+from src.services.pdf_parser.factory import make_pdf_parser_service
+from src.services.pdf_parser.parser import PDFParserService
+
+
+@pytest.fixture
+def docling_parser():
+    return DoclingParser(max_pages=30, max_file_size_mb=1)
+
+
+@pytest.fixture
+def service():
+    return PDFParserService(max_pages=30, max_file_size_mb=1)
+
+
+@pytest.fixture
+def pdf_file(tmp_path):
+    path = tmp_path / "paper.pdf"
+    path.write_bytes(b"%PDF-1.7\nnot really a pdf body")
+    return path
+
+
+@pytest.fixture
+def content():
+    return PdfContent(raw_text="Hello from a PDF", parser_used=ParserType.DOCLING)
+
+
+def test_validate_rejects_an_empty_file(docling_parser, tmp_path):
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    with pytest.raises(PDFValidationError, match="empty"):
+        docling_parser._validate_pdf(empty)
+
+
+def test_validate_rejects_a_file_without_the_pdf_header(docling_parser, tmp_path):
+    fake = tmp_path / "fake.pdf"
+    fake.write_bytes(b"&lt;html&gt;arXiv is down&lt;/html&gt;")
+    with pytest.raises(PDFValidationError, match="PDF header"):
+        docling_parser._validate_pdf(fake)
+
+
+def test_validate_wraps_a_missing_file(docling_parser):
+    with pytest.raises(PDFValidationError, match="Error validating PDF"):
+        docling_parser._validate_pdf(Path("does/not/exist.pdf"))
+
+
+def test_parse_pdf_skips_files_over_the_size_limit(docling_parser, tmp_path):
+    big = tmp_path / "big.pdf"
+    big.write_bytes(b"%PDF-1.7\n" + b"0" * (1024 * 1024 + 1))
+    assert docling_parser.parse_pdf(big) is None
+
+
+async def test_service_rejects_a_missing_file(service):
+    with pytest.raises(PDFValidationError, match="not found"):
+        await service.parse_pdf(Path("does/not/exist.pdf"))
+
+
+async def test_service_returns_what_docling_returns(service, pdf_file, content, monkeypatch):
+    monkeypatch.setattr(service.docling_parser, "parse_pdf", lambda path: content)
+    assert await service.parse_pdf(pdf_file) is content
+
+
+async def test_service_raises_when_docling_returns_nothing(service, pdf_file, monkeypatch):
+    monkeypatch.setattr(service.docling_parser, "parse_pdf", lambda path: None)
+    with pytest.raises(PDFParsingException, match="returned no result"):
+        await service.parse_pdf(pdf_file)
+
+
+async def test_service_wraps_unexpected_errors(service, pdf_file, monkeypatch):
+    def explode(path):
+        raise RuntimeError("model crashed")
+
+    monkeypatch.setattr(service.docling_parser, "parse_pdf", explode)
+    with pytest.raises(PDFParsingException, match="Docling parsing error"):
+        await service.parse_pdf(pdf_file)
+
+
+async def test_service_does_not_block_the_event_loop(service, pdf_file, content, monkeypatch):
+    def slow_parse(path):
+        time.sleep(0.3)
+        return content
+
+    monkeypatch.setattr(service.docling_parser, "parse_pdf", slow_parse)
+    start = time.perf_counter()
+    await asyncio.gather(service.parse_pdf(pdf_file), asyncio.sleep(0.3))
+    assert time.perf_counter() - start &lt; 0.5
+
+
+def test_factory_returns_one_cached_instance():
+    assert make_pdf_parser_service() is make_pdf_parser_service()</code></pre>
+  <p>
+    The event-loop test runs a 0.3-second blocking "parse" alongside a 0.3-second async sleep. In a thread they overlap: about
+    0.3 seconds total. Run on the event loop, they'd queue up: 0.6 seconds.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+uv run python -c "from pathlib import Path; from src.services.pdf_parser.factory import make_pdf_parser_service; import asyncio; pdf = next(Path('data/arxiv_pdfs').glob('*.pdf')); c = asyncio.run(make_pdf_parser_service().parse_pdf(pdf)); print(len(c.raw_text), [s.title for s in c.sections][:8])"</code></pre>
+  <p>
+    Tests: <code>81 passed</code> (71 + 10). The one-liner parses yesterday's real PDF on your CPU: the first run downloads Docling's
+    models (a few hundred MB) and can take several minutes; later runs are faster. It prints the text length and the first section
+    titles, like <code>Abstract</code>, <code>1 Introduction</code>. If the paper has more than 30 pages you'll get "returned no result"; pick another PDF. Commit.
+  </p>
+  <div class="callout warn"><b>If the model download fails with <code>CERTIFICATE_VERIFY_FAILED</code></b>
+    The Hugging Face client uses certifi's bundle, which doesn't know your proxy's certificate. Make a combined bundle and point the libraries at it for this session:
+<pre><code>Get-Content (uv run python -m certifi), certs\corp-ca.crt | Set-Content -Encoding ascii certs\bundle.pem
+$env:REQUESTS_CA_BUNDLE="$PWD\certs\bundle.pem"; $env:SSL_CERT_FILE="$PWD\certs\bundle.pem"</code></pre>
+    This is the laptop version of what the Dockerfiles do. If it still fails, skip the manual parse: parsing will run inside the Airflow container on Day 5, which has the certificate built in. I couldn't test this step for you.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Reproduce this week's bug: replace the <code>to_thread</code> line with <code>result = await self.docling_parser.parse_pdf(pdf_path)</code>. Four tests fail. Read the
+      message: <code>object PdfContent can't be used in 'await' expression</code>, wrapped as "Docling parsing error". Now you'd recognise it in a log in seconds.</li>
+    <li>Then try <code>result = self.docling_parser.parse_pdf(pdf_path)</code> (no await, no thread). Only the event-loop test fails. Correct results, frozen server.</li>
+    <li>Remove <code>@lru_cache</code> from the factory. Which test fails, and what would it cost in Airflow (hint: models loaded per call)?</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>The metadata fetcher: concurrency and per-paper errors</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    You have three parts: fetch, download-and-parse, store. The <b>orchestrator</b> runs them for a whole day's papers, as fast as the
+    network and CPU allow, without letting one broken PDF sink the run. This is the code the Airflow task calls, and the logic behind
+    lines like <code>Pipeline completed in 924.2s: 15 papers, 11 PDFs, 4 errors</code> in this week's logs.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Semaphore</td><td>A counter that limits how many tasks may be inside a block at once. <code>async with semaphore:</code> waits if the limit is reached.</td></tr>
+    <tr><td><code>gather(..., return_exceptions=True)</code></td><td>Run all tasks; if one raises, put the exception object in its result slot instead of cancelling the rest.</td></tr>
+    <tr><td>Pipelining</td><td>Each paper moves from download to parse on its own, so paper 1 can be parsing while papers 2&ndash;5 download.</td></tr>
+  </table>
+  <p>
+    Two different limits here: up to 5 downloads at once (network-bound, cheap to overlap) and 1 parse at a time (CPU-bound; running
+    two Docling parses on a laptop just makes both slower and doubles memory).
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/metadata_fetcher.py</b> &middot; <code>fetch_and_process_papers</code></p>
+  <table class="walk">
+    <tr><td><pre><code>results = {
+    "papers_fetched": 0,
+    "pdfs_downloaded": 0,
+    "pdfs_parsed": 0,
+    "papers_stored": 0,
+    "papers_indexed": 0,
+    "errors": [],
+    "processing_time": 0,
+}</code></pre></td>
+      <td>A plain dictionary of counters, returned at the end and pushed to Airflow tomorrow.</td></tr>
+    <tr><td><pre><code>papers = await self.arxiv_client.fetch_papers(
+    max_results=max_results, from_date=from_date, to_date=to_date, sort_by="submittedDate", sort_order="descending"
+)
+results["papers_fetched"] = len(papers)
+if not papers:
+    logger.warning("No papers found")
+    return results</code></pre></td>
+      <td>Step 1: metadata. No papers is a normal outcome (a quiet day), not an error.</td></tr>
+    <tr><td><pre><code>if process_pdfs:
+    pdf_results = await self._process_pdfs_batch(papers)
+    results["pdfs_downloaded"] = pdf_results["downloaded"]
+    results["pdfs_parsed"] = pdf_results["parsed"]
+    results["errors"].extend(pdf_results["errors"])</code></pre></td>
+      <td>Step 2: PDFs, concurrently.</td></tr>
+    <tr><td><pre><code>if store_to_db and db_session:
+    stored_count = self._store_papers_to_db(papers, pdf_results.get("parsed_papers", {}), db_session)
+    results["papers_stored"] = stored_count
+elif store_to_db:
+    results["errors"].append("Database session not provided for storage")</code></pre></td>
+      <td>Step 3: store <b>every</b> paper, with parsed content where available. The session is passed in; the fetcher never opens one.</td></tr>
+    <tr><td><pre><code>except Exception as e:
+    logger.error(f"Pipeline error: {e}")
+    results["errors"].append(f"Pipeline error: {str(e)}")
+    raise PipelineException(f"Pipeline execution failed: {e}") from e</code></pre></td>
+      <td>If fetching itself fails, the whole run fails (and Airflow will retry the task). <code>from e</code> keeps the original error attached.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/metadata_fetcher.py</b> &middot; the concurrent part</p>
+  <table class="walk">
+    <tr><td><pre><code>download_semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+parse_semaphore = asyncio.Semaphore(self.max_concurrent_parsing)
+
+pipeline_tasks = [self._download_and_parse_pipeline(paper, download_semaphore, parse_semaphore) for paper in papers]
+pipeline_results = await asyncio.gather(*pipeline_tasks, return_exceptions=True)</code></pre></td>
+      <td><code>_process_pdfs_batch</code>: one coroutine per paper, all started at once; the semaphores do the throttling.</td></tr>
+    <tr><td><pre><code>for paper, result in zip(papers, pipeline_results):
+    if isinstance(result, Exception):
+        error_msg = f"Pipeline error for {paper.arxiv_id}: {str(result)}"
+        results["errors"].append(error_msg)
+    elif result:
+        ...
+        download_success, parsed_paper = result
+        if download_success:
+            results["downloaded"] += 1
+            if parsed_paper:
+                results["parsed"] += 1
+                results["parsed_papers"][paper.arxiv_id] = parsed_paper
+            else:
+                results["parse_failures"].append(paper.arxiv_id)
+        else:
+            results["download_failures"].append(paper.arxiv_id)</code></pre></td>
+      <td>Match results back to papers by position. An exception becomes one error line; the other papers are unaffected. Failures are later added to <code>errors</code> as <code>Download failed: ...</code> and <code>PDF parse failed: ...</code>. (A defensive branch for non-tuple results, which mentions Airflow's <code>AirflowTaskTerminated</code>, is elided.)</td></tr>
+    <tr><td><pre><code>async with download_semaphore:
+    pdf_path = await self.arxiv_client.download_pdf(paper, False)
+    if pdf_path:
+        download_success = True
+    else:
+        return (False, None)
+
+async with parse_semaphore:
+    pdf_content = await self.pdf_parser.parse_pdf(pdf_path)
+    if pdf_content:
+        arxiv_metadata = ArxivMetadata(...)
+        parsed_paper = ParsedPaper(arxiv_metadata=arxiv_metadata, pdf_content=pdf_content)</code></pre></td>
+      <td><code>_download_and_parse_pipeline</code>: the download slot is released <em>before</em> parsing starts, so other downloads continue. Note there is no <code>try</code> around the parse alone.</td></tr>
+    <tr><td><pre><code>except Exception as e:
+    logger.error(f"Pipeline error for {paper.arxiv_id}: {e}")
+    raise MetadataFetchingException(f"Pipeline error for {paper.arxiv_id}: {e}") from e
+
+return (download_success, parsed_paper)</code></pre></td>
+      <td>So a parse exception (like "returned no result" for a 40-page paper) turns the <b>whole</b> tuple into an exception, and the successful download is never counted. That's why the 25 September log said <code>0/15 downloaded</code> although the PDFs were on disk. Read counters with the code in mind.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/metadata_fetcher.py</b> &middot; storing</p>
+  <pre><code>        paper_repo = PaperRepository(db_session)
+        for paper in papers:
+            try:
+                parsed_paper = parsed_papers.get(paper.arxiv_id)
+                published_date = (
+                    date_parser.parse(paper.published_date) if isinstance(paper.published_date, str) else paper.published_date
+                )
+                paper_data = {"arxiv_id": paper.arxiv_id, "title": paper.title, ..., "published_date": published_date, ...}
+                if parsed_paper:
+                    parsed_content = self._serialize_parsed_content(parsed_paper)
+                    paper_data.update(parsed_content)
+                else:
+                    paper_data.update(
+                        {"pdf_processed": False, "parser_metadata": {"note": "PDF processing not available or failed"}}
+                    )
+                paper_create = PaperCreate(**paper_data)
+                stored_paper = paper_repo.upsert(paper_create)
+                ...
+            except Exception as e:
+                logger.error(f"Failed to store paper {paper.arxiv_id}: {e}")</code></pre>
+  <p>
+    <code>dateutil</code>'s <code>parse</code> turns <code>"2026-09-29T17:59:55Z"</code> into a <code>datetime</code>. <code>_serialize_parsed_content</code>
+    turns sections into plain dicts and sets <code>pdf_processed=True</code> with a timestamp. Each paper is upserted inside its own
+    <code>try</code>, so one bad row doesn't stop the rest. Because it's an upsert, re-running a day is safe. <code>make_metadata_fetcher()</code> at the
+    bottom builds the fetcher with the concurrency limits from settings. Note the constructor's default <code>max_concurrent_parsing=3</code> differs from the setting's 1; the factory passes the setting.
+  </p>
+
+  <h3>4. Build</h3>
+  <p>
+    Write <code>src/services/metadata_fetcher.py</code>: <code>MetadataFetcher</code> with <code>fetch_and_process_papers</code>,
+    <code>_process_pdfs_batch</code>, <code>_download_and_parse_pipeline</code>, <code>_serialize_parsed_content</code>, <code>_store_papers_to_db</code>, and
+    <code>make_metadata_fetcher</code>, same signatures as the reference. Add <code>MetadataFetchingException</code> and
+    <code>PipelineException(MetadataFetchingException)</code> to <code>src/exceptions.py</code>.
+  </p>
+  <div class="callout info"><b>One deliberate difference</b>
+    The reference imports <code>OpenSearchClient</code> at the top of this file and never uses it. Leave that import out: you don't have OpenSearch until Module 3.</div>
+  <p class="file"><b>tests/unit/services/test_metadata_fetcher.py</b></p>
+  <pre><code>import asyncio
+from pathlib import Path
+
+import pytest
+
+from src.exceptions import ArxivAPIException, PDFParsingException, PipelineException
+from src.schemas.arxiv.paper import ArxivPaper
+from src.schemas.pdf_parser.models import ParserType, PdfContent
+from src.services.metadata_fetcher import MetadataFetcher
+
+
+def make_paper(arxiv_id: str) -&gt; ArxivPaper:
+    return ArxivPaper(
+        arxiv_id=arxiv_id,
+        title=f"Paper {arxiv_id}",
+        authors=["Ada Lovelace"],
+        abstract="An abstract.",
+        categories=["cs.AI"],
+        published_date="2026-09-29T10:00:00Z",
+        pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+    )
+
+
+class FakeArxivClient:
+    def __init__(self, papers, failing_downloads=(), download_seconds=0.0):
+        self.papers = papers
+        self.failing_downloads = set(failing_downloads)
+        self.download_seconds = download_seconds
+        self.pdf_cache_dir = Path(".")
+        self.active_downloads = 0
+        self.max_active_downloads = 0
+
+    async def fetch_papers(self, **kwargs):
+        return self.papers
+
+    async def download_pdf(self, paper, force_download=False):
+        self.active_downloads += 1
+        self.max_active_downloads = max(self.max_active_downloads, self.active_downloads)
+        await asyncio.sleep(self.download_seconds)
+        self.active_downloads -= 1
+        if paper.arxiv_id in self.failing_downloads:
+            return None
+        return Path(f"{paper.arxiv_id}.pdf")
+
+
+class FakeParser:
+    def __init__(self, failing=()):
+        self.failing = set(failing)
+
+    async def parse_pdf(self, pdf_path):
+        if pdf_path.stem in self.failing:
+            raise PDFParsingException(f"cannot parse {pdf_path.name}")
+        return PdfContent(raw_text=f"Full text of {pdf_path.stem}", parser_used=ParserType.DOCLING)
+
+
+def make_fetcher(arxiv_client, parser, max_concurrent_downloads=5):
+    return MetadataFetcher(
+        arxiv_client=arxiv_client,
+        pdf_parser=parser,
+        pdf_cache_dir=Path("."),
+        max_concurrent_downloads=max_concurrent_downloads,
+        max_concurrent_parsing=1,
+    )
+
+
+async def test_no_papers_means_empty_results():
+    fetcher = make_fetcher(FakeArxivClient([]), FakeParser())
+    results = await fetcher.fetch_and_process_papers(store_to_db=False)
+    assert results["papers_fetched"] == 0
+    assert results["errors"] == []
+
+
+async def test_one_bad_paper_does_not_stop_the_others():
+    papers = [make_paper("2609.00001v1"), make_paper("2609.00002v1"), make_paper("2609.00003v1")]
+    arxiv_client = FakeArxivClient(papers, failing_downloads={"2609.00002v1"})
+    fetcher = make_fetcher(arxiv_client, FakeParser(failing={"2609.00003v1"}))
+
+    results = await fetcher.fetch_and_process_papers(store_to_db=False)
+
+    assert results["papers_fetched"] == 3
+    assert results["pdfs_downloaded"] == 1
+    assert results["pdfs_parsed"] == 1
+    assert len(results["errors"]) == 2
+    assert any("Download failed: 2609.00002v1" in error for error in results["errors"])
+    assert any("Pipeline error for 2609.00003v1" in error for error in results["errors"])
+
+
+async def test_downloads_never_exceed_the_semaphore_limit():
+    papers = [make_paper(f"2609.0000{i}v1") for i in range(6)]
+    arxiv_client = FakeArxivClient(papers, download_seconds=0.05)
+    fetcher = make_fetcher(arxiv_client, FakeParser(), max_concurrent_downloads=2)
+
+    await fetcher.fetch_and_process_papers(store_to_db=False)
+
+    assert arxiv_client.max_active_downloads == 2
+
+
+async def test_asking_to_store_without_a_session_is_reported():
+    fetcher = make_fetcher(FakeArxivClient([make_paper("2609.00001v1")]), FakeParser())
+    results = await fetcher.fetch_and_process_papers(process_pdfs=False, store_to_db=True, db_session=None)
+    assert "Database session not provided for storage" in results["errors"]
+
+
+async def test_a_failed_fetch_becomes_a_pipeline_exception():
+    arxiv_client = FakeArxivClient([])
+
+    async def broken_fetch(**kwargs):
+        raise ArxivAPIException("arXiv is down")
+
+    arxiv_client.fetch_papers = broken_fetch
+    fetcher = make_fetcher(arxiv_client, FakeParser())
+    with pytest.raises(PipelineException, match="arXiv is down"):
+        await fetcher.fetch_and_process_papers(store_to_db=False)</code></pre>
+  <p>
+    Hand-written fakes instead of mocks: each one is a tiny class with the same method names as the real thing. The second test
+    encodes the counting quirk from the walkthrough: paper 3 downloaded, but it isn't counted.
+  </p>
+  <p class="file"><b>tests/integration/test_metadata_fetcher_db.py</b> &middot; the real database</p>
+  <pre><code>from src.repositories.paper import PaperRepository
+from src.services.metadata_fetcher import MetadataFetcher
+from tests.unit.services.test_metadata_fetcher import FakeArxivClient, FakeParser, make_paper
+
+
+async def test_papers_are_stored_with_and_without_pdf_content(db_session):
+    papers = [make_paper("9999.10001v1"), make_paper("9999.10002v1")]
+    fetcher = MetadataFetcher(
+        arxiv_client=FakeArxivClient(papers, failing_downloads={"9999.10002v1"}),
+        pdf_parser=FakeParser(),
+        max_concurrent_downloads=2,
+        max_concurrent_parsing=1,
+    )
+    repo = PaperRepository(db_session)
+    before = repo.get_count()
+
+    results = await fetcher.fetch_and_process_papers(db_session=db_session)
+
+    assert results["papers_stored"] == 2
+    parsed = repo.get_by_arxiv_id("9999.10001v1")
+    assert parsed.pdf_processed is True
+    assert parsed.raw_text == "Full text of 9999.10001v1"
+    metadata_only = repo.get_by_arxiv_id("9999.10002v1")
+    assert metadata_only.pdf_processed is False
+    assert metadata_only.raw_text is None
+
+    await fetcher.fetch_and_process_papers(db_session=db_session)
+    assert repo.get_count() == before + 2</code></pre>
+  <p>
+    Fakes for the network, the real database for storage, and the savepoint fixture from Module 1 cleans up. Running the pipeline twice
+    proves idempotency: the count grows by 2, not 4. The import from <code>tests.unit.services...</code> is why you created
+    <code>tests\unit\services\__init__.py</code> on Day 1.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q</code></pre>
+  <p>
+    <code>87 passed</code> (81 + 6), with your Postgres running. Optional end-to-end run on your laptop (real arXiv, real Docling, your database;
+    slow, because it parses on your CPU):
+  </p>
+  <pre><code>$env:POSTGRES_DATABASE_URL="postgresql+psycopg2://rag_user:rag_password@localhost:15432/rag_db"
+uv run python -c "import asyncio, src.models.paper; from src.db.factory import make_database; from src.services.arxiv.factory import make_arxiv_client; from src.services.pdf_parser.factory import make_pdf_parser_service; from src.services.metadata_fetcher import make_metadata_fetcher; db = make_database(); f = make_metadata_fetcher(make_arxiv_client(), make_pdf_parser_service()); s = db.get_session().__enter__(); print(asyncio.run(f.fetch_and_process_papers(max_results=2, db_session=s)))"</code></pre>
+  <p>Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-day4" /><span>Day 4 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove <code>return_exceptions=True</code>. The "one bad paper" test now fails with the raw <code>MetadataFetchingException</code>: the first failure aborts the batch.
+      That's the difference between a flaky PDF and a lost day.</li>
+    <li>Move the parse step inside the <code>async with download_semaphore:</code> block. Tests still pass, but in production a slow parse now holds a download
+      slot. Explain why the semaphore test can't see it. (Its fake parse takes no time.)</li>
+    <li>In <code>_store_papers_to_db</code>, call <code>paper_repo.create</code> instead of <code>upsert</code>. The integration test's second run fails with
+      <code>IntegrityError</code>... or does it? Look at the <code>try</code>/<code>except</code> around each paper, read the test output, and explain.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 5                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day5"><span class="day">Day 5</span>Airflow: running the pipeline on a schedule</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A script you remember to run isn't a pipeline. Airflow runs the ingestion every weekday at 6 a.m., retries failures, keeps
+    logs per run, and shows what happened in a web UI. It's the industry-standard scheduler, and "how does your data get in?" is
+    one of the first interview questions about any RAG system.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>DAG</td><td>Directed acyclic graph: a workflow of tasks with arrows between them and no loops. Defined in a Python file in the <code>dags/</code> folder.</td></tr>
+    <tr><td>Task / operator</td><td>A task is one step. An operator is the kind of step: <code>PythonOperator</code> calls a function, <code>BashOperator</code> runs a shell command.</td></tr>
+    <tr><td>Schedule</td><td>When to run, often as a <b>cron</b> expression: <code>"0 6 * * 1-5"</code> = minute 0, hour 6 (UTC), every day of the month, every month, Monday to Friday.</td></tr>
+    <tr><td><code>start_date</code> and catchup</td><td>The first date the DAG is valid. With <code>catchup=True</code>, Airflow would create a run for every missed interval since then; <code>False</code> runs only the latest.</td></tr>
+    <tr><td>Logical date</td><td>The date a run "is for" (called <code>execution_date</code> in this code). A manual trigger gets the current time.</td></tr>
+    <tr><td>XCom</td><td>"Cross-communication": small values one task stores and another reads, kept in Airflow's database. For counters, not for PDFs.</td></tr>
+    <tr><td>Scheduler, webserver, executor</td><td>The scheduler decides what should run; the executor runs it (<code>LocalExecutor</code>: as processes in the same container); the webserver is the UI.</td></tr>
+    <tr><td>Metadata database</td><td>Where Airflow stores runs, task states, XComs, and users. Here it's your <code>rag_db</code>, next to <code>papers</code>.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>airflow/dags/arxiv_paper_ingestion.py</b></p>
+  <table class="walk">
+    <tr><td><pre><code>default_args = {
+    "owner": "arxiv-curator",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 8, 8),
+    ...
+    "retries": 2,
+    "retry_delay": timedelta(minutes=30),
+    "catchup": False,
+}</code></pre></td>
+      <td>Defaults for every task: retry a failed task twice, 30 minutes apart. (<code>catchup</code> belongs on the DAG, not here; it's set correctly below.)</td></tr>
+    <tr><td><pre><code>dag = DAG(
+    "arxiv_paper_ingestion",
+    default_args=default_args,
+    description="...",
+    schedule="0 6 * * 1-5",  # Monday-Friday at 6 AM UTC
+    max_active_runs=1,
+    catchup=False,
+    tags=[...],
+)</code></pre></td>
+      <td>The DAG's ID is what you see in the UI. <code>max_active_runs=1</code>: never two ingestions at once.</td></tr>
+    <tr><td><pre><code>setup_task = PythonOperator(
+    task_id="setup_environment",
+    python_callable=setup_environment,
+    dag=dag,
+)</code></pre></td>
+      <td>A task that calls your function. <code>fetch_daily_papers</code>, <code>index_papers_hybrid</code>, and <code>generate_daily_report</code> follow the same shape, and <code>cleanup_temp_files</code> is a <code>BashOperator</code>.</td></tr>
+    <tr><td><pre><code>setup_task &gt;&gt; fetch_task &gt;&gt; index_hybrid_task &gt;&gt; report_task &gt;&gt; cleanup_task</code></pre></td>
+      <td><code>&gt;&gt;</code> draws the arrows. Yours, this module: <code>setup_task &gt;&gt; fetch_task &gt;&gt; report_task</code>. Indexing and cleanup arrive in Module 4.</td></tr>
+  </table>
+
+  <p class="file"><b>airflow/dags/arxiv_ingestion/common.py</b></p>
+  <pre><code>sys.path.insert(0, "/opt/airflow")
+
+from src.db.factory import make_database
+from src.services.arxiv.factory import make_arxiv_client
+from src.services.metadata_fetcher import make_metadata_fetcher
+from src.services.opensearch.factory import make_opensearch_client
+from src.services.pdf_parser.factory import make_pdf_parser_service
+
+
+@lru_cache(maxsize=1)
+def get_cached_services() -&gt; Tuple[Any, Any, Any, Any, Any]:
+    arxiv_client = make_arxiv_client()
+    pdf_parser = make_pdf_parser_service()
+    database = make_database()
+    opensearch_client = make_opensearch_client()
+    metadata_fetcher = make_metadata_fetcher(arxiv_client, pdf_parser)
+    return arxiv_client, pdf_parser, database, metadata_fetcher, opensearch_client</code></pre>
+  <p>
+    Compose mounts your <code>src/</code> at <code>/opt/airflow/src</code>; putting <code>/opt/airflow</code> on the path makes <code>from src...</code>
+    work. The DAG code reuses exactly the services you built. Importing <code>metadata_fetcher</code> imports the repository and the model,
+    which is why <code>make_database()</code> here creates the <code>papers</code> table (Module 1, Day 4). <code>lru_cache</code> builds the services
+    once per process. Each task runs in its own process, so in practice once per task.
+  </p>
+
+  <p class="file"><b>airflow/dags/arxiv_ingestion/fetching.py</b> &middot; the main task</p>
+  <table class="walk">
+    <tr><td><pre><code>def fetch_daily_papers(**context):</code></pre></td>
+      <td>Airflow calls the function with a <b>context</b>: keyword arguments like <code>execution_date</code> and <code>ti</code> (the task instance).</td></tr>
+    <tr><td><pre><code>execution_date = context.get("execution_date")
+if execution_date:
+    target_dt = execution_date - timedelta(days=1)
+    target_date = target_dt.strftime("%Y%m%d")</code></pre></td>
+      <td>Fetch the day <em>before</em> the logical date: at 6 a.m. Tuesday, get Monday's submissions.</td></tr>
+    <tr><td><pre><code>results = asyncio.run(
+    run_paper_ingestion_pipeline(target_date=target_date, process_pdfs=True)
+)</code></pre></td>
+      <td>Airflow tasks are ordinary synchronous functions; <code>asyncio.run</code> starts an event loop for the async pipeline and waits for it.</td></tr>
+    <tr><td><pre><code>with database.get_session() as session:
+    return await metadata_fetcher.fetch_and_process_papers(
+        max_results=max_results, from_date=target_date, to_date=target_date,
+        process_pdfs=process_pdfs, store_to_db=True, db_session=session,
+    )</code></pre></td>
+      <td>Inside <code>run_paper_ingestion_pipeline</code>: one session for the whole run, handed to the fetcher.</td></tr>
+    <tr><td><pre><code>results["date"] = target_date
+ti = context.get("ti")
+if ti:
+    ti.xcom_push(key="fetch_results", value=results)
+return results</code></pre></td>
+      <td>Store the counters in XCom for the report task. (The return value is also pushed automatically, under the key <code>return_value</code>.)</td></tr>
+  </table>
+  <p>
+    <code>setup.py</code> checks the database with <code>SELECT 1</code> (and, in the reference, creates the OpenSearch index), then returns
+    <code>{"status": "success", ...}</code>. <code>reporting.py</code> pulls <code>fetch_results</code> with
+    <code>ti.xcom_pull(task_ids="fetch_daily_papers", key="fetch_results")</code>, counts rows in <code>papers</code>, logs a JSON report, and pushes it as
+    <code>daily_report</code>.
+  </p>
+
+  <p class="file"><b>airflow/Dockerfile</b> &middot; the Airflow image (working-tree version)</p>
+  <table class="walk">
+    <tr><td><pre><code>FROM python:3.12-slim
+ENV AIRFLOW_HOME=/opt/airflow
+ENV AIRFLOW_VERSION=2.10.3</code></pre></td>
+      <td>Plain Python image, Airflow installed by hand, pinned to 2.10.3.</td></tr>
+    <tr><td><pre><code>RUN apt-get update &amp;&amp; \
+    apt-get install -y --no-install-recommends \
+        build-essential curl git libpq-dev poppler-utils tesseract-ocr \
+        libgl1 libglib2.0-0t64 \
+        &amp;&amp; rm -rf /var/lib/apt/lists/*</code></pre></td>
+      <td>System libraries: compilers, the Postgres client library, PDF and OCR tools. <code>libgl1</code> and <code>libglib2.0-0t64</code> were added this week because Docling's image libraries need them on the current Debian base.</td></tr>
+    <tr><td><pre><code>RUN groupadd -r -g 50000 airflow &amp;&amp; useradd -r -u 50000 -g airflow ...</code></pre></td>
+      <td>Run as a non-root user with UID 50000, Airflow's convention.</td></tr>
+    <tr><td><pre><code>COPY constraints-3.12.txt /tmp/constraints.txt</code></pre></td>
+      <td>Airflow publishes a <b>constraints file</b> pinning every dependency to versions tested together. It's normally downloaded from GitHub, which this proxy blocks, so the working tree vendors (copies in) the file.</td></tr>
+    <tr><td><pre><code>RUN --mount=type=cache,target=/root/.cache/pip \
+    sh -c 'i=0; until pip install --retries 5 --timeout 120 \
+      "apache-airflow[postgres]==${AIRFLOW_VERSION}" \
+      --constraint /tmp/constraints.txt \
+      psycopg2-binary; do \
+      i=$((i+1)); if [ $i -ge 8 ]; then echo "pip: giving up after $i attempts"; exit 1; fi; \
+      echo "pip: attempt $i failed, retrying..."; sleep 5; done'</code></pre></td>
+      <td>A shell <code>until</code> loop: run pip; if it fails, count, give up after 8 attempts, otherwise wait 5 seconds and retry. The pip cache mount keeps wheels that did download correctly, so each retry only re-fetches what failed.</td></tr>
+    <tr><td><pre><code>COPY requirements-airflow.txt /tmp/requirements-airflow.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    sh -c 'i=0; until pip install --retries 5 --timeout 120 -r /tmp/requirements-airflow.txt; do ... done'</code></pre></td>
+      <td>The project's own task dependencies (httpx, SQLAlchemy 1.4, Docling, opensearch-py, ...), same retry loop with up to 12 attempts. This is the multi-gigabyte layer.</td></tr>
+    <tr><td><pre><code>COPY corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt
+RUN update-ca-certificates &amp;&amp; \
+    cat /usr/local/share/ca-certificates/corp-ca.crt &gt;&gt; "$(python -c 'import certifi; print(certifi.where())')"</code></pre></td>
+      <td>Trust the proxy's certificate twice: in the system store, and in certifi's bundle for httpx and requests (arXiv downloads, Hugging Face models). The build context is <code>./airflow</code>, so the cert must be copied into that folder.</td></tr>
+    <tr><td><pre><code>COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh &amp;&amp; chmod +x /entrypoint.sh
+USER airflow
+CMD ["/entrypoint.sh"]</code></pre></td>
+      <td>Strip Windows line endings (CRLF): git on Windows may convert the script, and <code>#!/bin/bash\r</code> is not a valid interpreter. Then make it executable and switch users.</td></tr>
+  </table>
+  <div class="callout story">
+    <b>What happened here this week</b>
+    Building this image failed repeatedly with <code>THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE</code> on large wheels like torch.
+    pip checks every download against a known hash, and the TLS-inspecting proxy was intermittently corrupting big files. Nothing was wrong
+    with the packages. The fix is the retry loop plus the cache mount above: verified wheels survive between attempts, so eventually every
+    wheel arrives clean. The resulting image is 11.4 GB. Lesson: when a checksum fails behind a proxy, suspect the network before the package.
+  </div>
+
+  <p class="file"><b>airflow/entrypoint.sh</b></p>
+  <pre><code>airflow db init
+airflow users create \
+    --username admin \
+    --firstname Admin \
+    --lastname User \
+    --role Admin \
+    --email admin@example.com \
+    --password admin || echo "Admin user already exists"
+
+airflow webserver --port 8080 --daemon &amp;
+airflow scheduler</code></pre>
+  <p>
+    Create or upgrade Airflow's tables, create the <code>admin</code>/<code>admin</code> login (<code>||</code> ignores "already exists" on restarts), start
+    the webserver in the background, and run the scheduler in the foreground so the container lives as long as it does. (The top of the
+    script kills leftover processes and PID files from a previous run.)
+  </p>
+
+  <p class="file"><b>compose.yml</b> &middot; the reference airflow service</p>
+  <pre><code>  airflow:
+    build: 
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: rag-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - AIRFLOW_HOME=/opt/airflow
+      - PYTHONPATH=/opt/airflow/src
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      ...
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      ...
+      start_period: 120s</code></pre>
+  <p>
+    The two <b>bind mounts</b> are the key: your laptop's <code>airflow/dags</code> and <code>src</code> folders appear live inside the container. Edit a
+    file, and the next task run uses it, no rebuild. The <code>.env</code> supplies Airflow's own settings (<code>AIRFLOW__CORE__EXECUTOR</code> and so on).
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Part A: the task code, and tests for it</h4>
+  <pre><code>mkdir airflow\dags\arxiv_ingestion, airflow\plugins, tests\unit\dags
+ni airflow\dags\arxiv_ingestion\__init__.py</code></pre>
+  <ul>
+    <li><code>airflow/dags/arxiv_ingestion/common.py</code>: as the reference, but without the OpenSearch import. Keep the 5-item tuple so the other files
+      unpack it exactly like the reference: set <code>opensearch_client = None</code>. Module 3 replaces <code>None</code> with <code>make_opensearch_client()</code>.</li>
+    <li><code>setup.py</code>: the database check and the log lines, without the OpenSearch block.</li>
+    <li><code>fetching.py</code>: identical to the reference.</li>
+    <li><code>reporting.py</code>: <code>fetch_statistics</code> and <code>database_statistics</code> only; drop the <code>hybrid_stats</code> pull, the
+      <code>indexing_statistics</code>, and the OpenSearch statistics. Set <code>"pipeline_status": "success" if fetch_stats else "partial"</code>.</li>
+    <li><code>arxiv_paper_ingestion.py</code>: the reference DAG with only three tasks and <code>setup_task &gt;&gt; fetch_task &gt;&gt; report_task</code>.</li>
+  </ul>
+  <p>
+    Airflow itself isn't installed on your laptop, and the DAG file imports it, so you can't test the DAG file here. But the task
+    functions are plain Python. Tell pytest where the DAG folder is:
+  </p>
+  <p class="file"><b>pyproject.toml</b> (change one line)</p>
+  <pre><code>pythonpath = [".", "airflow/dags"]</code></pre>
+  <p class="file"><b>tests/unit/dags/test_ingestion_tasks.py</b></p>
+  <pre><code>from contextlib import contextmanager
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from arxiv_ingestion import fetching, reporting, setup
+
+
+class FakeTaskInstance:
+    def __init__(self):
+        self.xcom = {}
+
+    def xcom_push(self, key, value):
+        self.xcom[key] = value
+
+    def xcom_pull(self, task_ids, key):
+        return self.xcom.get(key)
+
+
+class FakeDatabase:
+    def __init__(self):
+        self.session = MagicMock()
+
+    @contextmanager
+    def get_session(self):
+        yield self.session
+
+
+@pytest.fixture
+def services(monkeypatch):
+    arxiv_client = MagicMock(max_results=5, base_url="https://export.arxiv.org/api/query")
+    database = FakeDatabase()
+    fetcher = MagicMock()
+    fetcher.fetch_and_process_papers = AsyncMock(return_value={"papers_fetched": 3, "papers_stored": 3, "errors": []})
+    bundle = (arxiv_client, MagicMock(), database, fetcher, None)
+    for module in (fetching, reporting, setup):
+        monkeypatch.setattr(module, "get_cached_services", lambda: bundle)
+    return bundle
+
+
+def test_fetch_targets_the_day_before_the_logical_date(services):
+    _, _, _, fetcher, _ = services
+    ti = FakeTaskInstance()
+
+    fetching.fetch_daily_papers(execution_date=datetime(2026, 9, 30, 6, 0), ti=ti)
+
+    kwargs = fetcher.fetch_and_process_papers.call_args.kwargs
+    assert kwargs["from_date"] == kwargs["to_date"] == "20260929"
+    assert kwargs["max_results"] == 5
+    assert kwargs["store_to_db"] is True
+    assert ti.xcom["fetch_results"]["date"] == "20260929"
+
+
+def test_report_reads_fetch_results_from_xcom(services):
+    _, _, database, _, _ = services
+    database.session.query.return_value.scalar.return_value = 42
+    ti = FakeTaskInstance()
+    ti.xcom["fetch_results"] = {"papers_fetched": 3, "papers_stored": 3, "date": "20260929"}
+
+    report = reporting.generate_daily_report(ti=ti, execution_date=datetime(2026, 9, 30, 6, 0))
+
+    assert report["fetch_statistics"]["papers_fetched"] == 3
+    assert report["database_statistics"]["total_papers"] == 42
+    assert report["pipeline_status"] == "success"
+    assert ti.xcom["daily_report"] is report
+
+
+def test_setup_succeeds_when_the_database_answers(services):
+    assert setup.setup_environment()["status"] == "success"
+
+
+def test_setup_fails_loudly_when_the_database_is_down(services):
+    _, _, database, _, _ = services
+    database.session.execute.side_effect = RuntimeError("connection refused")
+    with pytest.raises(Exception, match="Environment setup failed"):
+        setup.setup_environment()</code></pre>
+  <p>
+    The trick is <code>monkeypatch.setattr(module, "get_cached_services", ...)</code>: each task module did <code>from .common import get_cached_services</code>,
+    so the name to replace lives in each task module. Nothing real is built, so no database or arXiv is touched.
+  </p>
+
+  <h4>Part B: the image and the service</h4>
+  <ol>
+    <li>Copy the build files from the reference, and keep the certificate out of git:
+<pre><code>$ref = "..\production-agentic-rag-course\airflow"
+Copy-Item "$ref\Dockerfile", "$ref\entrypoint.sh", "$ref\requirements-airflow.txt", "$ref\constraints-3.12.txt", "$ref\corp-ca.crt" airflow\
+Add-Content .gitignore "airflow/corp-ca.crt"</code></pre>
+      Read each copied file against the walkthrough before you build. Keep <code>opensearch-py</code> in <code>requirements-airflow.txt</code> even though you
+      don't use it yet: adding it in Module 3 would force a rebuild of the heaviest layer.</li>
+    <li>Append the Airflow and PDF settings to <code>.env</code> (from the reference): <code>AIRFLOW__CORE__EXECUTOR=LocalExecutor</code>,
+      <code>AIRFLOW__CORE__LOAD_EXAMPLES=false</code>, <code>AIRFLOW__WEBSERVER__EXPOSE_CONFIG=true</code>, <code>AIRFLOW__HOME=/opt/airflow</code>,
+      <code>AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db</code>.</li>
+    <li>Add an <code>airflow</code> service to <code>compose.yml</code>, following the reference with your conventions: container name <code>curator-airflow</code>,
+      port <code>"18080:8080"</code>, volume <code>curator_airflow_logs</code> (declare it under <code>volumes:</code>), the same bind mounts, environment
+      (<code>AIRFLOW_HOME</code>, <code>PYTHONPATH</code>, <code>POSTGRES_DATABASE_URL</code>), healthcheck, <code>depends_on</code> postgres healthy, and <code>curator-network</code>.</li>
+  </ol>
+  <details class="hint"><summary>Hint: RAM and time</summary>
+    <p>The first build downloads several gigabytes; expect a long wait, and pip retry messages are normal. Your stack plus the reference stack
+      is a lot of containers; if Docker Desktop struggles, <code>docker compose stop</code> in the reference folder while you build.</p></details>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+docker compose up -d --build airflow
+docker compose ps
+docker exec curator-airflow airflow dags list-import-errors
+docker exec curator-airflow airflow dags unpause arxiv_paper_ingestion
+docker exec curator-airflow airflow dags trigger arxiv_paper_ingestion</code></pre>
+  <p>
+    Tests: <code>91 passed</code> (87 + 4). <code>curator-airflow</code> becomes <code>(healthy)</code> after up to about two minutes.
+    <code>list-import-errors</code> prints <code>No data found</code>. New DAGs start <b>paused</b>; unpausing lets the scheduler run it, and with
+    <code>catchup=False</code> it may start one run by itself for the latest weekday slot, besides the one you trigger.
+  </p>
+  <p>
+    Open <a href="http://localhost:18080">localhost:18080</a> and log in as <code>admin</code> / <code>admin</code>. Open <b>arxiv_paper_ingestion</b>: the
+    Graph view shows three boxes, <code>setup_environment</code> &rarr; <code>fetch_daily_papers</code> &rarr; <code>generate_daily_report</code>. Click the running
+    fetch task and open its <b>Logs</b>. The first parse downloads Docling's models inside the container. For comparison, the reference runs this
+    week took 15 to 35 minutes for 15 papers (<code>Pipeline completed in 924.2s: 15 papers, 11 PDFs, 4 errors</code>); with 5 papers expect less.
+    A few errors are normal: papers over 30 pages are skipped. When all three boxes are green:
+  </p>
+  <pre><code>docker exec curator-postgres psql -U rag_user -d rag_db -c "SELECT arxiv_id, left(title, 50) AS title, pdf_processed, length(raw_text) AS chars FROM papers ORDER BY published_date DESC LIMIT 10;"</code></pre>
+  <p>
+    You should see yesterday's papers (IDs with <code>v1</code>), most with <code>pdf_processed = t</code> and tens of thousands of characters. Also try
+    <code>\dt</code> in psql: dozens of Airflow tables (<code>dag_run</code>, <code>xcom</code>, ...) share the database with <code>papers</code>. Commit.
+  </p>
+  <div class="callout info"><b>What I could and couldn't check for you</b>
+    I ran the unit tests on this page against the same code in a scratch project. I did not build the Airflow image or run the DAG in
+    Airflow (the rules for this guide forbid me running Docker builds on your machine), so the image build and the UI run are yours to
+    discover. If the fetch task fails, read its log from the bottom up; the error is almost always one of this module's "Break it" cases.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-day5" /><span>DAG ran green in Airflow on 18080, papers visible in your Postgres, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Add a syntax error to <code>airflow/dags/arxiv_ingestion/setup.py</code> and wait a minute. The UI shows a red "Broken DAG" banner, and
+      <code>airflow dags list-import-errors</code> shows the traceback. The bind mount means you broke production by saving a file. Fix it.</li>
+    <li>In the service, remove the <code>POSTGRES_DATABASE_URL</code> override and change <code>.env</code> to <code>localhost:15432</code>. Trigger the DAG.
+      <code>setup_environment</code> fails with <code>Environment setup failed: ... Connection refused</code>: inside the container, <code>localhost</code> is Airflow
+      itself. Revert.</li>
+    <li>In <code>fetching.py</code>, change the XCom key to <code>"results"</code>. The run is green, but the report says <code>papers_fetched: 0</code> and
+      <code>"pipeline_status": "partial"</code>. XCom keys are an unchecked contract between tasks; the unit test would have caught it. Revert.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 2" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. Walk me through how a paper gets from arXiv into your database.</summary>
+    <div class="answer">At 6 a.m. on weekdays, Airflow runs <code>setup &gt;&gt; fetch &gt;&gt; report</code>. The fetch task computes yesterday's date and calls the
+      metadata fetcher: the arXiv client queries <code>cat:cs.AI</code> with a <code>submittedDate</code> range and parses the Atom XML into <code>ArxivPaper</code>s;
+      each paper is downloaded (up to 5 at once, cached, retried) and parsed by Docling (1 at a time, in a worker thread); then every paper is
+      upserted into Postgres through the repository, with parsed text where available. Counters go to XCom and the report task logs them.</div></details>
+
+  <details class="drill"><summary>2. Why do XML namespaces matter when parsing arXiv's response?</summary>
+    <div class="answer">The feed declares Atom as the default namespace, so <code>&lt;entry&gt;</code> is really <code>{http://www.w3.org/2005/Atom}entry</code>. ElementTree's
+      <code>find("entry")</code> without a namespace map silently returns nothing. The client passes <code>{"atom": ..., "arxiv": ...}</code> and searches
+      <code>atom:entry</code>. A test that counts parsed entries catches the silent failure.</div></details>
+
+  <details class="drill"><summary>3. How does the client respect arXiv's rate limit, and what are the weaknesses?</summary>
+    <div class="answer">It remembers the last request time and <code>await asyncio.sleep</code>s for the rest of the 3 seconds before the next API call; downloads always
+      sleep the delay first. Weaknesses: the state is per client instance, and concurrent downloads each sleep independently, so five downloads can
+      still start at nearly the same moment. A shared async lock or token bucket would enforce a true global rate.</div></details>
+
+  <details class="drill"><summary>4. Describe the download retry logic. Is it exponential backoff?</summary>
+    <div class="answer">Up to 3 attempts; on a timeout or HTTP error it waits <code>5 &times; (attempt + 1)</code> seconds (5, then 10) and retries, then raises a specific
+      exception. Despite the comment, that's linear backoff. It also retries 404s, which can't succeed, and its partial-file cleanup is unreachable, so an
+      interrupted download could be cached as a broken file. I'd use exponential backoff with jitter, retry only transient errors, and write to a temp file then rename.</div></details>
+
+  <details class="drill"><summary>5. What does Docling do that plain text extraction doesn't?</summary>
+    <div class="answer">It runs layout models over each page to recover reading order and label regions as titles, section headers, paragraphs, and tables, so the
+      output has structure. The parser walks the text elements and starts a new section at each header, producing titled sections that the chunker later uses.
+      OCR is off because arXiv PDFs have embedded text.</div></details>
+
+  <details class="drill"><summary>6. Tell me about the "can't be used in 'await' expression" bug.</summary>
+    <div class="answer">An upstream commit made <code>DoclingParser.parse_pdf</code> synchronous but the service still did <code>await self.docling_parser.parse_pdf(...)</code>. Every
+      parse succeeded, then awaiting the returned <code>PdfContent</code> raised a <code>TypeError</code>, so the 25 September run stored all 15 papers without text. The fix,
+      <code>await asyncio.to_thread(...)</code>, makes the call awaitable and runs the CPU-bound parse in a thread so downloads keep flowing. I have a test that fails if the
+      call blocks the event loop.</div></details>
+
+  <details class="drill"><summary>7. Why two semaphores with different limits?</summary>
+    <div class="answer">Downloads are I/O-bound: overlapping five of them mostly overlaps waiting. Parsing is CPU- and memory-heavy: on a laptop, two parallel Docling parses
+      are slower per paper and double memory. The download slot is released before parsing, so the stages pipeline: one paper parses while others download.</div></details>
+
+  <details class="drill"><summary>8. How does one bad PDF not break the whole run? What's the catch in the counters?</summary>
+    <div class="answer"><code>asyncio.gather(..., return_exceptions=True)</code> turns each paper's failure into a value, and storage wraps each upsert in its own <code>try</code>. Every paper is
+      stored, with or without content. The catch: an exception during parsing replaces the whole result, so a successful download isn't counted. That's why a log
+      can say <code>0/15 downloaded</code> when the PDFs are on disk.</div></details>
+
+  <details class="drill"><summary>9. Why is ingestion idempotent, and why does that matter?</summary>
+    <div class="answer">Papers are upserted by <code>arxiv_id</code>, and PDFs are cached on disk, so re-running a day updates rows instead of duplicating them and doesn't re-download.
+      Airflow retries tasks (2 retries here) and people re-trigger runs; without idempotency every retry would create duplicates.</div></details>
+
+  <details class="drill"><summary>10. Explain DAG, task, operator, schedule, catchup, and XCom using this project.</summary>
+    <div class="answer">The DAG <code>arxiv_paper_ingestion</code> is the workflow; its tasks are <code>PythonOperator</code>s calling <code>setup_environment</code>, <code>fetch_daily_papers</code>,
+      and <code>generate_daily_report</code>, chained with <code>&gt;&gt;</code>. The cron schedule <code>0 6 * * 1-5</code> runs weekdays at 06:00 UTC. <code>catchup=False</code> stops Airflow
+      back-filling every weekday since the 2025 start date. The fetch task pushes its counters to XCom under <code>fetch_results</code>, and the report task pulls them.</div></details>
+
+  <details class="drill"><summary>11. Why did the Airflow image build keep failing, and how was it fixed?</summary>
+    <div class="answer">pip reported hash mismatches on large wheels. The corporate TLS-inspecting proxy was intermittently corrupting big downloads; the packages were fine. The
+      Dockerfile now uses a BuildKit pip cache mount so verified wheels persist, and a shell retry loop re-runs pip up to 8 or 12 times. It also vendors Airflow's
+      constraints file because GitHub raw is blocked, and adds the corporate CA to certifi for runtime HTTPS.</div></details>
+
+  <details class="drill"><summary>12. How does the Airflow container run your application code without copying it into the image?</summary>
+    <div class="answer">Compose bind-mounts <code>./src</code> to <code>/opt/airflow/src</code> and <code>./airflow/dags</code> to <code>/opt/airflow/dags</code>. <code>common.py</code> adds <code>/opt/airflow</code> to
+      <code>sys.path</code>, so tasks import the same <code>src.services...</code> as the API. Edits take effect on the next run without a rebuild. The trade-off: the image
+      doesn't pin the code version, and a broken save breaks the live DAG.</div></details>
+
+  <details class="drill"><summary>13. The same <code>src/</code> runs in the API and in Airflow. What compatibility issue did that create?</summary>
+    <div class="answer">Airflow 2.10 requires SQLAlchemy 1.4 (<code>requirements-airflow.txt</code> pins <code>&lt;2.0</code>), while the API uses 2.x. The shared code must work on both:
+      <code>select()</code>, <code>session.scalar()</code>, and <code>sqlalchemy.orm.declarative_base</code> exist in both versions. Anything 2.0-only in <code>src/</code> would break ingestion.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m2-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 3</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m2-tests" /><span><code>uv run pytest -q</code> shows 91 passed</span></li>
+    <li><input type="checkbox" data-id="m2-dag" /><span>The DAG has run green at least once, and <code>SELECT count(*) FROM papers</code> in <code>curator-postgres</code> is above zero</span></li>
+    <li><input type="checkbox" data-id="m2-logs" /><span>You read a full fetch-task log and can explain every warning and error in it</span></li>
+    <li><input type="checkbox" data-id="m2-git" /><span><code>certs/</code>, <code>airflow/corp-ca.crt</code>, <code>data/</code>, and <code>.env</code> are not in git</span></li>
+  </ul>
+  <p>
+    Then send me "Module 2 passed". Module 3 makes those papers searchable: OpenSearch, analyzers, BM25, and your first search endpoint.
+  </p>
+  <p><a href="module-03-keyword-search.html">Next: Module 3 &mdash; Keyword search &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

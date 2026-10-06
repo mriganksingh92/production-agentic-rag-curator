@@ -1,0 +1,1531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 1 — Infrastructure</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 1 &middot; 6 days</p>
+    <h1><span class="grad">Infrastructure</span>: an API, a database, and a stack you run yourself</h1>
+    <p class="lede">
+      This module turns your playground into a real application. You'll write a FastAPI service with settings, dependency
+      injection, PostgreSQL behind SQLAlchemy, a repository for papers, and a Docker image. By the end,
+      <code>docker compose up -d --build</code> starts Redis, Postgres, and your API, and
+      <code>http://localhost:18000/api/v1/health</code> reports the database healthy.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: FastAPI basics</span>
+      <span class="pill">Day 2: settings, lifespan, dependency injection</span>
+      <span class="pill">Day 3: SQL, PostgreSQL, SQLAlchemy</span>
+      <span class="pill">Day 4: model and repository</span>
+      <span class="pill">Day 5: health check with a real dependency</span>
+      <span class="pill">Day 6: Dockerfile and Compose</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 1</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: FastAPI basics</a></li>
+      <li><a href="#day2">Day 2: Settings, lifespan, and dependency injection</a></li>
+      <li><a href="#day3">Day 3: SQL, PostgreSQL, and the database layer</a></li>
+      <li><a href="#day4">Day 4: The Paper model and the repository</a></li>
+      <li><a href="#day5">Day 5: The health check, exceptions, and testing with overrides</a></li>
+      <li><a href="#day6">Day 6: The API Dockerfile and Compose stack</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 2</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>How to use this page</b>
+    From now on, your code lives in <code>src/</code> with the <b>same paths and names as the reference repo</b>
+    (<code>src/config.py</code>, <code>src/routers/ping.py</code>, ...). That lets you open your file and the reference file side by
+    side and diff them. Your versions will be shorter; where I tell you to leave something out, that's deliberate, and a
+    later module adds it back. The reference repo is still read-only: read it, never edit it.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>FastAPI basics</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Every feature of this project, from search to the agent, is reached through one HTTP API. FastAPI is the framework
+    that turns Python functions into HTTP endpoints. It reads your type hints and Pydantic models to validate requests,
+    shape responses, and generate the <code>/docs</code> page for free. Once you can read one endpoint, you can read all of them.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>App</td><td>The <code>FastAPI()</code> object. It holds every route and is what the server runs.</td></tr>
+    <tr><td>Path operation</td><td>One method + path pair, like <code>GET /api/v1/health</code>, mapped to one Python function (the "endpoint").</td></tr>
+    <tr><td>Router</td><td>An <code>APIRouter()</code>: a group of path operations in its own file. The app includes routers, optionally under a prefix like <code>/api/v1</code>.</td></tr>
+    <tr><td>Response model</td><td>A Pydantic model named in <code>response_model=</code>. FastAPI validates what you return against it and filters out extra fields.</td></tr>
+    <tr><td>OpenAPI</td><td>A standard JSON description of an API. FastAPI builds it at <code>/openapi.json</code>; <code>/docs</code> is an interactive page drawn from it.</td></tr>
+    <tr><td>ASGI server (uvicorn)</td><td>The program that listens on a port, receives HTTP, and calls your app. FastAPI is the app; uvicorn is the server.</td></tr>
+  </table>
+  <p>
+    FastAPI decides where each function parameter comes from by its type: a Pydantic model means "JSON body", a plain
+    <code>int</code> in the path means "path parameter", and a special marker (<code>Depends</code>, tomorrow) means "compute it
+    for me". Return values are converted to JSON.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/main.py</b> &middot; creating the app and including routers (bottom of the file)</p>
+  <table class="walk">
+    <tr><td><pre><code>app = FastAPI(
+    title="arXiv Paper Curator API",
+    description="Personal arXiv CS.AI paper curator with RAG capabilities",
+    version=os.getenv("APP_VERSION", "0.1.0"),
+    lifespan=lifespan,
+)</code></pre></td>
+      <td>The one app object. <code>title</code>, <code>description</code>, and <code>version</code> appear on <code>/docs</code>. The version comes from an environment variable that the Dockerfile sets. <code>lifespan</code> is startup/shutdown code; that's Day 2.</td></tr>
+    <tr><td><pre><code>app.include_router(ping.router, prefix="/api/v1")  # Health check endpoint</code></pre></td>
+      <td>Attach every route in <code>ping.router</code> under <code>/api/v1</code>. The router says <code>/health</code>; the result is <code>/api/v1/health</code>.</td></tr>
+    <tr><td><pre><code>app.include_router(hybrid_search.router, prefix="/api/v1")
+...
+app.include_router(agentic_ask.router)</code></pre></td>
+      <td>The other routers, added in Modules 3&ndash;7. Your Module 1 app includes <b>only</b> the ping router.</td></tr>
+    <tr><td><pre><code>if __name__ == "__main__":
+    uvicorn.run(app, port=8000, host="0.0.0.0")</code></pre></td>
+      <td>Lets you run the file directly. <code>0.0.0.0</code> means "accept connections on every network interface", which matters inside a container.</td></tr>
+  </table>
+
+  <p class="file"><b>src/schemas/api/health.py</b> &middot; the response model</p>
+  <pre><code>class ServiceStatus(BaseModel):
+    """Individual service status."""
+
+    status: str = Field(..., description="Service status", example="healthy")
+    message: Optional[str] = Field(None, description="Status message", example="Connected successfully")
+
+
+class HealthResponse(BaseModel):
+    """Health check response model."""
+
+    status: str = Field(..., description="Overall health status", example="ok")
+    version: str = Field(..., description="Application version", example="0.1.0")
+    environment: str = Field(..., description="Deployment environment", example="development")
+    service_name: str = Field(..., description="Service identifier", example="rag-api")
+    services: Optional[Dict[str, ServiceStatus]] = Field(None, description="Individual service statuses")</code></pre>
+  <p>
+    A health response is an overall status plus one <code>ServiceStatus</code> per dependency (database, OpenSearch, Ollama).
+    <code>services</code> is a dictionary from a name to a nested model, so the JSON nests too. The <code>example=</code> keyword
+    is Pydantic v1 style; with v2 you'll see a deprecation warning for each one in the test output. It's harmless.
+  </p>
+
+  <p class="file"><b>src/routers/ping.py</b> &middot; the path operation (first lines)</p>
+  <pre><code>router = APIRouter()
+
+
+@router.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check(settings: SettingsDep, database: DatabaseDep, opensearch_client: OpenSearchDep) -&gt; HealthResponse:</code></pre>
+  <p>
+    <code>@router.get("/health", ...)</code> registers the function for <code>GET /health</code>. <code>tags</code> groups it on
+    <code>/docs</code>. The three parameters are dependencies (Day 2 and Day 5). Today you'll write a version with no
+    parameters that returns fixed values.
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: dependencies and folders</h4>
+  <pre><code>cd C:\Users\mrigsing\Downloads\my-paper-curator
+uv add "fastapi[standard]" uvicorn
+mkdir src\routers, src\schemas\api, tests\api\routers
+ni src\__init__.py, src\routers\__init__.py, src\schemas\__init__.py, src\schemas\api\__init__.py
+ni tests\__init__.py, tests\api\__init__.py</code></pre>
+  <p>
+    <code>fastapi[standard]</code> installs FastAPI plus its usual extras (uvicorn, the test client's HTTP library, and more).
+    The quotes stop PowerShell from treating the brackets specially. The empty <code>__init__.py</code> files make each folder
+    a package so <code>from src.routers import ping</code> works. The reference repo leaves some of them out (Python's
+    "namespace packages" still work without them), but being explicit avoids surprises.
+  </p>
+  <div class="callout warn"><b>Certificate errors from uv</b>
+    As in Module 0, run <code>$env:UV_SYSTEM_CERTS=1</code> first. Older guides call it <code>UV_NATIVE_TLS</code>; uv 0.12
+    still accepts that name but prints a deprecation warning.</div>
+
+  <h4>Step B: write the code</h4>
+  <ol>
+    <li><code>src/schemas/api/health.py</code>: type <code>ServiceStatus</code> and <code>HealthResponse</code> exactly as quoted above
+      (you may skip the inner <code>Config</code> example class in the reference).</li>
+    <li><code>src/routers/ping.py</code>: <code>router = APIRouter()</code> and <code>async def health_check() -&gt; HealthResponse</code>
+      on <code>GET /health</code> with <code>response_model=HealthResponse</code> and <code>tags=["Health"]</code>. For today, return
+      status <code>"ok"</code>, version <code>"0.1.0"</code>, environment <code>"development"</code>, service name <code>"rag-api"</code>.</li>
+    <li><code>src/main.py</code>: create <code>app = FastAPI(...)</code> with the same title and description as the reference, and include
+      <code>ping.router</code> under <code>/api/v1</code>. No lifespan yet.</li>
+  </ol>
+  <details class="hint"><summary>Hint: relative imports</summary>
+    <p>The reference writes <code>from ..schemas.api.health import HealthResponse</code> inside <code>src/routers/ping.py</code>: two dots
+      mean "go up from <code>routers</code> to <code>src</code>". <code>from src.schemas.api.health import HealthResponse</code> works too.</p></details>
+
+  <h4>Step C: type the tests</h4>
+  <p>
+    FastAPI's <code>TestClient</code> calls your app in memory, without a real server or port. Used in a <code>with</code> block,
+    it also runs the app's startup and shutdown code. A <b>fixture</b> in <code>conftest.py</code> is shared by every test in
+    that folder and below.
+  </p>
+  <p class="file"><b>tests/api/conftest.py</b> (Day 1 version)</p>
+  <pre><code>import pytest
+from fastapi.testclient import TestClient
+
+from src.main import app
+
+
+@pytest.fixture
+def client():
+    with TestClient(app) as test_client:
+        yield test_client</code></pre>
+  <p class="file"><b>tests/api/routers/test_ping.py</b></p>
+  <pre><code>def test_health_returns_ok(client):
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["service_name"] == "rag-api"
+
+
+def test_health_has_exactly_the_response_model_fields(client):
+    data = client.get("/api/v1/health").json()
+    assert set(data) == {"status", "version", "environment", "service_name", "services"}
+
+
+def test_openapi_lists_the_health_path(client):
+    schema = client.get("/openapi.json").json()
+    assert schema["info"]["title"] == "arXiv Paper Curator API"
+    assert "/api/v1/health" in schema["paths"]
+
+
+def test_unknown_path_is_404(client):
+    assert client.get("/api/v1/nope").status_code == 404
+
+
+def test_wrong_method_is_405(client):
+    assert client.post("/api/v1/health").status_code == 405</code></pre>
+  <p>
+    The second test checks that the JSON has exactly the model's fields, including <code>services</code> (which is
+    <code>null</code> today). 405 means "Method Not Allowed": the path exists, but not for POST.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+uv run uvicorn src.main:app --reload --port 18000</code></pre>
+  <p>
+    Tests: <code>29 passed</code> (24 from Module 0 plus 5 new). You'll also see a handful of warnings: Pydantic's
+    <code>example=</code> deprecation and a Starlette note about <code>httpx</code>. Both are harmless. Then open
+    <a href="http://localhost:18000/docs">localhost:18000/docs</a>, expand <b>GET /api/v1/health</b>, and click "Try it out" and
+    "Execute". <code>--reload</code> restarts the server whenever you save a file. Stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>. Commit.
+  </p>
+  <div class="callout info"><b>Port 18000</b>
+    Your API gets port 18000 (reference 8000 + 10000) so it never clashes with the reference stack. On Day 6 the Docker
+    container takes this port, so remember to stop any <code>uvicorn</code> you started by hand.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Make the endpoint return a dict without <code>service_name</code>. The test fails with
+      <code>fastapi.exceptions.ResponseValidationError</code>. That's the response model catching <em>your</em> bug; a real client would
+      get a 500 instead of malformed data.</li>
+    <li>Change the prefix to <code>/api/v2</code>. Four tests fail with 404. Where is the path actually assembled?</li>
+    <li>Run uvicorn with <code>src.main:application</code>. Read the error: uvicorn imports the module, then looks for that attribute name.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Settings, lifespan, and dependency injection</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Hard-coded values don't survive contact with Docker: inside a container, Postgres is at <code>postgres:5432</code>; on your
+    laptop, at <code>localhost:15432</code>. The project solves this with three patterns you'll meet in every file: a
+    <b>settings</b> class that reads the environment, a <b>lifespan</b> that creates expensive objects once at startup, and
+    <b>dependency injection</b> that hands those objects to each endpoint.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>pydantic-settings, the real version</h4>
+  <p>
+    You built a small <code>CuratorSettings</code> in Module 0. The reference uses the same library with two more ideas:
+    one settings class per subsystem, each with its own environment prefix (<code>ARXIV__</code>, <code>OPENSEARCH__</code>), and a
+    top-level <code>Settings</code> that contains them. Values come from, in order of priority: arguments you pass, real
+    environment variables, the <code>.env</code> file, then the defaults in the class.
+  </p>
+  <h4>Lifespan</h4>
+  <p>
+    A <b>lifespan</b> is an async context manager that FastAPI runs around the app's whole life: code before
+    <code>yield</code> runs once at startup, code after it once at shutdown. It's where the API opens its database pool and
+    creates its clients. <code>app.state</code> is a place to keep those objects so any request can reach them.
+  </p>
+  <h4>Dependency injection</h4>
+  <p>
+    <b>Dependency injection</b> means a function declares what it needs, and something else provides it. In FastAPI you write
+    <code>settings: Annotated[Settings, Depends(get_settings)]</code>: "before calling me, call <code>get_settings()</code> and pass the
+    result". The payoff comes in tests: <code>app.dependency_overrides[get_settings] = fake</code> swaps the provider without touching
+    the endpoint. <code>Annotated[...]</code> just attaches extra information (the <code>Depends</code>) to a type. The project gives
+    each combination a short alias, like <code>SettingsDep</code>.
+  </p>
+  <h4><code>lru_cache</code></h4>
+  <p>
+    <code>@lru_cache</code> (from <code>functools</code>) remembers a function's return value per argument combination. On a
+    function with no arguments, it means "compute once, then return the same object forever": a cheap singleton.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/config.py</b> &middot; the base class and the top-level Settings</p>
+  <table class="walk">
+    <tr><td><pre><code>PROJECT_ROOT = Path(__file__).parent.parent
+ENV_FILE_PATH = PROJECT_ROOT / ".env"</code></pre></td>
+      <td><code>__file__</code> is this file's path; two <code>.parent</code>s go from <code>src/config.py</code> to the project root. So <code>.env</code> is found even if you start Python from another folder.</td></tr>
+    <tr><td><pre><code>class BaseConfigSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=[".env", str(ENV_FILE_PATH)],
+        extra="ignore",
+        frozen=True,
+        env_nested_delimiter="__",
+        case_sensitive=False,
+    )</code></pre></td>
+      <td>Shared configuration. <code>extra="ignore"</code> matters because one <code>.env</code> feeds many classes: each ignores the others' variables. <code>frozen=True</code> makes settings read-only. <code>env_nested_delimiter="__"</code> is how <code>ARXIV__MAX_RESULTS</code> can reach a nested field.</td></tr>
+    <tr><td><pre><code>class Settings(BaseConfigSettings):
+    app_version: str = "0.1.0"
+    debug: bool = True
+    environment: Literal["development", "staging", "production"] = "development"
+    service_name: str = "rag-api"</code></pre></td>
+      <td>No prefix, so <code>ENVIRONMENT=production</code> fills <code>environment</code>. <code>Literal</code> rejects anything else, like <code>qa</code>.</td></tr>
+    <tr><td><pre><code>    postgres_database_url: str = "postgresql://rag_user:rag_password@localhost:5432/rag_db"
+    postgres_echo_sql: bool = False
+    postgres_pool_size: int = 20
+    postgres_max_overflow: int = 0</code></pre></td>
+      <td>Read from <code>POSTGRES_DATABASE_URL</code> etc. The default points at the reference Postgres on 5432. Yours overrides it.</td></tr>
+    <tr><td><pre><code>    arxiv: ArxivSettings = Field(default_factory=ArxivSettings)
+    ...</code></pre></td>
+      <td>Nested settings for each subsystem. You'll add <code>arxiv</code> and <code>pdf_parser</code> in Module 2, and the rest later.</td></tr>
+    <tr><td><pre><code>    @field_validator("postgres_database_url")
+    @classmethod
+    def validate_database_url(cls, v: str) -&gt; str:
+        if not (v.startswith("postgresql://") or v.startswith("postgresql+psycopg2://")):
+            raise ValueError(...)
+        return v</code></pre></td>
+      <td>A custom rule: fail at startup if someone points the app at MySQL. <code>+psycopg2</code> names the driver SQLAlchemy should use.</td></tr>
+    <tr><td><pre><code>def get_settings() -&gt; Settings:
+    return Settings()</code></pre></td>
+      <td>Note: <b>no cache here</b>. Every call re-reads the environment and <code>.env</code>. The factories (<code>make_database</code> and friends) call this one.</td></tr>
+  </table>
+
+  <p class="file"><b>src/dependencies.py</b> &middot; providers and aliases</p>
+  <table class="walk">
+    <tr><td><pre><code>@lru_cache
+def get_settings() -&gt; Settings:
+    """Get application settings."""
+    return Settings()</code></pre></td>
+      <td>A <b>second</b> <code>get_settings</code> with the same name, this one cached. Endpoints use it through <code>SettingsDep</code>, so settings are read once per process. Knowing there are two is a good code-reading detail.</td></tr>
+    <tr><td><pre><code>def get_request_settings(request: Request) -&gt; Settings:
+    return request.app.state.settings</code></pre></td>
+      <td>The other style: fetch what the lifespan stored. A <code>Request</code> parameter is filled by FastAPI automatically.</td></tr>
+    <tr><td><pre><code>def get_database(request: Request) -&gt; BaseDatabase:
+    return request.app.state.database</code></pre></td>
+      <td>Day 5. Every client dependency (<code>get_opensearch_client</code>, <code>get_ollama_client</code>, ...) follows this shape.</td></tr>
+    <tr><td><pre><code>SettingsDep = Annotated[Settings, Depends(get_settings)]
+DatabaseDep = Annotated[BaseDatabase, Depends(get_database)]
+SessionDep = Annotated[Session, Depends(get_db_session)]</code></pre></td>
+      <td>The aliases. An endpoint writes <code>settings: SettingsDep</code> instead of the long form.</td></tr>
+  </table>
+  <p>
+    The reference file also imports every service client at the top (OpenSearch, Ollama, Jina, ...) inside a
+    <code>TYPE_CHECKING</code> / <code>try</code> block. You'll import only what exists in your project, and add lines as later modules add clients.
+  </p>
+
+  <p class="file"><b>src/main.py</b> &middot; the lifespan (start and end)</p>
+  <pre><code>@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan for the API.
+    """
+    logger.info("Starting RAG API...")
+
+    settings = get_settings()
+    app.state.settings = settings
+    ...
+    logger.info("API ready")
+    yield
+    ...
+    database.teardown()
+    logger.info("API shutdown complete")</code></pre>
+  <p>
+    <code>@asynccontextmanager</code> turns an async generator into an async context manager, the same trick as Module 0's
+    <code>Timer</code>, but async. In between, the reference creates the database, OpenSearch, arXiv, PDF parser, embeddings,
+    Ollama, Langfuse, cache, and Telegram clients. You'll add them one module at a time.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>src/config.py</code>: <code>PROJECT_ROOT</code>, <code>ENV_FILE_PATH</code>, <code>BaseConfigSettings</code> exactly as above,
+      and <code>Settings</code> with only the eight fields shown (four app fields, four Postgres fields) plus the URL validator.
+      Uncached <code>get_settings()</code> at the bottom.</li>
+    <li><code>src/dependencies.py</code>: cached <code>get_settings</code>, <code>get_request_settings</code>, and <code>SettingsDep</code>.
+      (Database parts come on Day 5.)</li>
+    <li><code>src/main.py</code>: add logging setup and a <code>lifespan</code> that stores <code>get_settings()</code> (from
+      <code>src.config</code>) on <code>app.state.settings</code>. Pass <code>lifespan=lifespan</code> and
+      <code>version=os.getenv("APP_VERSION", "0.1.0")</code> to <code>FastAPI(...)</code>. Add the <code>if __name__ == "__main__"</code> block.</li>
+    <li><code>src/routers/ping.py</code>: <code>health_check(settings: SettingsDep)</code> now returns version, environment, and
+      service name from settings.</li>
+    <li>Your <code>.env</code>: keep <code>CURATOR__TIMEOUT_SECONDS=60</code> and add the lines below, which mirror the reference <code>.env</code>.</li>
+  </ol>
+  <p class="file"><b>.env</b> (append)</p>
+  <pre><code>DEBUG=true
+ENVIRONMENT=development
+POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db</code></pre>
+  <p>
+    Yes, the hostname is <code>postgres</code>, the name of a Compose service. That's what the API needs when it runs inside Docker
+    (Day 6). On your laptop the name doesn't resolve; you'll handle that on purpose on Day 5. Your Module 0
+    <code>CuratorSettings</code> uses a <code>CURATOR__</code> prefix, so it ignores these new lines.
+  </p>
+  <p>Now update the fixture so tests can't leak overrides into each other:</p>
+  <p class="file"><b>tests/api/conftest.py</b> (Day 2 version)</p>
+  <pre><code>@pytest.fixture
+def client():
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()</code></pre>
+  <p class="file"><b>tests/api/routers/test_ping.py</b> (add at the top and bottom)</p>
+  <pre><code>from src.config import Settings
+from src.dependencies import get_settings
+from src.main import app
+
+# ... Day 1 tests unchanged ...
+
+
+def test_health_reports_values_from_settings(client):
+    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None, environment="staging", app_version="9.9.9")
+    data = client.get("/api/v1/health").json()
+    assert data["environment"] == "staging"
+    assert data["version"] == "9.9.9"
+
+
+def test_lifespan_stores_settings_on_app_state(client):
+    assert isinstance(app.state.settings, Settings)</code></pre>
+  <p>
+    The override key is the <b>function object</b> <code>get_settings</code> from <code>src.dependencies</code>, not its name. Override
+    the one from <code>src.config</code> by mistake and nothing changes.
+  </p>
+  <p class="file"><b>tests/unit/test_config.py</b> (create <code>tests\unit\__init__.py</code> too)</p>
+  <pre><code>import pytest
+from pydantic import ValidationError
+
+from src.config import Settings
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    for name in ("APP_VERSION", "DEBUG", "ENVIRONMENT", "POSTGRES_DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_settings_defaults(clean_env):
+    settings = Settings(_env_file=None)
+    assert settings.app_version == "0.1.0"
+    assert settings.debug is True
+    assert settings.environment == "development"
+    assert settings.service_name == "rag-api"
+    assert settings.postgres_pool_size == 20
+
+
+def test_settings_read_environment_variables(clean_env, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("POSTGRES_DATABASE_URL", "postgresql+psycopg2://u:p@db:5432/x")
+    settings = Settings(_env_file=None)
+    assert settings.environment == "production"
+    assert settings.postgres_database_url == "postgresql+psycopg2://u:p@db:5432/x"
+
+
+def test_settings_reject_unknown_environment(clean_env, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "qa")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_settings_reject_non_postgres_url(clean_env, monkeypatch):
+    monkeypatch.setenv("POSTGRES_DATABASE_URL", "mysql://u:p@db:3306/x")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_settings_are_frozen(clean_env):
+    settings = Settings(_env_file=None)
+    with pytest.raises(ValidationError):
+        settings.debug = False
+
+
+def test_dependency_get_settings_is_cached():
+    from src.dependencies import get_settings
+
+    assert get_settings() is get_settings()</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q</code></pre>
+  <p><code>37 passed</code> (29 + 8). Start uvicorn again and check that <code>/api/v1/health</code> still answers. Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove <code>@lru_cache</code> from <code>src/dependencies.py</code>. Which test fails? What would it cost in production (hint: reading <code>.env</code> on every request)?</li>
+    <li>Put <code>ENVIRONMENT=qa</code> in <code>.env</code> and start uvicorn. The app refuses to start with a <code>ValidationError</code> that names the field and the allowed values. Fail fast, at startup, not at 3 a.m. Put it back.</li>
+    <li>In the conftest, delete <code>app.dependency_overrides.clear()</code> and add a test after the settings test that checks <code>environment == "development"</code>. It fails, because the override leaked. Restore the line.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>SQL, PostgreSQL, and the database layer</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Every paper the pipeline fetches (metadata, full text, sections) lands in PostgreSQL. Search indexes are rebuilt from
+    it. When something looks wrong in search, the first question is "what's in the database?", and you answer it in SQL.
+    Today you learn enough SQL to answer it, then the Python layer the project wraps around the database.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Relational database</td><td>Data in <b>tables</b>: rows (one paper each) and typed columns (title, date, ...). PostgreSQL is one.</td></tr>
+    <tr><td>Primary key</td><td>A column that uniquely identifies a row. Here, <code>id</code>, a UUID (a random 128-bit ID).</td></tr>
+    <tr><td>Constraint</td><td>A rule the database enforces: <code>NOT NULL</code>, <code>UNIQUE</code>. It protects data even from buggy code.</td></tr>
+    <tr><td>Index</td><td>A lookup structure that makes <code>WHERE arxiv_id = ...</code> fast instead of scanning every row.</td></tr>
+    <tr><td>Transaction</td><td>A group of changes that succeed or fail together. <code>BEGIN</code> ... <code>COMMIT</code> saves; <code>ROLLBACK</code> undoes.</td></tr>
+    <tr><td>JSON column</td><td>A column holding a JSON value, used here for lists like authors and sections.</td></tr>
+  </table>
+  <h4>SQLAlchemy in three objects</h4>
+  <table class="plain">
+    <tr><th>Object</th><th>Role</th></tr>
+    <tr><td>Engine</td><td>Knows how to reach the database and keeps a <b>connection pool</b>: a set of open connections reused across requests, because opening one is slow.</td></tr>
+    <tr><td>Session</td><td>A unit of work: borrows a connection, tracks the objects you add or change, and writes them on <code>commit()</code>.</td></tr>
+    <tr><td>sessionmaker</td><td>A factory that creates sessions bound to the engine.</td></tr>
+  </table>
+  <p>
+    psycopg2 is the <b>driver</b>: the low-level library that speaks Postgres's network protocol. SQLAlchemy sits on top of it.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>compose.yml</b> &middot; the reference postgres service</p>
+  <table class="walk">
+    <tr><td><pre><code>  postgres:
+    image: postgres:16-alpine
+    container_name: rag-postgres</code></pre></td>
+      <td>Official Postgres 16 image. Service name <code>postgres</code> is the hostname other containers use.</td></tr>
+    <tr><td><pre><code>    environment:
+      - POSTGRES_DB=rag_db
+      - POSTGRES_USER=rag_user
+      - POSTGRES_PASSWORD=rag_password
+      - POSTGRES_HOST_AUTH_METHOD=password
+      - PGDATA=/var/lib/postgresql/data/pgdata</code></pre></td>
+      <td>On first start, the image creates this database and user. <code>PGDATA</code> puts the data files in a subfolder of the volume.</td></tr>
+    <tr><td><pre><code>    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data</code></pre></td>
+      <td>Published port and a named volume, so your papers survive a container restart.</td></tr>
+    <tr><td><pre><code>    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d rag_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s</code></pre></td>
+      <td><code>pg_isready</code> asks "are you accepting connections?". Services with <code>condition: service_healthy</code> wait for this.</td></tr>
+  </table>
+
+  <p class="file"><b>src/db/interfaces/base.py</b> &middot; the contract</p>
+  <pre><code>class BaseDatabase(ABC):
+    """Base class for database operations."""
+
+    @abstractmethod
+    def startup(self) -&gt; None:
+        """Initialize the database connection."""
+
+    @abstractmethod
+    def teardown(self) -&gt; None:
+        """Close the database connection."""
+
+    @abstractmethod
+    def get_session(self) -&gt; ContextManager[Session]:
+        """Get a database session."""</code></pre>
+  <p>
+    An <b>abstract base class</b> (ABC) lists methods a subclass must implement; Python refuses to create a subclass instance
+    that's missing one. The rest of the code depends on <code>BaseDatabase</code>, not on Postgres, which is what lets tests pass
+    in a fake. The same file defines a <code>BaseRepository</code> ABC that nothing actually inherits from; the real repository
+    (Day 4) doesn't use it. Copy it anyway so your file matches.
+  </p>
+
+  <p class="file"><b>src/db/interfaces/postgresql.py</b> &middot; the real implementation</p>
+  <table class="walk">
+    <tr><td><pre><code>Base = declarative_base()</code></pre></td>
+      <td>The parent class for every table model (Day 4). It also keeps <code>Base.metadata</code>: a registry of all tables whose model classes have been <b>imported</b>.</td></tr>
+    <tr><td><pre><code>def __init__(self, config: PostgreSQLSettings):
+    self.config = config
+    self.engine: Optional[Engine] = None
+    self.session_factory: Optional[sessionmaker] = None</code></pre></td>
+      <td>The constructor does no I/O. Connecting happens in <code>startup()</code>, so creating the object is cheap and safe.</td></tr>
+    <tr><td><pre><code>self.engine = create_engine(
+    self.config.database_url,
+    echo=self.config.echo_sql,
+    pool_size=self.config.pool_size,
+    max_overflow=self.config.max_overflow,
+    pool_pre_ping=True,  # Verify connections before use
+)</code></pre></td>
+      <td>Create the engine and its pool. <code>echo</code> prints every SQL statement (great for learning). <code>pool_pre_ping</code> tests a pooled connection before handing it out, so a Postgres restart doesn't break the next request.</td></tr>
+    <tr><td><pre><code>self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)</code></pre></td>
+      <td><code>expire_on_commit=False</code>: after a commit, objects keep their loaded values instead of reloading on next access. Handy when you return them after the session closes.</td></tr>
+    <tr><td><pre><code>with self.engine.connect() as conn:
+    conn.execute(text("SELECT 1"))</code></pre></td>
+      <td>Prove the connection works now, at startup. <code>text()</code> marks a raw SQL string.</td></tr>
+    <tr><td><pre><code>Base.metadata.create_all(bind=self.engine)</code></pre></td>
+      <td>Create every registered table that doesn't exist yet. Idempotent: running it twice is fine. It does not alter existing tables; real projects use a migration tool (the reference lists Alembic as a dependency but doesn't use it).</td></tr>
+    <tr><td><pre><code>except Exception as e:
+    logger.error(f"Failed to initialize PostgreSQL database: {e}")
+    raise</code></pre></td>
+      <td>Log and re-raise: the API must not start without its database.</td></tr>
+    <tr><td><pre><code>@contextmanager
+def get_session(self) -&gt; Generator[Session, None, None]:
+    if not self.session_factory:
+        raise RuntimeError("Database not initialized. Call startup() first.")
+    session = self.session_factory()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()</code></pre></td>
+      <td>The core pattern. Hand out a session; if the block raises, undo uncommitted changes; always return the connection to the pool. This is exactly the context manager from Module 0, Day 2.</td></tr>
+  </table>
+
+  <p class="file"><b>src/schemas/database/config.py</b> and <b>src/db/factory.py</b> &middot; glue</p>
+  <pre><code>class PostgreSQLSettings(BaseSettings):
+    database_url: str = Field(default="postgresql://rag_user:rag_password@localhost:5432/rag_db", ...)
+    echo_sql: bool = Field(default=False, ...)
+    pool_size: int = Field(default=20, ...)
+    max_overflow: int = Field(default=0, ...)
+
+    class Config:
+        env_prefix = "POSTGRES_"</code></pre>
+  <pre><code>def make_database() -&gt; BaseDatabase:
+    settings = get_settings()
+    config = PostgreSQLSettings(
+        database_url=settings.postgres_database_url,
+        echo_sql=settings.postgres_echo_sql,
+        pool_size=settings.postgres_pool_size,
+        max_overflow=settings.postgres_max_overflow,
+    )
+    database = PostgreSQLDatabase(config=config)
+    database.startup()
+    return database</code></pre>
+  <p>
+    The <b>factory</b> pattern: one function knows how to build a ready-to-use object from settings. Every service in the project
+    has a <code>make_...</code> factory. Note that <code>make_database()</code> connects immediately.
+    <code>src/database.py</code> is an older helper that keeps one global database; nothing in the reference imports it. Copy it for parity, but you won't use it.
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Part A: Postgres in your Compose file</h4>
+  <p>Add a <code>postgres</code> service to your <code>compose.yml</code>, following the reference but with your conventions:</p>
+  <ul>
+    <li>Image <code>postgres:16-alpine</code>, container name <code>curator-postgres</code>, the same five environment variables as the reference.</li>
+    <li>Port <code>"15432:5432"</code>, volume <code>curator_postgres_data</code> at <code>/var/lib/postgresql/data</code>, the same healthcheck, <code>restart: unless-stopped</code>.</li>
+    <li>A top-level network <code>curator-network</code> (<code>driver: bridge</code>) that both <code>redis</code> and <code>postgres</code> join.</li>
+  </ul>
+  <pre><code>docker compose up -d
+docker compose ps
+docker exec -it curator-postgres psql -U rag_user -d rag_db</code></pre>
+  <p>You're now at a <code>rag_db=&gt;</code> prompt. Type these one at a time and read each result:</p>
+  <pre><code>CREATE TABLE sql_practice (id serial PRIMARY KEY, arxiv_id text UNIQUE NOT NULL, title text, authors json);
+INSERT INTO sql_practice (arxiv_id, title, authors) VALUES ('1706.03762', 'Attention Is All You Need', '["Vaswani"]');
+INSERT INTO sql_practice (arxiv_id, title) VALUES ('2005.11401', 'Retrieval-Augmented Generation');
+SELECT id, arxiv_id, title FROM sql_practice ORDER BY id;
+INSERT INTO sql_practice (arxiv_id) VALUES ('1706.03762');
+UPDATE sql_practice SET title = 'RAG' WHERE arxiv_id = '2005.11401';
+BEGIN; DELETE FROM sql_practice; SELECT count(*) FROM sql_practice; ROLLBACK;
+SELECT count(*) FROM sql_practice;
+\d sql_practice
+DROP TABLE sql_practice;
+\q</code></pre>
+  <p>
+    The duplicate insert fails with <code>duplicate key value violates unique constraint</code>. Inside the transaction the count is 0;
+    after <code>ROLLBACK</code> it's 2 again. <code>\d</code> (a psql command, not SQL) describes a table, including its indexes.
+  </p>
+
+  <h4>Part B: the database layer</h4>
+  <pre><code>uv add sqlalchemy psycopg2-binary
+mkdir src\db\interfaces, src\schemas\database, tests\unit\db, tests\integration
+ni src\db\__init__.py, src\db\interfaces\__init__.py, src\schemas\database\__init__.py, tests\integration\__init__.py</code></pre>
+  <p>Write, matching the reference names and behaviour:</p>
+  <ul>
+    <li><code>src/db/interfaces/base.py</code>: <code>BaseDatabase</code> and <code>BaseRepository</code>.</li>
+    <li><code>src/schemas/database/config.py</code>: <code>PostgreSQLSettings</code>.</li>
+    <li><code>src/db/interfaces/postgresql.py</code>: <code>Base</code> and <code>PostgreSQLDatabase</code>. You may drop the extra log lines.</li>
+    <li><code>src/db/factory.py</code>: <code>make_database()</code>. And <code>src/database.py</code>.</li>
+  </ul>
+  <div class="callout tip"><b>Which <code>declarative_base</code>?</b>
+    The reference imports it from <code>sqlalchemy.ext.declarative</code>, an old location that warns under SQLAlchemy 2.x (you have 2.1).
+    Import it from <code>sqlalchemy.orm</code> instead: same object, no warning. That location also exists in SQLAlchemy 1.4, which matters in
+    Module 2, because Airflow runs this same <code>src/</code> code with SQLAlchemy 1.4.</div>
+
+  <h4>Part C: tests</h4>
+  <p class="file"><b>tests/unit/db/test_postgresql.py</b> &middot; no database needed</p>
+  <pre><code>import pytest
+
+from src.db.interfaces.postgresql import PostgreSQLDatabase
+from src.schemas.database.config import PostgreSQLSettings
+
+
+def test_get_session_before_startup_raises():
+    database = PostgreSQLDatabase(config=PostgreSQLSettings())
+    with pytest.raises(RuntimeError, match="not initialized"):
+        with database.get_session():
+            pass
+
+
+def test_startup_fails_fast_when_nothing_listens():
+    config = PostgreSQLSettings(database_url="postgresql+psycopg2://rag_user:rag_password@localhost:1/rag_db")
+    database = PostgreSQLDatabase(config=config)
+    with pytest.raises(Exception):
+        database.startup()</code></pre>
+  <p>
+    <b>Integration tests</b> talk to a real service. These use your Compose Postgres. Your <code>.env</code> points at
+    <code>postgres:5432</code>, which only works inside Docker, so the fixture uses its own URL, defaulting to the published port.
+  </p>
+  <p class="file"><b>tests/integration/conftest.py</b></p>
+  <pre><code>import os
+
+import pytest
+from sqlalchemy.orm import Session
+
+from src.db.interfaces.postgresql import PostgreSQLDatabase
+from src.schemas.database.config import PostgreSQLSettings
+
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL", "postgresql+psycopg2://rag_user:rag_password@localhost:15432/rag_db"
+)
+
+
+@pytest.fixture(scope="session")
+def database():
+    db = PostgreSQLDatabase(config=PostgreSQLSettings(database_url=TEST_DATABASE_URL, pool_size=2))
+    db.startup()
+    yield db
+    db.teardown()
+
+
+@pytest.fixture
+def db_session(database):
+    connection = database.engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()</code></pre>
+  <p>
+    <code>scope="session"</code> means one database object for the whole test run. <code>db_session</code> is a well-known pattern
+    for testing against a real database without leaving data behind: open a transaction, and let the session's own
+    <code>commit()</code> calls only release <b>savepoints</b> (checkpoints inside that transaction). At the end, roll back the outer
+    transaction, and every row the test wrote disappears. You'll use it tomorrow.
+  </p>
+  <p class="file"><b>tests/integration/test_postgres_database.py</b></p>
+  <pre><code>import pytest
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import ProgrammingError
+
+
+def test_select_one(database):
+    with database.get_session() as session:
+        assert session.execute(text("SELECT 1")).scalar() == 1
+
+
+def test_bad_sql_raises_and_the_next_session_still_works(database):
+    with pytest.raises(ProgrammingError):
+        with database.get_session() as session:
+            session.execute(text("SELECT * FROM table_that_does_not_exist"))
+    with database.get_session() as session:
+        assert session.execute(text("SELECT 1")).scalar() == 1</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>docker compose ps
+uv run pytest -q</code></pre>
+  <p><code>curator-postgres</code> shows <code>(healthy)</code>; tests: <code>41 passed</code> (37 + 4). Commit, including <code>compose.yml</code>.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <p>Each of these is a real error you'll see again. Change the URL in <code>tests/integration/conftest.py</code> (or set <code>$env:TEST_DATABASE_URL</code>) and run the integration tests:</p>
+  <ol>
+    <li>Wrong password: <code>password authentication failed for user "rag_user"</code>. Postgres is reachable and says no.</li>
+    <li>Host <code>postgres</code>, port 5432: <code>could not translate host name "postgres" to address</code>. A Docker-internal
+      name used from your laptop. This is the cousin of the <code>getaddrinfo failed</code> error from Module 0.</li>
+    <li><code>docker compose stop postgres</code>: <code>Connection refused (0x0000274D/10061)</code>. Nothing listens on that port. Start it again.</li>
+  </ol>
+  <p>Remove <code>$env:TEST_DATABASE_URL</code> afterwards (<code>Remove-Item Env:TEST_DATABASE_URL</code>).</p>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>The Paper model and the repository</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The <code>papers</code> table is the project's source of truth. Two pieces of code define it: a SQLAlchemy <b>model</b>
+    (the table, as a Python class) and Pydantic <b>schemas</b> (the data crossing into and out of it). A <b>repository</b> is the only
+    code allowed to run queries on it, so the rest of the project says <code>repo.upsert(paper)</code> instead of writing SQL.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <p>
+    An <b>ORM</b> (object-relational mapper) maps a class to a table and instances to rows. You write
+    <code>select(Paper).where(Paper.arxiv_id == "1706.03762")</code>; SQLAlchemy writes the SQL. The <b>repository pattern</b> puts all
+    such queries behind one class with plain methods (create, get, list, update). Callers don't know or care whether the data
+    lives in Postgres. An <b>upsert</b> means "update if it exists, insert if it doesn't", which makes re-running a pipeline safe.
+  </p>
+  <div class="callout tip"><b>Model versus schema</b>
+    <code>src/models/paper.py</code> (SQLAlchemy) describes storage: column types, keys, defaults. <code>src/schemas/arxiv/paper.py</code>
+    (Pydantic) describes data in motion: what the pipeline hands in, what an API would return. They have almost the same fields,
+    on purpose, for different jobs.</div>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/models/paper.py</b></p>
+  <table class="walk">
+    <tr><td><pre><code>class Paper(Base):
+    __tablename__ = "papers"</code></pre></td>
+      <td>Inheriting from <code>Base</code> registers the table in <code>Base.metadata</code>, at the moment this module is imported.</td></tr>
+    <tr><td><pre><code>    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)</code></pre></td>
+      <td>Primary key. <code>default=uuid.uuid4</code> is a <b>Python-side</b> default: SQLAlchemy generates the ID before inserting. In the reference database, <code>\d papers</code> shows no default on <code>id</code> for that reason.</td></tr>
+    <tr><td><pre><code>    arxiv_id = Column(String, unique=True, nullable=False, index=True)</code></pre></td>
+      <td>The natural key, like <code>2609.38178v1</code>. Unique and indexed, which becomes <code>ix_papers_arxiv_id</code> in Postgres.</td></tr>
+    <tr><td><pre><code>    title = Column(String, nullable=False)
+    authors = Column(JSON, nullable=False)
+    abstract = Column(Text, nullable=False)
+    categories = Column(JSON, nullable=False)
+    published_date = Column(DateTime, nullable=False)
+    pdf_url = Column(String, nullable=False)</code></pre></td>
+      <td>Metadata from the arXiv API (Module 2). <code>Text</code> is unlimited-length text; <code>JSON</code> stores the author and category lists.</td></tr>
+    <tr><td><pre><code>    raw_text = Column(Text, nullable=True)
+    sections = Column(JSON, nullable=True)
+    references = Column(JSON, nullable=True)</code></pre></td>
+      <td>Content parsed from the PDF. Nullable, because a paper can be stored before (or without) its PDF being parsed.</td></tr>
+    <tr><td><pre><code>    parser_used = Column(String, nullable=True)
+    parser_metadata = Column(JSON, nullable=True)
+    pdf_processed = Column(Boolean, default=False, nullable=False)
+    pdf_processing_date = Column(DateTime, nullable=True)</code></pre></td>
+      <td>Bookkeeping: did parsing succeed, with what, when.</td></tr>
+    <tr><td><pre><code>    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=..., onupdate=lambda: datetime.now(timezone.utc))</code></pre></td>
+      <td>A <code>lambda</code> is called at insert time, so each row gets its own timestamp. <code>onupdate</code> refreshes on every update.</td></tr>
+  </table>
+
+  <p class="file"><b>src/schemas/arxiv/paper.py</b> &middot; the database-facing schemas</p>
+  <pre><code>class PaperBase(BaseModel):
+    # Core arXiv metadata
+    arxiv_id: str = Field(..., description="arXiv paper ID")
+    title: str = Field(..., description="Paper title")
+    authors: List[str] = Field(..., description="List of author names")
+    abstract: str = Field(..., description="Paper abstract")
+    categories: List[str] = Field(..., description="Paper categories")
+    published_date: datetime = Field(..., description="Date published on arXiv")
+    pdf_url: str = Field(..., description="URL to PDF")
+
+
+class PaperCreate(PaperBase):
+    """Schema for creating a paper with optional parsed content."""
+    raw_text: Optional[str] = Field(None, ...)
+    sections: Optional[List[Dict[str, Any]]] = Field(None, ...)
+    references: Optional[List[Dict[str, Any]]] = Field(None, ...)
+    parser_used: Optional[str] = Field(None, ...)
+    parser_metadata: Optional[Dict[str, Any]] = Field(None, ...)
+    pdf_processed: Optional[bool] = Field(False, ...)
+    pdf_processing_date: Optional[datetime] = Field(None, ...)</code></pre>
+  <p>
+    <code>PaperCreate</code> is what the pipeline hands to the repository. The same file also has <code>PaperResponse</code> (adds
+    <code>id</code> and timestamps, with <code>from_attributes = True</code> so it can be built from a model object) and
+    <code>ArxivPaper</code>, the raw API shape you'll write in Module 2.
+  </p>
+
+  <p class="file"><b>src/repositories/paper.py</b> &middot; the methods that matter</p>
+  <table class="walk">
+    <tr><td><pre><code>class PaperRepository:
+    def __init__(self, session: Session):
+        self.session = session</code></pre></td>
+      <td>A repository wraps one session. The caller owns the session's lifetime.</td></tr>
+    <tr><td><pre><code>    def create(self, paper: PaperCreate) -&gt; Paper:
+        db_paper = Paper(**paper.model_dump())
+        self.session.add(db_paper)
+        self.session.commit()
+        self.session.refresh(db_paper)
+        return db_paper</code></pre></td>
+      <td>Pydantic to dict to model. <code>add</code> stages the row; <code>commit</code> writes it; <code>refresh</code> reloads it so database-filled values are present.</td></tr>
+    <tr><td><pre><code>    def get_by_arxiv_id(self, arxiv_id: str) -&gt; Optional[Paper]:
+        stmt = select(Paper).where(Paper.arxiv_id == arxiv_id)
+        return self.session.scalar(stmt)</code></pre></td>
+      <td><code>Paper.arxiv_id == arxiv_id</code> doesn't compare now; it builds a SQL condition. <code>scalar</code> returns the first result or <code>None</code>.</td></tr>
+    <tr><td><pre><code>    def get_all(self, limit: int = 100, offset: int = 0) -&gt; List[Paper]:
+        stmt = select(Paper).order_by(Paper.published_date.desc()).limit(limit).offset(offset)
+        return list(self.session.scalars(stmt))</code></pre></td>
+      <td>Newest first, with <b>pagination</b>: <code>limit</code> rows, skipping <code>offset</code>. <code>scalars</code> yields model objects.</td></tr>
+    <tr><td><pre><code>    def get_count(self) -&gt; int:
+        stmt = select(func.count(Paper.id))
+        return self.session.scalar(stmt) or 0</code></pre></td>
+      <td><code>SELECT count(papers.id) FROM papers</code>.</td></tr>
+    <tr><td><pre><code>    def upsert(self, paper_create: PaperCreate) -&gt; Paper:
+        existing_paper = self.get_by_arxiv_id(paper_create.arxiv_id)
+        if existing_paper:
+            for key, value in paper_create.model_dump(exclude_unset=True).items():
+                setattr(existing_paper, key, value)
+            return self.update(existing_paper)
+        else:
+            return self.create(paper_create)</code></pre></td>
+      <td>Read, then write. <code>exclude_unset=True</code> copies only fields the caller actually set, so a metadata-only update doesn't wipe parsed text. Interview point: two processes upserting the same ID at once can race; Postgres's <code>INSERT ... ON CONFLICT</code> does it atomically.</td></tr>
+  </table>
+  <p>
+    The other methods (<code>get_by_id</code>, <code>get_processed_papers</code>, <code>get_unprocessed_papers</code>,
+    <code>get_papers_with_raw_text</code>, <code>get_processing_stats</code>, <code>update</code>) follow the same shapes. Read them in the reference.
+  </p>
+
+  <div class="callout warn"><b>Who creates the <code>papers</code> table?</b>
+    <code>create_all</code> creates tables for models that have been <b>imported</b>. The reference API never imports
+    <code>src.models.paper</code>, so the API's startup creates no tables. The table is created by Airflow (Module 2), whose task code
+    imports the metadata fetcher, which imports the repository, which imports the model, before calling <code>make_database()</code>.
+    In your tests, the conftest imports the model on purpose.</div>
+
+  <h3>4. Build</h3>
+  <pre><code>mkdir src\models, src\repositories, src\schemas\arxiv, tests\unit\schemas
+ni src\models\__init__.py, src\repositories\__init__.py, src\schemas\arxiv\__init__.py</code></pre>
+  <ul>
+    <li><code>src/models/paper.py</code>: <code>Paper</code>, all 17 columns as in the reference.</li>
+    <li><code>src/schemas/arxiv/paper.py</code>: <code>PaperBase</code>, <code>PaperCreate</code>, <code>PaperResponse</code>. (No <code>ArxivPaper</code> yet.)</li>
+    <li><code>src/repositories/paper.py</code>: <code>PaperRepository</code> with every method in the reference.</li>
+    <li>In <code>tests/integration/conftest.py</code>, add this import under the others, so <code>startup()</code> creates the table:</li>
+  </ul>
+  <pre><code>import src.models.paper  # noqa: F401  (registers the papers table on Base before create_all runs)</code></pre>
+  <p class="file"><b>tests/integration/test_postgres_database.py</b> (add)</p>
+  <pre><code>def test_startup_created_the_papers_table(database):
+    columns = {column["name"] for column in inspect(database.engine).get_columns("papers")}
+    assert {"id", "arxiv_id", "title", "raw_text", "pdf_processed"} &lt;= columns</code></pre>
+  <p class="file"><b>tests/integration/test_paper_repository.py</b></p>
+  <pre><code>from datetime import datetime
+
+import pytest
+from sqlalchemy.exc import IntegrityError
+
+from src.repositories.paper import PaperRepository
+from src.schemas.arxiv.paper import PaperCreate
+
+
+def make_paper(arxiv_id: str = "9999.00001v1", **overrides) -&gt; PaperCreate:
+    data = {
+        "arxiv_id": arxiv_id,
+        "title": "A Test Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "We test things.",
+        "categories": ["cs.AI"],
+        "published_date": datetime(2026, 9, 1),
+        "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+    }
+    data.update(overrides)
+    return PaperCreate(**data)
+
+
+def test_create_fills_in_id_and_defaults(db_session):
+    paper = PaperRepository(db_session).create(make_paper())
+    assert paper.id is not None
+    assert paper.created_at is not None
+    assert paper.pdf_processed is False
+
+
+def test_get_by_arxiv_id(db_session):
+    repo = PaperRepository(db_session)
+    repo.create(make_paper())
+    assert repo.get_by_arxiv_id("9999.00001v1").title == "A Test Paper"
+    assert repo.get_by_arxiv_id("0000.00000") is None
+
+
+def test_duplicate_arxiv_id_is_rejected(db_session):
+    repo = PaperRepository(db_session)
+    repo.create(make_paper())
+    with pytest.raises(IntegrityError):
+        repo.create(make_paper())
+
+
+def test_upsert_updates_the_existing_row(db_session):
+    repo = PaperRepository(db_session)
+    first = repo.upsert(make_paper())
+    count_after_first = repo.get_count()
+    second = repo.upsert(make_paper(title="A Better Title"))
+    assert second.id == first.id
+    assert repo.get_count() == count_after_first
+    assert repo.get_by_arxiv_id("9999.00001v1").title == "A Better Title"
+
+
+def test_processed_and_unprocessed_filters(db_session):
+    repo = PaperRepository(db_session)
+    repo.create(make_paper("9999.00001v1"))
+    repo.create(make_paper("9999.00002v1", raw_text="Full text", pdf_processed=True, pdf_processing_date=datetime(2026, 9, 2)))
+    processed = [p.arxiv_id for p in repo.get_processed_papers(limit=10_000)]
+    unprocessed = [p.arxiv_id for p in repo.get_unprocessed_papers(limit=10_000)]
+    assert "9999.00002v1" in processed and "9999.00001v1" not in processed
+    assert "9999.00001v1" in unprocessed and "9999.00002v1" not in unprocessed</code></pre>
+  <p>
+    The assertions are relative ("count didn't change", "this ID is in the list") rather than absolute, because your database
+    will contain real papers from Module 2 onwards, and these tests must keep passing.
+  </p>
+  <p class="file"><b>tests/unit/schemas/test_paper_schemas.py</b></p>
+  <pre><code>from datetime import datetime
+
+import pytest
+from pydantic import ValidationError
+
+from src.schemas.arxiv.paper import PaperCreate
+
+
+def test_paper_create_optional_fields_default():
+    paper = PaperCreate(
+        arxiv_id="9999.00001v1",
+        title="T",
+        authors=["A"],
+        abstract="Abs",
+        categories=["cs.AI"],
+        published_date="2026-09-01T00:00:00Z",
+        pdf_url="https://arxiv.org/pdf/9999.00001v1",
+    )
+    assert isinstance(paper.published_date, datetime)
+    assert paper.raw_text is None
+    assert paper.pdf_processed is False
+
+
+def test_paper_create_requires_core_fields():
+    with pytest.raises(ValidationError):
+        PaperCreate(arxiv_id="9999.00001v1", title="T")</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+docker exec curator-postgres psql -U rag_user -d rag_db -c "\d papers"
+docker exec curator-postgres psql -U rag_user -d rag_db -c "SELECT count(*) FROM papers;"</code></pre>
+  <p>
+    Tests: <code>49 passed</code> (41 + 8). <code>\d papers</code> shows the 17 columns, <code>papers_pkey</code>, and the unique index
+    <code>ix_papers_arxiv_id</code>, the same as the reference table. The count is <b>0</b>: every test row was rolled back. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day4" /><span>Day 4 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In <code>create</code>, delete <code>self.session.commit()</code>. <code>refresh</code> now fails with
+      <code>InvalidRequestError: Instance '&lt;Paper ...&gt;' is not persistent within this Session</code>: there is no row yet to reload.</li>
+    <li>In <code>make_paper</code>, drop <code>"abstract"</code> and call <code>Paper(...)</code> directly (bypassing Pydantic). Postgres answers
+      <code>NotNullViolation: null value in column "abstract" of relation "papers" violates not-null constraint</code>. The database is the last line of defence.</li>
+    <li>In <code>upsert</code>, remove <code>exclude_unset=True</code>. Upsert a paper with <code>raw_text="x"</code>, then upsert the same ID
+      without it. The text is gone. Write a test that proves it, then restore the argument.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 5                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day5"><span class="day">Day 5</span>The health check, exceptions, and testing with overrides</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A health endpoint is how Docker, load balancers, and you decide whether the service works. A good one checks each
+    dependency separately and reports "degraded" rather than crashing. Today you connect all the pieces: lifespan creates the
+    database, dependency injection hands it to the endpoint, and tests swap it for a fake.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <p>
+    <b>Dependency chains</b>: a dependency can itself depend on another. <code>SessionDep</code> calls <code>get_db_session</code>,
+    which declares <code>Depends(get_database)</code>. FastAPI resolves the chain for every request. A dependency written as a
+    generator (with <code>yield</code>) gets its cleanup code run after the response, which is how a session is closed per request.
+  </p>
+  <p>
+    <b>Two ways to fake things in tests.</b> <code>unittest.mock.patch("src.main.make_database", ...)</code> replaces a name for the
+    duration of a <code>with</code> block; you use it for code FastAPI doesn't inject, like the lifespan. <code>app.dependency_overrides</code>
+    replaces an injected dependency; you use it for endpoints. Patch the name <b>where it is looked up</b>: <code>src.main</code> did
+    <code>from src.db.factory import make_database</code>, so the name to patch lives in <code>src.main</code>.
+  </p>
+  <p>
+    <b>Custom exceptions</b>: a hierarchy like <code>RepositoryException</code> &rarr; <code>PaperNotFound</code> lets callers catch a whole
+    family with one <code>except</code>, and makes logs say what failed in the project's own terms.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/routers/ping.py</b> &middot; the health check body</p>
+  <table class="walk">
+    <tr><td><pre><code>services = {}
+overall_status = "ok"</code></pre></td>
+      <td>Start optimistic; any failing check downgrades the overall status.</td></tr>
+    <tr><td><pre><code>def _check_service(name: str, check_func, *args, **kwargs):
+    try:
+        ...
+        result = check_func(*args)
+        services[name] = result
+        if result.status != "healthy":
+            nonlocal overall_status
+            overall_status = "degraded"
+    except Exception as e:
+        services[name] = ServiceStatus(status="unhealthy", message=str(e))
+        overall_status = "degraded"</code></pre></td>
+      <td>A helper that runs one check and never lets it crash the endpoint. <code>nonlocal</code> lets the inner function reassign the outer variable. Placing it inside the <code>if</code> is legal but odd; it applies to the whole function. In your version, put it on the first line. (The <code>is_async</code> branch I elided is never used.)</td></tr>
+    <tr><td><pre><code>def _check_database():
+    with database.get_session() as session:
+        session.execute(text("SELECT 1"))
+    return ServiceStatus(status="healthy", message="Connected successfully")</code></pre></td>
+      <td>The cheapest possible real query. If it raises, <code>_check_service</code> records the error message.</td></tr>
+    <tr><td><pre><code>_check_service("database", _check_database)
+_check_service("opensearch", _check_opensearch)
+...
+return HealthResponse(status=overall_status, version=settings.app_version, ...)</code></pre></td>
+      <td>The reference also checks OpenSearch and Ollama (Modules 3 and 5). A failing dependency gives <code>"degraded"</code> with HTTP 200: the API itself is up.</td></tr>
+  </table>
+  <p>
+    One design flaw worth noticing: this is an <code>async def</code> that makes synchronous database calls, so it blocks the event
+    loop while Postgres answers (Module 0, Day 3). With a one-row <code>SELECT 1</code> it's negligible.
+  </p>
+
+  <p class="file"><b>tests/api/conftest.py</b> (reference) &middot; a different approach</p>
+  <pre><code>    with (
+        patch("src.db.interfaces.postgresql.PostgreSQLDatabase.startup") as mock_startup,
+        patch("src.db.interfaces.postgresql.PostgreSQLDatabase.get_session") as mock_get_session,
+        ...
+    ):
+        ...
+        async with LifespanManager(app) as manager:
+            async with AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as client:
+                yield client</code></pre>
+  <p>
+    The reference patches methods and drives the app with an async <code>httpx</code> client plus <code>asgi-lifespan</code>. You'll use
+    the simpler <code>TestClient</code> plus <code>dependency_overrides</code>. Both are valid; knowing both is a good interview answer.
+  </p>
+
+  <p class="file"><b>src/exceptions.py</b> and <b>src/middlewares.py</b></p>
+  <pre><code>class RepositoryException(Exception):
+    """Base exception for repository-related errors."""
+
+
+class PaperNotFound(RepositoryException):
+    """Exception raised when paper data is not found."""</code></pre>
+  <pre><code>def log_request(method: str, path: str) -&gt; None:
+    """Simple request logging for Week 1."""
+    logger.info(f"{method} {path}")</code></pre>
+  <p>
+    <code>exceptions.py</code> grows a family per subsystem (arXiv and PDF in Module 2, Ollama in Module 5). <code>middlewares.py</code>
+    is honest about itself: its comment says these functions are <b>not</b> wired into FastAPI. A real <b>middleware</b> is code that wraps
+    every request, for example <code>@app.middleware("http")</code> to log timing. The reference never adds one.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>src/dependencies.py</code>: add <code>get_database</code>, <code>get_db_session</code> (a generator using
+      <code>with database.get_session() as session: yield session</code>), <code>DatabaseDep</code>, and <code>SessionDep</code>.</li>
+    <li><code>src/main.py</code> lifespan: after settings, <code>database = make_database()</code>, store it on
+      <code>app.state.database</code>; after <code>yield</code>, call <code>database.teardown()</code>. Still only the ping router.</li>
+    <li><code>src/routers/ping.py</code>: <code>health_check(settings: SettingsDep, database: DatabaseDep)</code> with <code>_check_service</code>
+      and <code>_check_database</code> as walked through, returning <code>services={"database": ...}</code>.</li>
+    <li><code>src/exceptions.py</code>: <code>RepositoryException</code>, <code>PaperNotFound</code>, <code>PaperNotSaved</code>, <code>ConfigurationError</code>.
+      <code>src/middlewares.py</code>: <code>log_request</code> and <code>log_error</code> as in the reference.</li>
+  </ol>
+  <p>
+    The lifespan now connects to Postgres, and your <code>.env</code> says <code>postgres:5432</code>. To run uvicorn on your laptop, point
+    this PowerShell session at the published port. A real environment variable beats <code>.env</code>:
+  </p>
+  <pre><code>$env:POSTGRES_DATABASE_URL="postgresql+psycopg2://rag_user:rag_password@localhost:15432/rag_db"
+uv run uvicorn src.main:app --reload --port 18000</code></pre>
+  <p>Tests must not need a database at all, so replace the API conftest:</p>
+  <p class="file"><b>tests/api/conftest.py</b> (final version)</p>
+  <pre><code>from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from src.db.interfaces.base import BaseDatabase
+from src.dependencies import get_database
+from src.main import app
+
+
+class FakeDatabase(BaseDatabase):
+    def __init__(self):
+        self.fail = False
+        self.torn_down = False
+
+    def startup(self) -&gt; None:
+        pass
+
+    def teardown(self) -&gt; None:
+        self.torn_down = True
+
+    @contextmanager
+    def get_session(self):
+        session = MagicMock()
+        if self.fail:
+            session.execute.side_effect = RuntimeError("connection refused")
+        yield session
+
+
+@pytest.fixture
+def fake_database():
+    return FakeDatabase()
+
+
+@pytest.fixture
+def client(fake_database):
+    app.dependency_overrides[get_database] = lambda: fake_database
+    with patch("src.main.make_database", return_value=fake_database):
+        with TestClient(app) as test_client:
+            yield test_client
+    app.dependency_overrides.clear()</code></pre>
+  <p>
+    <code>FakeDatabase</code> implements the <code>BaseDatabase</code> contract, which is the payoff of that abstract class. A
+    <code>MagicMock</code> accepts any method call; <code>side_effect</code> makes one raise.
+  </p>
+  <p class="file"><b>tests/api/routers/test_ping.py</b> (add; also add <code>from unittest.mock import patch</code> and <code>from fastapi.testclient import TestClient</code> at the top)</p>
+  <pre><code>def test_health_reports_healthy_database(client):
+    data = client.get("/api/v1/health").json()
+    assert data["services"]["database"] == {"status": "healthy", "message": "Connected successfully"}
+
+
+def test_health_is_degraded_when_database_fails(client, fake_database):
+    fake_database.fail = True
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "degraded"
+    assert data["services"]["database"]["status"] == "unhealthy"
+    assert "connection refused" in data["services"]["database"]["message"]
+
+
+def test_lifespan_opens_and_tears_down_the_database(fake_database):
+    with patch("src.main.make_database", return_value=fake_database):
+        with TestClient(app):
+            assert app.state.database is fake_database
+            assert fake_database.torn_down is False
+    assert fake_database.torn_down is True</code></pre>
+  <p class="file"><b>tests/unit/test_dependencies.py</b></p>
+  <pre><code>from contextlib import contextmanager
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from src.dependencies import SessionDep, get_database
+
+
+class RecordingDatabase:
+    def __init__(self):
+        self.events = []
+
+    @contextmanager
+    def get_session(self):
+        self.events.append("open")
+        yield "fake-session"
+        self.events.append("close")
+
+
+def test_session_dep_opens_and_closes_a_session_per_request():
+    database = RecordingDatabase()
+    demo = FastAPI()
+
+    @demo.get("/demo")
+    def demo_route(session: SessionDep):
+        return {"session": session}
+
+    demo.dependency_overrides[get_database] = lambda: database
+    with TestClient(demo) as client:
+        assert client.get("/demo").json() == {"session": "fake-session"}
+    assert database.events == ["open", "close"]</code></pre>
+  <p>
+    Nothing in your app uses <code>SessionDep</code> yet, so the test builds a throwaway app to prove the chain works:
+    override the <em>inner</em> dependency, and the outer one still runs its setup and cleanup.
+  </p>
+  <p class="file"><b>tests/unit/test_middlewares.py</b></p>
+  <pre><code>import logging
+
+from src.exceptions import PaperNotFound, RepositoryException
+from src.middlewares import log_error, log_request
+
+
+def test_log_helpers_write_to_the_log(caplog):
+    with caplog.at_level(logging.INFO, logger="src.middlewares"):
+        log_request("GET", "/api/v1/health")
+        log_error("boom", "POST", "/api/v1/papers")
+    assert "GET /api/v1/health" in caplog.text
+    assert "Error in POST /api/v1/papers: boom" in caplog.text
+
+
+def test_exception_hierarchy():
+    assert issubclass(PaperNotFound, RepositoryException)</code></pre>
+  <p><code>caplog</code> is a built-in pytest fixture that captures log records during a test.</p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+curl.exe -s http://localhost:18000/api/v1/health</code></pre>
+  <p>
+    Tests: <code>55 passed</code> (49 + 6). With uvicorn running as shown above, the health call returns
+    <code>{"status":"ok","version":"0.1.0","environment":"development","service_name":"rag-api","services":{"database":{"status":"healthy","message":"Connected successfully"}}}</code>.
+    Then <code>docker compose stop postgres</code> and call it again: <code>"status":"degraded"</code> with the connection error as the
+    message. Start Postgres again. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day5" /><span>Day 5 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In the conftest, remove the <code>patch("src.main.make_database", ...)</code> line (keep its body). Every API test now errors
+      during startup with <code>could not translate host name "postgres" to address</code>: the real lifespan read your <code>.env</code>. This is the
+      same class of failure as the reference's 13 API tests that fail on your laptop with <code>getaddrinfo failed</code>.</li>
+    <li>Instead, patch <code>"src.db.factory.make_database"</code>. It still fails. Why? (Where does <code>src.main</code> look the name up?)</li>
+    <li>Remove the <code>dependency_overrides</code> line but keep the patch. The tests still pass! The lifespan put the same fake on
+      <code>app.state</code>, and <code>get_database</code> reads it from there. Two roads, one fake. Put it back; the override is what lets one test swap in a different fake.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 6                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day6"><span class="day">Day 6</span>The API Dockerfile and Compose stack</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    "Works on my laptop" isn't a deployment. Today your API becomes an image that runs the same everywhere, joins the
+    Compose network next to Postgres, and starts only once Postgres is healthy. This is the module's end state.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Multi-stage build</td><td>Several <code>FROM</code> lines in one Dockerfile. An early stage has the build tools; the final stage copies only the results. The shipped image stays smaller.</td></tr>
+    <tr><td>Build context</td><td>The folder sent to Docker (the <code>.</code> in <code>build: .</code>). <code>COPY</code> can only see files inside it.</td></tr>
+    <tr><td>BuildKit cache mount</td><td><code>RUN --mount=type=cache,...</code> keeps a folder (like uv's download cache) between builds without putting it in the image.</td></tr>
+    <tr><td><code>depends_on: condition: service_healthy</code></td><td>Don't start this service until that one's healthcheck passes. Without it, the API would start before Postgres accepts connections and crash.</td></tr>
+    <tr><td>CA certificate</td><td>A root certificate your machine trusts. Your office proxy re-signs HTTPS traffic with the company's own CA, so containers must trust it too.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>Dockerfile</b> &middot; the API image (working-tree version, with the proxy fix)</p>
+  <table class="walk">
+    <tr><td><pre><code>FROM ghcr.io/astral-sh/uv:python3.12-bookworm AS base
+WORKDIR /app
+COPY pyproject.toml uv.lock ./</code></pre></td>
+      <td>Stage one, named <code>base</code>: an image with Python 3.12 and uv. Copy <b>only</b> the dependency files first, so this layer's cache survives code changes.</td></tr>
+    <tr><td><pre><code>ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy</code></pre></td>
+      <td>Precompile <code>.pyc</code> files for faster startup; copy instead of hard-linking (the cache is on a different filesystem).</td></tr>
+    <tr><td><pre><code>RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=/app/uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=/app/pyproject.toml \
+    uv sync --frozen --no-dev</code></pre></td>
+      <td>Install dependencies into <code>/app/.venv</code>. <code>--frozen</code>: use <code>uv.lock</code> exactly and fail if it's out of date. <code>--no-dev</code>: skip pytest and friends. The cache mount keeps downloads between builds.</td></tr>
+    <tr><td><pre><code>COPY src /app/src</code></pre></td>
+      <td>Your code, last, because it changes most often.</td></tr>
+    <tr><td><pre><code>FROM python:3.12.8-slim AS final
+EXPOSE 8000
+ENV PYTHONUNBUFFERED=1
+ARG VERSION=0.1.0
+ENV APP_VERSION=$VERSION</code></pre></td>
+      <td>Stage two: a slim Python image without uv. <code>PYTHONUNBUFFERED</code> makes logs appear immediately in <code>docker logs</code>. <code>APP_VERSION</code> feeds the version in <code>main.py</code>.</td></tr>
+    <tr><td><pre><code>WORKDIR /app
+COPY --from=base /app /app
+ENV PATH="/app/.venv/bin:$PATH"</code></pre></td>
+      <td>Copy the finished virtual environment and code from stage one. Putting <code>.venv/bin</code> first on <code>PATH</code> makes <code>python</code> and <code>uvicorn</code> the project's.</td></tr>
+    <tr><td><pre><code>COPY certs/corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt
+RUN cat /usr/local/share/ca-certificates/corp-ca.crt &gt;&gt; "$(python -c 'import certifi; print(certifi.where())')"</code></pre></td>
+      <td>The proxy fix (not in the original course). <code>httpx</code> and <code>requests</code> trust the <code>certifi</code> bundle, not the system store, so the corporate root is appended to that file. Needed for outgoing calls to arXiv and Jina in later modules.</td></tr>
+    <tr><td><pre><code>CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]</code></pre></td>
+      <td>Four worker processes, each with its own lifespan, so each opens its own pool of up to 20 Postgres connections. Postgres allows 100 by default. Good interview arithmetic.</td></tr>
+  </table>
+  <p>
+    Notice the cert is only added in the final stage. The <code>uv sync</code> in the base stage downloads packages without it, and the
+    reference image builds fine on this network, so package downloads aren't what the proxy breaks.
+  </p>
+
+  <p class="file"><b>compose.yml</b> &middot; the reference api service (first half)</p>
+  <pre><code>  api:
+    build: .
+    container_name: rag-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    env_file:
+      - .env
+    environment:
+      # Container-specific overrides
+      ...
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      ...</code></pre>
+  <p>
+    <code>build: .</code> builds the Dockerfile in this folder instead of pulling an image. The healthcheck uses Python's standard
+    library because the slim image has no <code>curl</code>. <code>env_file</code> loads your whole <code>.env</code> into the container;
+    <code>environment</code> then overrides specific values. Inside the container, the API reaches Postgres at <code>postgres:5432</code>,
+    the internal port, not 15432.
+  </p>
+
+  <div class="callout story">
+    <b>What happened here this week</b>
+    The reference API image is 12.8 GB, and rebuilds took about 30 minutes: the dependency layer (torch and friends, pulled in by the
+    PDF parser in Module 2) kept being evicted from a build cache that had hit its 30 GB limit. Your image today is small, because you
+    only have FastAPI, SQLAlchemy, and a few libraries. Enjoy fast builds while they last.
+  </div>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Copy the certificate and keep it out of git:
+<pre><code>mkdir certs
+Copy-Item ..\production-agentic-rag-course\certs\corp-ca.crt certs\
+Add-Content .gitignore "certs/"</code></pre></li>
+    <li>Write your <code>Dockerfile</code>, identical to the reference.</li>
+    <li>Add a <code>.dockerignore</code> with <code>.venv</code>, <code>.git</code>, <code>data</code>, and <code>__pycache__</code>, one per line, so Docker doesn't
+      upload your Windows virtual environment as build context. (The reference doesn't have one.)</li>
+    <li>Add an <code>api</code> service to <code>compose.yml</code>: <code>build: .</code>, container name <code>curator-api</code>, port <code>"18000:8000"</code>,
+      <code>depends_on</code> <b>postgres</b> with <code>condition: service_healthy</code> (OpenSearch comes in Module 3; the API doesn't use Redis until Module 6),
+      the same healthcheck, <code>env_file: .env</code>, an <code>environment</code> entry setting <code>POSTGRES_DATABASE_URL</code> to the <code>postgres:5432</code> URL,
+      and the <code>curator-network</code>.</li>
+    <li>Stop any <code>uvicorn</code> you started by hand (it holds port 18000).</li>
+  </ol>
+  <details class="hint"><summary>Hint: <code>uv.lock</code> out of date</summary>
+    <p>If the build fails at <code>uv sync --frozen</code> saying the lockfile needs updating, run <code>uv lock</code> on your laptop and build again.
+      <code>--frozen</code> refuses to guess.</p></details>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>docker compose up -d --build
+docker compose ps
+curl.exe -s http://localhost:18000/api/v1/health
+docker compose logs api --tail 20</code></pre>
+  <p>
+    <code>ps</code> shows <code>curator-redis</code>, <code>curator-postgres</code>, and <code>curator-api</code>. The API turns <code>(healthy)</code>
+    after up to about 40 seconds (its <code>start_period</code>). The health call returns the same JSON as on Day 5, now from the container:
+    database <code>healthy</code>. The logs show <code>Starting RAG API...</code>, <code>Database connected</code>, <code>API ready</code> four times, one
+    per worker. <a href="http://localhost:18000/docs">localhost:18000/docs</a> works too. Commit everything except <code>certs/</code> and <code>.env</code>.
+  </p>
+  <div class="callout info"><b>Not validated for you</b>
+    I checked every test on this page by building the same code in a scratch project, against a real Postgres container. I did not
+    build your Docker image (the rules for this guide forbid me running builds on your machine), so treat the build output as new
+    territory and read it carefully if it fails.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-day6" /><span>Stack is up, <code>/api/v1/health</code> on 18000 reports the database healthy, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove the <code>environment:</code> override for <code>POSTGRES_DATABASE_URL</code>, and change <code>.env</code> to the <code>localhost:15432</code> URL.
+      Rebuild. Health is degraded with a connection-refused message: inside a container, <code>localhost</code> is the container itself. Revert both.</li>
+    <li>Remove <code>depends_on</code>, then <code>docker compose down</code> and <code>up -d</code>. Watch <code>docker compose logs api</code>: the API may try to
+      connect before Postgres is ready and crash at startup. Restore it.</li>
+    <li>Comment out the two certificate lines in the Dockerfile and rebuild. Nothing breaks yet, because your API makes no outgoing HTTPS
+      calls. Module 2's arXiv downloads would fail with <code>CERTIFICATE_VERIFY_FAILED</code>. Restore them.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 1" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. What does FastAPI do with a function's type hints?</summary>
+    <div class="answer">It decides where each parameter comes from (path, query, body, dependency), validates incoming data with Pydantic,
+      validates and filters the return value against <code>response_model</code>, and generates the OpenAPI schema and <code>/docs</code> page.
+      Invalid requests get a 422 before your code runs; invalid responses raise a server error.</div></details>
+
+  <details class="drill"><summary>2. What is the lifespan, and what goes in it?</summary>
+    <div class="answer">An async context manager that runs once at startup (before <code>yield</code>) and once at shutdown (after). It creates
+      expensive shared objects (the database pool, service clients) and stores them on <code>app.state</code>; shutdown closes them, e.g.
+      <code>database.teardown()</code> disposes the engine's pool.</div></details>
+
+  <details class="drill"><summary>3. Explain dependency injection in FastAPI and why it helps testing.</summary>
+    <div class="answer">An endpoint declares <code>Annotated[Type, Depends(provider)]</code>; FastAPI calls the provider per request and passes the
+      result. Dependencies can chain and can be generators with cleanup. In tests, <code>app.dependency_overrides[provider] = fake</code> swaps
+      the provider without touching endpoint code: I test the health endpoint with a fake database that can be told to fail.</div></details>
+
+  <details class="drill"><summary>4. There are two <code>get_settings</code> functions in the project. What's the difference?</summary>
+    <div class="answer"><code>src.config.get_settings</code> builds a fresh <code>Settings()</code> on every call; factories like <code>make_database</code> use it.
+      <code>src.dependencies.get_settings</code> is wrapped in <code>@lru_cache</code>, so endpoints share one instance per process. To override
+      settings in a test, you override the dependencies version, because that's the object FastAPI knows about.</div></details>
+
+  <details class="drill"><summary>5. In what order does pydantic-settings pick a value, and why does the API use <code>postgres:5432</code> but your tests <code>localhost:15432</code>?</summary>
+    <div class="answer">Explicit arguments, then environment variables, then the <code>.env</code> file, then class defaults. Inside Docker, the service name
+      <code>postgres</code> resolves on the Compose network and the internal port is 5432. From the laptop that name doesn't resolve; you reach
+      the same database through the published port 15432. That's also why 13 reference API tests fail on the host with <code>getaddrinfo failed</code>.</div></details>
+
+  <details class="drill"><summary>6. Engine, connection pool, session: what is each?</summary>
+    <div class="answer">The engine knows the database URL and owns a pool of open connections that get reused, because opening a connection is slow.
+      A session is a unit of work that borrows a connection, tracks added or changed objects, and writes them on commit. <code>get_session</code>
+      rolls back on error and always closes the session, returning the connection.</div></details>
+
+  <details class="drill"><summary>7. What does <code>Base.metadata.create_all</code> do, and what are its limits?</summary>
+    <div class="answer">It issues <code>CREATE TABLE</code> for every registered model whose table doesn't exist. Models register when their module is
+      imported, which is why the reference API never creates <code>papers</code> (it never imports the model) and Airflow does. It never alters existing
+      tables, so schema changes need a migration tool like Alembic.</div></details>
+
+  <details class="drill"><summary>8. What is the repository pattern, and what does <code>upsert</code> do here?</summary>
+    <div class="answer">All queries for one table live in one class with plain methods, so the rest of the code never writes SQL and can be tested with a fake.
+      <code>upsert</code> looks up by <code>arxiv_id</code>, then updates the fields the caller set (<code>exclude_unset=True</code>) or inserts. It makes re-running
+      ingestion safe. It's read-then-write, so concurrent writers could race; <code>INSERT ... ON CONFLICT</code> would be atomic.</div></details>
+
+  <details class="drill"><summary>9. Why does the model have both <code>unique=True</code> and a Pydantic schema? Isn't that duplicate validation?</summary>
+    <div class="answer">They protect different boundaries. Pydantic checks shape and types when data enters the code. Database constraints (NOT NULL,
+      UNIQUE) hold even if a bug, a script, or another service bypasses the code. Duplicate arXiv IDs are prevented by the database, not by Python.</div></details>
+
+  <details class="drill"><summary>10. How do your repository tests avoid leaving rows in the database?</summary>
+    <div class="answer">Each test gets a session bound to a connection with an open outer transaction, using <code>join_transaction_mode="create_savepoint"</code>.
+      The repository's <code>commit()</code> calls only release savepoints; the fixture rolls back the outer transaction at the end. Real SQL,
+      real constraints, no leftover data.</div></details>
+
+  <details class="drill"><summary>11. Why does the health endpoint return 200 with <code>"degraded"</code> instead of 500 when the database is down?</summary>
+    <div class="answer">The API process is alive and can report what's wrong. Each dependency check is wrapped so one failure records
+      <code>"unhealthy"</code> with the error message instead of crashing. A monitor can read the body. The trade-off: a load balancer that only looks at
+      status codes will keep sending traffic; some teams return 503 for degraded.</div></details>
+
+  <details class="drill"><summary>12. Walk me through the API Dockerfile.</summary>
+    <div class="answer">Two stages. The uv stage copies <code>pyproject.toml</code> and <code>uv.lock</code> first and runs <code>uv sync --frozen --no-dev</code> with a
+      cache mount, so the dependency layer is cached across code changes; then it copies <code>src</code>. The slim final stage copies <code>/app</code>
+      including <code>.venv</code>, puts it on <code>PATH</code>, appends the corporate CA to certifi's bundle so outgoing HTTPS works behind the
+      TLS-inspecting proxy, and runs uvicorn with 4 workers.</div></details>
+
+  <details class="drill"><summary>13. What does <code>depends_on: condition: service_healthy</code> guarantee, and what doesn't it?</summary>
+    <div class="answer">Compose starts the API only after Postgres's healthcheck (<code>pg_isready</code>) passes. It doesn't help if Postgres dies later; for that, the
+      pool's <code>pool_pre_ping</code> and the health endpoint's degraded status matter. It also only applies at <code>up</code> time, within one Compose project.</div></details>
+
+  <details class="drill"><summary>14. With 4 uvicorn workers and <code>pool_size=20</code>, how many Postgres connections can the API open?</summary>
+    <div class="answer">Each worker is a separate process with its own lifespan and its own engine, so up to 4 &times; 20 = 80 (<code>max_overflow</code> is 0).
+      Postgres's default <code>max_connections</code> is 100, and Airflow uses the same server. Scaling workers without shrinking pools will exhaust connections.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m1-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 2</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m1-tests" /><span><code>uv run pytest -q</code> shows 55 passed (with Postgres up and the reference stack running for the Module 0 tests)</span></li>
+    <li><input type="checkbox" data-id="m1-stack" /><span><code>docker compose ps</code> shows redis, postgres, and api healthy; <code>curl.exe -s http://localhost:18000/api/v1/health</code> reports the database healthy</span></li>
+    <li><input type="checkbox" data-id="m1-diff" /><span>You diffed your <code>src/config.py</code>, <code>src/dependencies.py</code>, and <code>src/routers/ping.py</code> against the reference and can explain every difference</span></li>
+    <li><input type="checkbox" data-id="m1-git" /><span><code>certs/</code> and <code>.env</code> are not in git</span></li>
+  </ul>
+  <p>
+    Then send me "Module 1 passed". Module 2 fills your database: an arXiv client, PDF parsing with Docling, a concurrent
+    ingestion pipeline, and Airflow to run it every weekday.
+  </p>
+  <p><a href="module-02-data-ingestion.html">Next: Module 2 &mdash; Data ingestion &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 6 — Caching and tracing</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 6 &middot; 3 days</p>
+    <h1><span class="grad">Caching and tracing</span>: make repeats instant, and see inside every request</h1>
+    <p class="lede">
+      A three-minute answer is painful the first time and unacceptable the second. Today you add an exact-match
+      answer cache in Redis, measure the speedup yourself, and learn how a cached answer can outlive the code that
+      produced it. Then you add Langfuse tracing, so every request becomes a timeline of steps you can inspect.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: the cache client</span>
+      <span class="pill">Day 2: caching /ask and /stream</span>
+      <span class="pill">Day 3: tracing with Langfuse</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 6</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: Caching concepts and the cache client</a></li>
+      <li><a href="#day2">Day 2: Caching /ask and /stream, and measuring it</a></li>
+      <li><a href="#day3">Day 3: Observability with Langfuse</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 7</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>Which version of the code this page teaches</b>
+    The original course code, as in Module 5. <code>src/routers/ask.py</code> and <code>src/services/langfuse/client.py</code> were changed today in the
+    reference repo, so this page quotes <code>git show HEAD:&lt;path&gt;</code> for them. One exception, explained on Day 3: the original
+    Langfuse client was <b>missing methods</b> that the original tracer calls, and the working tree added them. You'll write the working-tree
+    version of those methods, and learn why.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>Caching concepts and the cache client</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Your <code>/ask</code> costs 2&ndash;4 minutes of CPU. People ask the same questions again: you testing, a demo, a
+    Telegram user pressing a button twice. A <b>cache</b> stores the finished answer, so an identical question is
+    answered in milliseconds without touching OpenSearch, Jina, or Ollama. It's the cheapest performance win in the
+    whole system, and it has a real failure mode that you hit this week.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Cache hit / miss</td><td>Hit: the answer was stored, return it. Miss: compute it, then store it.</td></tr>
+    <tr><td>Cache key</td><td>The name the answer is stored under. Two requests that should share an answer must produce the same key; requests that shouldn't must produce different keys.</td></tr>
+    <tr><td>Exact-match cache</td><td>The key is built from the exact request. <code>"What is RAG?"</code> and <code>"what is RAG?"</code> are different keys. A <b>semantic</b> cache would compare meanings with embeddings instead; more hits, but risk of returning the answer to a subtly different question.</td></tr>
+    <tr><td>Hash (SHA-256)</td><td>A function that turns any text into a fixed-length fingerprint. Same input, same fingerprint; any change, a completely different one. Used here to make short keys from long requests.</td></tr>
+    <tr><td>TTL (time to live)</td><td>How long an entry survives before Redis deletes it automatically. Here 6 hours.</td></tr>
+    <tr><td>Eviction and LRU</td><td>When Redis reaches its memory limit, it must delete something. <code>allkeys-lru</code> deletes the <b>l</b>east <b>r</b>ecently <b>u</b>sed key first.</td></tr>
+    <tr><td>Invalidation</td><td>Removing entries that are no longer correct. "There are only two hard things in computer science: cache invalidation and naming things."</td></tr>
+    <tr><td>Graceful fallback</td><td>If the cache is broken, behave as if every lookup is a miss. The cache must make the system faster, never make it fail.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/config.py</b> &middot; <code>RedisSettings</code> (nested under <code>Settings.redis</code>)</p>
+  <pre><code>class RedisSettings(BaseConfigSettings):
+    model_config = SettingsConfigDict(
+        env_file=[".env", str(ENV_FILE_PATH)],
+        env_prefix="REDIS__",
+        extra="ignore",
+        frozen=True,
+        case_sensitive=False,
+    )
+
+    host: str = "localhost"
+    port: int = 6379
+    password: str = ""
+    db: int = 0
+    decode_responses: bool = True
+    socket_timeout: int = 30
+    socket_connect_timeout: int = 30
+
+    # Cache settings
+    ttl_hours: int = 6  # Cache TTL in hours</code></pre>
+  <p>
+    And on <code>Settings</code>: <code>redis: RedisSettings = Field(default_factory=RedisSettings)</code>. Environment variables:
+    <code>REDIS__HOST</code>, <code>REDIS__PORT</code>, <code>REDIS__TTL_HOURS</code>, and so on.
+  </p>
+
+  <p class="file"><b>src/services/cache/client.py</b> &middot; the whole cache in 75 lines</p>
+  <table class="walk">
+    <tr><td><pre><code>class CacheClient:
+    def __init__(self, redis_client: redis.Redis, settings: RedisSettings):
+        self.redis = redis_client
+        self.settings = settings
+        self.ttl = timedelta(hours=settings.ttl_hours)</code></pre></td>
+      <td>Receives a ready Redis connection instead of creating one. That's dependency injection again, and it's what lets tests pass in a fake.</td></tr>
+    <tr><td><pre><code>    def _generate_cache_key(self, request: AskRequest) -&gt; str:
+        key_data = {
+            "query": request.query,
+            "model": request.model,
+            "top_k": request.top_k,
+            "use_hybrid": request.use_hybrid,
+            "categories": sorted(request.categories) if request.categories else [],
+        }</code></pre></td>
+      <td>Every field that changes the answer goes into the key. Categories are sorted so <code>["cs.LG","cs.AI"]</code> and <code>["cs.AI","cs.LG"]</code> share an entry. What's <em>not</em> in the key matters too: the prompt text and the code version (see the incident on Day 2).</td></tr>
+    <tr><td><pre><code>        key_string = json.dumps(key_data, sort_keys=True)
+        key_hash = hashlib.sha256(key_string.encode()).hexdigest()[:16]
+        return f"exact_cache:{key_hash}"</code></pre></td>
+      <td><code>sort_keys=True</code> makes the JSON text identical regardless of dictionary order. SHA-256 gives 64 hex characters; the first 16 are kept. The prefix groups these keys so you can find them with <code>--scan --pattern "exact_cache:*"</code>.</td></tr>
+    <tr><td><pre><code>    async def find_cached_response(self, request: AskRequest) -&gt; Optional[AskResponse]:
+        try:
+            cache_key = self._generate_cache_key(request)
+            cached_response = self.redis.get(cache_key)
+
+            if cached_response:
+                try:
+                    response_data = json.loads(cached_response)
+                    logger.info(f"Cache hit for exact query match")
+                    return AskResponse(**response_data)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to deserialize cached response: {e}")
+                    return None
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error checking cache: {e}")
+            return None</code></pre></td>
+      <td>A hit is turned back into an <code>AskResponse</code>. Every failure path returns <code>None</code>, meaning "treat as a miss": that's the graceful fallback. Note that <code>self.redis.get</code> is a <b>synchronous</b> call inside an <code>async def</code>; Redis answers in well under a millisecond locally so it's harmless here, but it's the same event-loop trap as Module 0's <code>hybrid_search</code>. <code>redis.asyncio</code> would fix it.</td></tr>
+    <tr><td><pre><code>    async def store_response(self, request: AskRequest, response: AskResponse) -&gt; bool:
+        try:
+            cache_key = self._generate_cache_key(request)
+            success = self.redis.set(cache_key, response.model_dump_json(), ex=self.ttl)
+            if success:
+                logger.info(f"Stored response in exact cache with key {cache_key[:16]}...")
+                return True
+            else:
+                logger.warning(f"Failed to store response in cache")
+                return False
+        except Exception as e:
+            logger.error(f"Error storing in cache: {e}")
+            return False</code></pre></td>
+      <td>Stores the answer as JSON with an expiry. <code>ex=</code> accepts a <code>timedelta</code>. Failures return <code>False</code> and never raise.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/cache/factory.py</b></p>
+  <pre><code>def make_redis_client(settings: Settings) -&gt; redis.Redis:
+    redis_settings = settings.redis
+    try:
+        client = redis.Redis(
+            host=redis_settings.host,
+            port=redis_settings.port,
+            password=redis_settings.password if redis_settings.password else None,
+            db=redis_settings.db,
+            decode_responses=redis_settings.decode_responses,
+            socket_timeout=redis_settings.socket_timeout,
+            socket_connect_timeout=redis_settings.socket_connect_timeout,
+            retry_on_timeout=True,
+            retry_on_error=[redis.ConnectionError, redis.TimeoutError],
+        )
+        client.ping()
+        logger.info(f"Connected to Redis at {redis_settings.host}:{redis_settings.port}")
+        return client
+    except redis.ConnectionError as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        raise
+    ...
+
+def make_cache_client(settings: Settings) -&gt; CacheClient:
+    try:
+        redis_client = make_redis_client(settings)
+        cache_client = CacheClient(redis_client, settings.redis)
+        logger.info("Exact match cache client created successfully")
+        return cache_client
+    except Exception as e:
+        logger.error(f"Failed to create cache client: {e}")
+        raise</code></pre>
+  <p>
+    <code>client.ping()</code> tests the connection at startup. Note the asymmetry: the <em>client</em> never raises during requests, but the
+    <em>factory</em> re-raises. Since the lifespan calls it without a <code>try</code>, <b>the API refuses to start if Redis is down at startup</b>, yet
+    keeps running if Redis dies later. You'll see both on Day 2.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Add <code>RedisSettings</code> and the <code>redis</code> field to your <code>src/config.py</code>. Add to <code>.env</code>, mirroring the reference:
+      <code>REDIS__HOST=redis</code>, <code>REDIS__PORT=6379</code>, <code>REDIS__PASSWORD=</code>, <code>REDIS__DB=0</code>, <code>REDIS__TTL_HOURS=6</code>.
+      These are the values <em>inside</em> Docker.</li>
+    <li>Write <code>src/services/cache/client.py</code> (<code>CacheClient</code> with <code>_generate_cache_key</code>, <code>find_cached_response</code>,
+      <code>store_response</code>) and <code>src/services/cache/factory.py</code> (<code>make_redis_client</code>, <code>make_cache_client</code>).</li>
+    <li>In <code>compose.yml</code>, give your existing <code>redis</code> service the reference's cache settings:
+      <code>command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru</code>, and make sure it's on
+      <code>curator-network</code>. Add <code>REDIS__HOST=redis</code> to the <code>api</code> environment and
+      <code>redis: condition: service_healthy</code> to its <code>depends_on</code>.</li>
+  </ol>
+  <p>Add two fixtures to <code>tests/conftest.py</code> (the name <code>cache</code> is avoided because pytest already has a built-in fixture with that name):</p>
+  <p class="file"><b>tests/conftest.py</b> (add)</p>
+  <pre><code>from unittest.mock import MagicMock
+
+from src.config import RedisSettings
+from src.services.cache.client import CacheClient
+
+
+@pytest.fixture
+def fake_redis():
+    return MagicMock()
+
+
+@pytest.fixture
+def cache_client(fake_redis):
+    return CacheClient(fake_redis, RedisSettings(ttl_hours=6))</code></pre>
+
+  <p class="file"><b>tests/unit/services/test_cache_client.py</b></p>
+  <pre><code>from datetime import timedelta
+
+import pytest
+import redis
+from src.schemas.api.ask import AskRequest, AskResponse
+
+ANSWER = AskResponse(
+    query="What is RAG?",
+    answer="RAG retrieves, then generates.",
+    sources=["https://arxiv.org/pdf/2609.30227.pdf"],
+    chunks_used=3,
+    search_mode="hybrid",
+)
+
+
+def test_cache_key_is_stable_and_short(cache_client):
+    key = cache_client._generate_cache_key(AskRequest(query="What is RAG?"))
+    assert key == cache_client._generate_cache_key(AskRequest(query="What is RAG?"))
+    assert key.startswith("exact_cache:")
+    assert len(key) == len("exact_cache:") + 16
+
+
+def test_cache_key_ignores_category_order(cache_client):
+    a = AskRequest(query="q", categories=["cs.LG", "cs.AI"])
+    b = AskRequest(query="q", categories=["cs.AI", "cs.LG"])
+    assert cache_client._generate_cache_key(a) == cache_client._generate_cache_key(b)
+
+
+@pytest.mark.parametrize("change", [{"query": "What is RAG? "}, {"top_k": 5}, {"model": "llama3.2:3b"}, {"use_hybrid": False}])
+def test_cache_key_changes_with_any_parameter(cache_client, change):
+    base = AskRequest(query="What is RAG?")
+    other = AskRequest(**{"query": "What is RAG?", **change})
+    assert cache_client._generate_cache_key(base) != cache_client._generate_cache_key(other)
+
+
+async def test_miss_returns_none(cache_client, fake_redis):
+    fake_redis.get.return_value = None
+    assert await cache_client.find_cached_response(AskRequest(query="q")) is None
+
+
+async def test_hit_returns_an_ask_response(cache_client, fake_redis):
+    fake_redis.get.return_value = ANSWER.model_dump_json()
+    assert await cache_client.find_cached_response(AskRequest(query="What is RAG?")) == ANSWER
+
+
+async def test_redis_down_is_treated_as_a_miss(cache_client, fake_redis):
+    fake_redis.get.side_effect = redis.ConnectionError("Error 10061 connecting to localhost:16379")
+    assert await cache_client.find_cached_response(AskRequest(query="q")) is None
+
+
+async def test_store_sets_value_with_ttl(cache_client, fake_redis):
+    fake_redis.set.return_value = True
+    request = AskRequest(query="What is RAG?")
+    assert await cache_client.store_response(request, ANSWER) is True
+    key, value = fake_redis.set.call_args.args
+    assert key == cache_client._generate_cache_key(request)
+    assert AskResponse.model_validate_json(value) == ANSWER
+    assert fake_redis.set.call_args.kwargs["ex"] == timedelta(hours=6)
+
+
+async def test_store_failure_returns_false(cache_client, fake_redis):
+    fake_redis.set.side_effect = redis.ConnectionError("down")
+    assert await cache_client.store_response(AskRequest(query="q"), ANSWER) is False</code></pre>
+  <p>
+    The parametrized test includes a trailing space: <code>"What is RAG? "</code> gets its own key. That's the price of an exact-match cache.
+    Now one test against your real Redis:
+  </p>
+  <p class="file"><b>tests/integration/test_cache_redis.py</b></p>
+  <pre><code>from src.config import RedisSettings, Settings
+from src.schemas.api.ask import AskRequest, AskResponse
+from src.services.cache.factory import make_cache_client
+
+
+async def test_round_trip_against_your_redis():
+    settings = Settings(redis=RedisSettings(host="localhost", port=16379, ttl_hours=6))
+    cache = make_cache_client(settings)
+    request = AskRequest(query="integration test question")
+    response = AskResponse(query=request.query, answer="42", sources=[], chunks_used=0, search_mode="bm25")
+
+    assert await cache.store_response(request, response) is True
+    assert await cache.find_cached_response(request) == response
+    key = cache._generate_cache_key(request)
+    assert 21_500 &lt; cache.redis.ttl(key) &lt;= 21_600
+    cache.redis.delete(key)</code></pre>
+  <div class="callout story">
+    <b>Why the host and port are spelled out in that test</b>
+    Your <code>.env</code> says <code>REDIS__HOST=redis</code>, correct for the API container and meaningless on your laptop. That's exactly how
+    13 reference API tests failed this week with <code>Error 11001 connecting to redis:6379. getaddrinfo failed</code>. A test that runs on the
+    host must use the published port: <code>localhost:16379</code>.
+  </div>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>docker compose up -d redis
+uv run pytest tests/unit/services/test_cache_client.py tests/integration/test_cache_redis.py -q</code></pre>
+  <p>Expect <code>12 passed</code> (11 unit tests, counting the 4 parametrized cases, plus 1 integration test). Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m6-day1" /><span>Day 1: 12 cache tests pass against your Redis on 16379, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove <code>sorted(...)</code> around the categories. Which test fails? What would users notice in production? (Fewer hits, nothing else.)</li>
+    <li>Remove <code>sort_keys=True</code> and run the tests. They still pass. Why? (Python dictionaries keep insertion order and the code always inserts in the same order,
+      so it's defensive rather than required. Would it still be safe if someone built <code>key_data</code> in a loop?)</li>
+    <li><code>docker compose stop redis</code> and run only the unit tests: they pass, because they use a fake. Run the integration test: it fails in
+      <code>make_redis_client</code> with a <code>ConnectionError</code> from <code>client.ping()</code>. Start Redis again.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Caching /ask and /stream, and measuring it</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A cache client alone does nothing; it has to sit in the request path at the right places. Put it in the wrong
+    place and you cache errors, cache "no results" forever, or skip the cache for streaming users. And once answers are
+    cached, a bug fix doesn't reach users until the old answers expire.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <ul>
+    <li><b>Cache-aside:</b> the endpoint checks the cache first; on a miss it does the work and then stores the result. The cache never calls the backend itself.</li>
+    <li><b>What not to cache:</b> errors (they may be temporary) and empty results (the papers may be indexed an hour later).</li>
+    <li><b>Replaying a cached answer as a stream:</b> the client expects SSE events, so a cached answer is re-sent in the same event shapes, word by word.</li>
+    <li><b>Stale entries:</b> an entry that's still within its TTL but no longer what the current code would produce.</li>
+  </ul>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/dependencies.py</b></p>
+  <pre><code>def get_cache_client(request: Request) -&gt; CacheClient | None:
+    """Get cache client from the request state."""
+    return getattr(request.app.state, "cache_client", None)
+...
+CacheDep = Annotated[CacheClient | None, Depends(get_cache_client)]</code></pre>
+  <p>
+    <code>getattr(..., None)</code> means "no cache configured" is a normal state, not a crash. That's also why your Module 5 endpoint tests keep passing
+    today without changes: their small app has no <code>cache_client</code>, so the endpoints see <code>None</code>.
+  </p>
+  <p class="file"><b>src/main.py</b> &middot; in the lifespan</p>
+  <pre><code>    app.state.cache_client = make_cache_client(settings)</code></pre>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; original version, the cache lines in <code>/ask</code> (tracing elided)</p>
+  <table class="walk">
+    <tr><td><pre><code>            cached_response = None
+            if cache_client:
+                try:
+                    cached_response = await cache_client.find_cached_response(request)
+                    if cached_response:
+                        logger.info("Returning cached response for exact query match")
+                        return cached_response
+                except Exception as e:
+                    logger.warning(f"Cache check failed, proceeding with normal flow: {e}")</code></pre></td>
+      <td>First thing in the endpoint, before any embedding or search. A second <code>try</code> around a client that already never raises: belt and braces, so a future bug in the client can't break <code>/ask</code>.</td></tr>
+    <tr><td><pre><code>            if not chunks:
+                response = AskResponse(...)
+                ...
+                return response</code></pre></td>
+      <td>The "couldn't find anything" answer returns <b>before</b> the store step, so empty results are never cached. Good: new papers may arrive tomorrow.</td></tr>
+    <tr><td><pre><code>            if cache_client:
+                try:
+                    await cache_client.store_response(request, response)
+                except Exception as e:
+                    logger.warning(f"Failed to store response in cache: {e}")
+
+            return response</code></pre></td>
+      <td>After a successful answer. Errors raise before reaching this point, so they're never cached either.</td></tr>
+  </table>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; original version, the cache lines in <code>/stream</code></p>
+  <pre><code>                if cache_client:
+                    try:
+                        cached_response = await cache_client.find_cached_response(request)
+                        if cached_response:
+                            logger.info("Returning cached response for exact streaming query match")
+
+                            # Send metadata first (same format as non-cached)
+                            metadata_response = {
+                                "sources": cached_response.sources,
+                                "chunks_used": cached_response.chunks_used,
+                                "search_mode": cached_response.search_mode,
+                            }
+                            yield f"data: {json.dumps(metadata_response)}\n\n"
+
+                            # Stream the cached response in chunks
+                            for chunk in cached_response.answer.split():
+                                yield f"data: {json.dumps({'chunk': chunk + ' '})}\n\n"
+
+                            # Send completion signal with just the final answer
+                            yield f"data: {json.dumps({'answer': cached_response.answer, 'done': True})}\n\n"
+                            return
+                    except Exception as e:
+                        logger.warning(f"Cache check failed, proceeding with normal flow: {e}")
+                ...
+                if cache_client and full_response:
+                    try:
+                        search_mode = "bm25" if not request.use_hybrid else "hybrid"
+                        response_to_cache = AskResponse(
+                            query=request.query,
+                            answer=full_response,
+                            sources=sources,
+                            chunks_used=len(chunks),
+                            search_mode=search_mode,
+                        )
+                        await cache_client.store_response(request, response_to_cache)
+                    except Exception as e:
+                        logger.warning(f"Failed to store streaming response in cache: {e}")</code></pre>
+  <p>
+    <code>/ask</code> and <code>/stream</code> share one cache, because the key is built from the same <code>AskRequest</code>. Ask a question on
+    <code>/stream</code> and the identical <code>/ask</code> is instant, and vice versa. A replayed answer is split on whitespace and re-sent with a
+    space after each word, so line breaks in the original answer are lost. <code>full_response</code> must be non-empty to be stored, so a
+    stream that failed before any text arrived isn't cached.
+  </p>
+
+  <div class="callout story">
+    <b>What happened here this week: the stale answer</b>
+    Before the hallucination hardening, plain <code>/ask</code> produced an answer citing papers that were never retrieved, and that answer was
+    stored in Redis. After the hardening was deployed, the same question still returned the bad answer, instantly, because the cache key
+    contains the question, model, <code>top_k</code>, hybrid flag and categories, but <b>not</b> the prompt or the code version. New code, same key, old answer,
+    for up to 6 hours. The fix was to flush the cache. Better designs: add a version string to <code>key_data</code> and bump it on every change to
+    prompts or answer logic, or flush <code>exact_cache:*</code> as part of each deploy.
+  </div>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>src/dependencies.py</code>: add <code>get_cache_client</code> and <code>CacheDep</code>.</li>
+    <li><code>src/main.py</code>: <code>app.state.cache_client = make_cache_client(settings)</code> in the lifespan.</li>
+    <li><code>src/routers/ask.py</code>: add <code>cache_client: CacheDep</code> to both endpoints and the cache lines above, exactly where the original has them.
+      (Tracing stays out until tomorrow.)</li>
+  </ol>
+  <p>Update the endpoint fixtures so every test gets a fake cache that misses by default:</p>
+  <p class="file"><b>tests/api/conftest.py</b> (add the fixture, and two lines to <code>ask_client</code>)</p>
+  <pre><code>from src.dependencies import get_cache_client
+
+
+@pytest.fixture
+def fake_cache():
+    cache = MagicMock()
+    cache.find_cached_response = AsyncMock(return_value=None)
+    cache.store_response = AsyncMock(return_value=True)
+    return cache
+
+
+# ask_client now also takes fake_cache:
+@pytest.fixture
+def ask_client(fake_opensearch, fake_embeddings, fake_ollama, fake_cache):
+    ...
+    app.dependency_overrides[get_cache_client] = lambda: fake_cache
+    ...</code></pre>
+
+  <p class="file"><b>tests/api/routers/test_ask.py</b> (add)</p>
+  <pre><code>from src.schemas.api.ask import AskResponse
+
+CACHED = AskResponse(
+    query="What is RAG?",
+    answer="RAG retrieves first.",
+    sources=["https://arxiv.org/pdf/2609.30227.pdf"],
+    chunks_used=3,
+    search_mode="hybrid",
+)
+
+
+def test_ask_cache_hit_skips_search_and_llm(ask_client, fake_cache, fake_opensearch, fake_ollama):
+    fake_cache.find_cached_response.return_value = CACHED
+    data = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"}).json()
+    assert data["answer"] == "RAG retrieves first."
+    fake_opensearch.search_unified.assert_not_called()
+    fake_ollama.generate_rag_answer.assert_not_awaited()
+
+
+def test_ask_miss_stores_the_answer(ask_client, fake_cache):
+    ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+    stored_request, stored_response = fake_cache.store_response.call_args.args
+    assert stored_request.query == "What is RAG?"
+    assert stored_response.answer == "RAG retrieves, then generates."
+
+
+def test_ask_still_answers_when_the_cache_lookup_raises(ask_client, fake_cache):
+    fake_cache.find_cached_response.side_effect = RuntimeError("redis down")
+    response = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+    assert response.status_code == 200
+    assert response.json()["answer"] == "RAG retrieves, then generates."
+
+
+def test_ask_does_not_cache_empty_results(ask_client, fake_cache, fake_opensearch):
+    fake_opensearch.search_unified.return_value = {"total": 0, "hits": []}
+    ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+    fake_cache.store_response.assert_not_awaited()
+
+
+def test_stream_replays_a_cached_answer_word_by_word(ask_client, fake_cache, fake_ollama):
+    fake_cache.find_cached_response.return_value = CACHED
+    events = _events(ask_client.post("/api/v1/stream", json={"query": "What is RAG?"}))
+    assert events[0] == {"sources": ["https://arxiv.org/pdf/2609.30227.pdf"], "chunks_used": 3, "search_mode": "hybrid"}
+    assert [event["chunk"] for event in events if "chunk" in event] == ["RAG ", "retrieves ", "first. "]
+    assert events[-1] == {"answer": "RAG retrieves first.", "done": True}
+
+
+def test_stream_caches_the_full_answer(ask_client, fake_cache):
+    ask_client.post("/api/v1/stream", json={"query": "What is RAG?"})
+    assert fake_cache.store_response.call_args.args[1].answer == "RAG retrieves."</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/api/routers/test_ask.py -q
+docker compose up -d --build api
+'{"query": "What is retrieval-augmented generation?", "top_k": 3}' | Out-File -Encoding ascii ask.json
+Measure-Command { curl.exe -s -X POST http://localhost:18000/api/v1/ask -H "Content-Type: application/json" --data-binary "@ask.json" -o first.json }
+Measure-Command { curl.exe -s -X POST http://localhost:18000/api/v1/ask -H "Content-Type: application/json" --data-binary "@ask.json" -o second.json }
+docker exec curator-redis redis-cli --scan --pattern "exact_cache:*"
+docker compose logs api --tail 20</code></pre>
+  <p>
+    <code>test_ask.py</code> now shows <code>14 passed</code> (8 from Module 5 + 6). The first call takes minutes; the second takes well under a second, and
+    <code>first.json</code> and <code>second.json</code> are identical. Write both numbers down: that ratio is an interview sentence. <code>redis-cli</code>
+    lists one <code>exact_cache:...</code> key, and the logs show "Stored response in exact cache" and then "Cache hit for exact query match".
+  </p>
+  <p>Now the operator's side:</p>
+  <pre><code>docker exec curator-redis redis-cli TTL exact_cache:PASTE_YOUR_KEY_HERE
+docker exec curator-redis redis-cli DEL exact_cache:PASTE_YOUR_KEY_HERE
+docker exec curator-redis redis-cli FLUSHDB</code></pre>
+  <p>
+    <code>TTL</code> shows seconds left (just under 21600). <code>DEL</code> removes one entry; <code>FLUSHDB</code> empties the whole database, which is what fixed
+    this week's stale answer. Delete the JSON files. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m6-day2" /><span>Day 2: tests pass, second /ask is instant (numbers noted), you flushed a key by hand, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li><b>Redis dies while the API runs.</b> <code>docker compose stop redis</code>, then call <code>/ask</code> with a new question. It still answers (slowly),
+      and the logs show <code>Error checking cache</code> and <code>Error storing in cache</code>. That's graceful fallback.</li>
+    <li><b>Redis is down when the API starts.</b> With Redis still stopped, <code>docker compose restart api</code> and read <code>docker compose logs api</code>:
+      <code>Failed to connect to Redis</code>, then the lifespan fails and the API doesn't start. The same dependency is optional at request time but
+      mandatory at startup. How would you make startup tolerant? (Hint: catch the exception in the lifespan and leave <code>cache_client</code> unset;
+      <code>get_cache_client</code> already handles a missing attribute.) Start Redis, restart the API.</li>
+    <li><b>Reproduce the stale-answer incident.</b> Ask a question, then change one instruction in <code>rag_system.txt</code>, rebuild, and ask again. You get
+      the old answer instantly. Add <code>"prompt_version": "2"</code> to <code>key_data</code> and see the new prompt take effect. Then remove it again to match the
+      reference, and flush.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>Observability with Langfuse</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    When an answer is wrong or slow, "it took 3 minutes and said something odd" isn't enough to act on. Was the search
+    bad? Was the prompt too long? Did the model ignore the passages? <b>Tracing</b> records every step of every request
+    (inputs, outputs, timings) so you can open one request and see exactly where the time went and what the model was
+    given. For LLM apps this matters more than usual, because the same code can give a different answer every time.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Trace</td><td>The record of one whole request, e.g. one <code>/ask</code> call.</td></tr>
+    <tr><td>Span</td><td>One timed step inside a trace, with an input, an output, a start and an end. Spans can nest: <code>rag_request</code> contains <code>search_retrieval</code>.</td></tr>
+    <tr><td>Generation</td><td>A span specifically for an LLM call, with the model name, prompt, completion, and token counts.</td></tr>
+    <tr><td>Flush</td><td>Tracing libraries buffer events and send them in batches in the background, so tracing doesn't slow requests down. Flushing sends whatever is still buffered.</td></tr>
+    <tr><td>OpenTelemetry</td><td>The industry-standard format for traces. Langfuse v3's Python SDK is built on it; that's why the reference logs mention an "OTEL tracer provider".</td></tr>
+  </table>
+
+  <h4>Langfuse v3 is six services</h4>
+  <table class="plain">
+    <tr><th>Service</th><th>Job</th></tr>
+    <tr><td><code>langfuse-web</code></td><td>The UI and the API that receives traces (reference port 3001, container port 3000).</td></tr>
+    <tr><td><code>langfuse-worker</code></td><td>Processes incoming events in the background.</td></tr>
+    <tr><td><code>langfuse-postgres</code></td><td>Users, projects, API keys.</td></tr>
+    <tr><td><code>clickhouse</code></td><td>A column-oriented database for fast analytics over millions of traces.</td></tr>
+    <tr><td><code>langfuse-redis</code></td><td>A queue between web and worker.</td></tr>
+    <tr><td><code>langfuse-minio</code></td><td>S3-compatible object storage for raw event payloads.</td></tr>
+  </table>
+  <div class="callout story">
+    <b>What happened here this week: the image that wouldn't pull</b>
+    Pulling <code>quay.io/minio/minio</code> failed with <b>401 Unauthorized</b>, and the Docker Hub repository the original <code>compose.yml</code> used
+    (<code>docker.io/minio/minio</code>) is no longer available either. The working tree replaced it with <code>rustfs/rustfs</code>, an S3-compatible
+    drop-in, keeping the service name, ports and credentials so Langfuse's configuration didn't change. Read the comment above
+    <code>langfuse-minio</code> in the working-tree <code>compose.yml</code>. Lesson: pin images to versions you've verified you can pull.
+  </div>
+  <div class="callout tip">
+    <b>Recommended: reuse the reference Langfuse instead of running six more containers</b>
+    Start only the reference Langfuse services (in the reference folder:
+    <code>docker compose start langfuse-postgres langfuse-redis langfuse-minio clickhouse langfuse-worker langfuse-web</code>). The working tree provisions
+    a project with fixed keys. In your <code>api</code> service's environment set
+    <code>LANGFUSE__ENABLED=true</code>, <code>LANGFUSE__HOST=http://host.docker.internal:3001</code>,
+    <code>LANGFUSE__PUBLIC_KEY=pk-lf-00000000-0000-0000-0000-00000000pub</code>,
+    <code>LANGFUSE__SECRET_KEY=sk-lf-00000000-0000-0000-0000-00000000sec</code>. The UI is <a href="http://localhost:3001">localhost:3001</a>, login
+    <code>admin@example.com</code> / <code>admin123</code>. Your traces appear next to the reference's, in project "Agentic RAG".
+    If you'd rather run your own, copy the six services from the reference <code>compose.yml</code> with your prefixes and publish the web UI on 13001.
+  </div>
+  <div class="callout warn">
+    <b>A config trap: one underscore versus two</b>
+    The reference <code>.env</code> and <code>.env.example</code> contain <code>LANGFUSE_ENABLED</code>, <code>LANGFUSE_PUBLIC_KEY</code> and so on, with <b>one</b>
+    underscore. But <code>LangfuseSettings</code> uses <code>env_prefix="LANGFUSE__"</code> (two), so those lines are silently ignored. The working-tree
+    <code>compose.yml</code> has a comment explaining exactly this, and sets <code>LANGFUSE__*</code>. Use the double-underscore names.
+  </div>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/config.py</b> &middot; <code>LangfuseSettings</code> (on <code>Settings.langfuse</code>)</p>
+  <pre><code>    public_key: str = ""
+    secret_key: str = ""
+    host: str = "http://localhost:3000"  # Self-hosted Langfuse URL
+    enabled: bool = True
+    flush_at: int = 15  # Number of events before flushing
+    flush_interval: float = 1.0  # Seconds between flushes
+    max_retries: int = 3
+    timeout: int = 30
+    debug: bool = False</code></pre>
+
+  <p class="file"><b>src/services/langfuse/client.py</b> &middot; original <code>__init__</code></p>
+  <pre><code>class LangfuseTracer:
+    def __init__(self, settings: Settings):
+        self.settings = settings.langfuse
+        self.client: Optional[Langfuse] = None
+
+        if self.settings.enabled and self.settings.public_key and self.settings.secret_key:
+            try:
+                self.client = Langfuse(
+                    public_key=self.settings.public_key,
+                    secret_key=self.settings.secret_key,
+                    host=self.settings.host,
+                    flush_at=self.settings.flush_at,
+                    flush_interval=self.settings.flush_interval,
+                    debug=self.settings.debug,
+                )
+                logger.info(f"Langfuse v3 tracing initialized (host: {self.settings.host})")
+            except Exception as e:
+                logger.error(f"Failed to initialize Langfuse: {e}")
+                self.client = None
+        else:
+            logger.info("Langfuse tracing disabled or missing credentials")</code></pre>
+  <p>
+    <code>self.client</code> is either a real Langfuse client or <code>None</code>. Every other method starts with "if there's no client, do nothing".
+    That's the key design idea: <b>tracing is optional and must never break a request</b>. <code>enabled</code> defaults to <code>True</code>, but with empty
+    keys the client stays <code>None</code>, which is why tracing was quietly off while the single-underscore variables were being ignored.
+  </p>
+
+  <p class="file"><b>src/services/langfuse/tracer.py</b> &middot; <code>RAGTracer</code>, a RAG-shaped layer on top</p>
+  <table class="walk">
+    <tr><td><pre><code>class RAGTracer:
+    def __init__(self, tracer: LangfuseTracer):
+        self.tracer = tracer</code></pre></td>
+      <td>Wraps the generic tracer with one method per RAG step, so the endpoint reads like the pipeline.</td></tr>
+    <tr><td><pre><code>    @contextmanager
+    def trace_request(self, user_id: str, query: str):
+        trace = None
+        try:
+            with self.tracer.trace_rag_request(
+                query=query, user_id=user_id, session_id=f"session_{user_id}", metadata={"simplified_tracing": True}
+            ) as trace:
+                yield trace
+        finally:
+            if trace:
+                self.tracer.flush()</code></pre></td>
+      <td>A context manager built from a generator (Module 0, Day 2): code before <code>yield</code> runs on entering the <code>with</code>, the <code>finally</code> on leaving it. It opens the root span for the request and flushes at the end.</td></tr>
+    <tr><td><pre><code>    @contextmanager
+    def trace_search(self, trace, query: str, top_k: int):
+        span = self.tracer.create_span(trace=trace, name="search_retrieval", input_data={"query": query, "top_k": top_k})
+        try:
+            yield span
+        finally:
+            if span:
+                span.end()</code></pre></td>
+      <td>One child span per step, always ended even if the step raises. <code>trace_embedding</code>, <code>trace_prompt_construction</code> and <code>trace_generation</code> have the same shape; <code>trace_embedding</code> also records how long it took.</td></tr>
+    <tr><td><pre><code>    def end_search(self, span, chunks: List[Dict], arxiv_ids: List[str], total_hits: int):
+        if not span:
+            return
+        self.tracer.update_span(
+            span=span,
+            output={
+                "chunks_returned": len(chunks),
+                "unique_papers": len(set(arxiv_ids)),
+                "total_hits": total_hits,
+                "arxiv_ids": list(set(arxiv_ids)),
+            },
+        )</code></pre></td>
+      <td>Records <em>what</em> the step produced. When an answer cites a paper, this is where you check whether that paper was actually retrieved. <code>end_prompt</code>, <code>end_generation</code> and <code>end_request</code> do the same for their steps.</td></tr>
+  </table>
+
+  <div class="callout story">
+    <b>A bug in the original course code: the tracer calls methods that don't exist</b>
+    <code>RAGTracer</code> calls <code>self.tracer.trace_rag_request(...)</code> and <code>self.tracer.create_span(...)</code>. Search the original client
+    (<code>git show HEAD:src/services/langfuse/client.py</code>): neither method is there. Because <code>trace_request</code> calls
+    <code>trace_rag_request</code> unconditionally, even with tracing <em>disabled</em>, every original <code>/ask</code> raises
+    <code>AttributeError: 'LangfuseTracer' object has no attribute 'trace_rag_request'</code> before its <code>try</code> block even starts. The reference test
+    suite didn't notice, because <code>test_ask.py</code> accepts status 500 as a pass. The working tree added <code>trace_rag_request</code>,
+    <code>create_span</code> and <code>end_span</code>. You'll write those, which is why this page quotes the working-tree version of these three methods.
+  </div>
+
+  <p class="file"><b>src/services/langfuse/client.py</b> &middot; the three methods added in the working tree (<code>git diff HEAD -- src/services/langfuse/client.py</code>)</p>
+  <table class="walk">
+    <tr><td><pre><code>    @contextmanager
+    def trace_rag_request(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        if not self.client:
+            yield None
+            return</code></pre></td>
+      <td>Disabled: yield <code>None</code> so the caller's <code>with ... as trace</code> still works. Every downstream helper accepts <code>None</code>.</td></tr>
+    <tr><td><pre><code>        try:
+            with self.client.start_as_current_span(name="rag_request") as span:
+                span.update(input={"query": query}, metadata=metadata or {})
+                yield span
+        except Exception as e:
+            logger.error(f"Error creating RAG request trace: {e}")
+            yield None</code></pre></td>
+      <td><code>start_as_current_span</code> is the Langfuse v3 (OpenTelemetry) way to open a root span and make it "current". Note that <code>user_id</code> and <code>session_id</code> are accepted but not recorded.</td></tr>
+    <tr><td><pre><code>    def create_span(self, trace=None, name: str = "span", input_data: Optional[Any] = None):
+        if not self.client:
+            return None
+
+        try:
+            if trace is not None and hasattr(trace, "start_span"):
+                return trace.start_span(name=name, input=input_data)
+            return self.client.start_span(name=name, input=input_data)
+        except Exception as e:
+            logger.error(f"Error creating span '{name}': {e}")
+            return None</code></pre></td>
+      <td>Not a context manager: the caller decides when to end it. With a parent, the new span nests under it; without, it becomes a top-level span. Note the signature has no <code>metadata</code> parameter. Keep that in mind for the debugging exercise.</td></tr>
+    <tr><td><pre><code>    def end_span(self, span, output: Optional[Any] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs):
+        if not span:
+            return
+
+        try:
+            if output is not None or metadata or kwargs:
+                span.update(output=output, metadata=metadata or {}, **kwargs)
+            span.end()
+        except Exception as e:
+            logger.error(f"Error ending span: {e}")</code></pre></td>
+      <td>Records output and closes. Used by the agent nodes in Module 7.</td></tr>
+  </table>
+  <p class="file"><b>src/services/langfuse/client.py</b> &middot; original <code>update_span</code>, <code>flush</code>, <code>shutdown</code></p>
+  <pre><code>    def update_span(
+        self,
+        span,
+        output: Optional[Any] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        level: Optional[str] = None,
+        status_message: Optional[str] = None,
+    ):
+        if not span:
+            return
+
+        try:
+            update_data = {}
+            if output is not None:
+                update_data["output"] = output
+            if metadata:
+                update_data["metadata"] = metadata
+            if level:
+                update_data["level"] = level
+            if status_message:
+                update_data["status_message"] = status_message
+
+            if update_data:
+                span.update(**update_data)
+            span.end()
+        except Exception as e:
+            logger.error(f"Error updating span: {e}")
+
+    def flush(self):
+        """Flush any pending traces."""
+        if self.client:
+            try:
+                self.client.flush()
+            except Exception as e:
+                logger.error(f"Error flushing Langfuse: {e}")</code></pre>
+  <p>
+    <code>update_span</code> also <em>ends</em> the span. <code>RAGTracer.trace_search</code> ends it again in its <code>finally</code>, so spans get ended twice; the
+    second call is ignored. <code>shutdown()</code> flushes and calls <code>self.client.shutdown()</code>. The original file has more methods
+    (<code>get_callback_handler</code>, <code>trace_langgraph_agent</code>, <code>get_trace_id</code>, <code>submit_feedback</code>, <code>start_generation</code>,
+    <code>start_span</code>, <code>update_generation</code>); they serve the agent in Module 7.
+  </p>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; original version, how <code>/ask</code> uses the tracer</p>
+  <pre><code>    rag_tracer = RAGTracer(langfuse_tracer)
+    start_time = time.time()
+
+    with rag_tracer.trace_request("api_user", request.query) as trace:
+        try:
+            # (cache check from Day 2)
+            ...
+            chunks, sources, _ = await _prepare_chunks_and_sources(
+                request, opensearch_client, embeddings_service, rag_tracer, trace
+            )
+            ...
+            with rag_tracer.trace_prompt_construction(trace, chunks) as prompt_span:
+                from src.services.ollama.prompts import RAGPromptBuilder
+
+                prompt_builder = RAGPromptBuilder()
+
+                try:
+                    prompt_data = prompt_builder.create_structured_prompt(request.query, chunks)
+                    final_prompt = prompt_data["prompt"]
+                except Exception:
+                    final_prompt = prompt_builder.create_rag_prompt(request.query, chunks)
+
+                rag_tracer.end_prompt(prompt_span, final_prompt)
+
+            with rag_tracer.trace_generation(trace, request.model, final_prompt) as gen_span:
+                rag_response = await ollama_client.generate_rag_answer(query=request.query, chunks=chunks, model=request.model)
+                answer = rag_response.get("answer", "Unable to generate answer")
+                rag_tracer.end_generation(gen_span, answer, request.model)
+            ...
+            rag_tracer.end_request(trace, answer, time.time() - start_time)</code></pre>
+  <p>
+    Each pipeline step sits inside its own <code>with</code>, producing spans <code>query_embedding</code>, <code>search_retrieval</code>,
+    <code>prompt_construction</code>, <code>llm_generation</code> under the root <code>rag_request</code>. Inside <code>_prepare_chunks_and_sources</code>, the embedding call is
+    wrapped in <code>rag_tracer.trace_embedding(trace, request.query)</code> and the search in <code>rag_tracer.trace_search(trace, request.query, request.top_k)</code>,
+    followed by <code>rag_tracer.end_search(search_span, chunks, arxiv_ids, search_results.get("total", 0))</code>.
+    The prompt built here exists only to be recorded in the trace; <code>generate_rag_answer</code> builds the same prompt again internally. <code>/stream</code> is traced the
+    same way. The trace is recorded as an ordinary (non-generation) span, so token counts don't show up in Langfuse, even though
+    <code>generate</code> computes <code>usage_metadata</code>.
+  </p>
+
+  <p class="file"><b>src/services/langfuse/factory.py</b></p>
+  <pre><code>@lru_cache(maxsize=1)
+def make_langfuse_tracer() -&gt; LangfuseTracer:
+    settings = get_settings()
+    return LangfuseTracer(settings)</code></pre>
+  <p>Plus <code>app.state.langfuse_tracer = make_langfuse_tracer()</code> in the lifespan, and <code>get_langfuse_tracer</code> / <code>LangfuseDep</code> in <code>dependencies.py</code>.</p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>uv add "langfuse&gt;=3.9,&lt;4"</code>. The reference is locked to 3.9.0; the <code>&lt;4</code> keeps you on the same major API.</li>
+    <li>Add <code>LangfuseSettings</code> and <code>langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)</code> to <code>Settings</code>.</li>
+    <li>Write <code>src/services/langfuse/client.py</code> with <code>LangfuseTracer</code>: <code>__init__</code>, <code>trace_rag_request</code>, <code>create_span</code>,
+      <code>update_span</code>, <code>end_span</code>, <code>flush</code>, <code>shutdown</code>. <b>This is a deliberate subset</b>; Module 7 adds the agent methods.</li>
+    <li>Write <code>src/services/langfuse/tracer.py</code> (<code>RAGTracer</code>, all methods: <code>trace_request</code>, <code>trace_embedding</code>, <code>trace_search</code>,
+      <code>end_search</code>, <code>trace_prompt_construction</code>, <code>end_prompt</code>, <code>trace_generation</code>, <code>end_generation</code>, <code>end_request</code>),
+      an empty <code>src/services/langfuse/__init__.py</code>, and the factory.</li>
+    <li>Wire the tracer into the lifespan and <code>dependencies.py</code>, and add the tracing lines to both endpoints. Your <code>src/routers/ask.py</code> should now match
+      <code>git show HEAD:src/routers/ask.py</code> line for line (apart from comments). Diff it.</li>
+    <li>Set the <code>LANGFUSE__*</code> variables (reuse option above) in your <code>api</code> service's environment.</li>
+  </ol>
+  <p>One more fixture in <code>tests/conftest.py</code>, and one more override in <code>ask_client</code>:</p>
+  <p class="file"><b>tests/conftest.py</b> (add)</p>
+  <pre><code>from src.config import LangfuseSettings
+from src.services.langfuse.client import LangfuseTracer
+
+
+@pytest.fixture
+def disabled_tracer():
+    return LangfuseTracer(Settings(langfuse=LangfuseSettings(enabled=False)))
+
+
+@pytest.fixture
+def live_tracer():
+    tracer = LangfuseTracer(Settings(langfuse=LangfuseSettings(enabled=False)))
+    tracer.client = MagicMock()  # stands in for a real Langfuse client
+    return tracer</code></pre>
+  <p class="file"><b>tests/api/conftest.py</b> (in <code>ask_client</code>)</p>
+  <pre><code>from src.dependencies import get_langfuse_tracer
+
+# ask_client now also takes disabled_tracer:
+@pytest.fixture
+def ask_client(fake_opensearch, fake_embeddings, fake_ollama, fake_cache, disabled_tracer):
+    ...
+    app.dependency_overrides[get_langfuse_tracer] = lambda: disabled_tracer
+    ...</code></pre>
+
+  <p class="file"><b>tests/unit/services/test_langfuse_tracer.py</b></p>
+  <pre><code>from unittest.mock import MagicMock
+
+from src.config import LangfuseSettings, Settings
+from src.services.langfuse.client import LangfuseTracer
+from src.services.langfuse.tracer import RAGTracer
+
+
+def test_missing_keys_disable_tracing():
+    tracer = LangfuseTracer(Settings(langfuse=LangfuseSettings(enabled=True, public_key="", secret_key="")))
+    assert tracer.client is None
+
+
+def test_disabled_tracer_is_a_silent_no_op(disabled_tracer):
+    rag_tracer = RAGTracer(disabled_tracer)
+    with rag_tracer.trace_request("api_user", "What is RAG?") as trace:
+        assert trace is None
+        with rag_tracer.trace_search(trace, "What is RAG?", top_k=3) as span:
+            assert span is None
+            rag_tracer.end_search(span, chunks=[], arxiv_ids=[], total_hits=0)
+        rag_tracer.end_request(trace, "answer", total_duration=1.0)
+
+
+def test_create_span_nests_under_the_trace(live_tracer):
+    trace = MagicMock()
+    span = live_tracer.create_span(trace=trace, name="search_retrieval", input_data={"top_k": 3})
+    assert span is trace.start_span.return_value
+    assert trace.start_span.call_args.kwargs["name"] == "search_retrieval"
+    assert trace.start_span.call_args.kwargs["input"] == {"top_k": 3}
+
+
+def test_create_span_without_a_trace_uses_the_client(live_tracer):
+    live_tracer.create_span(trace=None, name="orphan")
+    assert live_tracer.client.start_span.call_args.kwargs["name"] == "orphan"
+
+
+def test_trace_request_opens_a_root_span_and_flushes(live_tracer):
+    root = MagicMock()
+    live_tracer.client.start_as_current_span.return_value.__enter__.return_value = root
+    with RAGTracer(live_tracer).trace_request("api_user", "What is RAG?") as trace:
+        assert trace is root
+    live_tracer.client.start_as_current_span.assert_called_once_with(name="rag_request")
+    root.update.assert_called_once_with(input={"query": "What is RAG?"}, metadata={"simplified_tracing": True})
+    live_tracer.client.flush.assert_called_once()
+
+
+def test_trace_search_records_results_and_ends_the_span(live_tracer):
+    rag_tracer = RAGTracer(live_tracer)
+    with rag_tracer.trace_search(MagicMock(), "What is RAG?", top_k=3) as span:
+        rag_tracer.end_search(span, chunks=[{}, {}], arxiv_ids=["2609.30227", "2609.30227"], total_hits=2)
+    assert span.update.call_args.kwargs["output"]["unique_papers"] == 1
+    assert span.end.called</code></pre>
+  <p>
+    <code>live_tracer</code> replaces the real Langfuse client with a <code>MagicMock</code>, so you can check which Langfuse calls your code makes without any
+    server. The <code>__enter__</code> line configures what the mock returns when used in a <code>with</code> statement.
+  </p>
+  <p class="file"><b>tests/api/routers/test_ask.py</b> (add)</p>
+  <pre><code>from src.dependencies import get_langfuse_tracer
+
+
+def test_ask_records_one_span_per_step(ask_client, live_tracer):
+    root = live_tracer.client.start_as_current_span.return_value.__enter__.return_value
+    ask_client.app.dependency_overrides[get_langfuse_tracer] = lambda: live_tracer
+
+    assert ask_client.post("/api/v1/ask", json={"query": "What is RAG?"}).status_code == 200
+    names = [call.kwargs["name"] for call in root.start_span.call_args_list]
+    assert names == ["query_embedding", "search_retrieval", "prompt_construction", "llm_generation"]</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/test_langfuse_tracer.py tests/api/routers/test_ask.py -q
+uv run pytest -q
+docker compose up -d --build api
+docker compose logs api | Select-String "Langfuse"</code></pre>
+  <p>
+    <code>21 passed</code> for the two files (6 tracer tests + 15 endpoint tests), full suite green. The log shows
+    <code>Langfuse v3 tracing initialized (host: http://host.docker.internal:3001)</code>; if it says "disabled or missing credentials", check the
+    double underscores. Ask a <b>new</b> question on <code>/ask</code> (a cached one returns before any span is created), wait for the answer, then open
+    <a href="http://localhost:3001">localhost:3001</a> &rarr; Tracing. Open your <code>rag_request</code> trace and read the timeline: which span took almost all the
+    time? What exactly was in the prompt? Which arXiv IDs did <code>search_retrieval</code> return? Commit.
+  </p>
+  <div class="callout warn"><b>What I checked and what I couldn't</b>
+    I checked the tests on this page against a copy of the reference code (see the report). I didn't run your stack against Langfuse; the reference API
+    sends traces to the same Langfuse successfully on this machine (its logs show <code>agentic_rag_request</code> spans being flushed).</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m6-day3" /><span>Day 3: tracer tests pass, a <code>rag_request</code> trace with four child spans is visible in Langfuse, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li><b>Reproduce the original bug.</b> Temporarily delete <code>trace_rag_request</code> from your client and run the tests. Both
+      <code>test_disabled_tracer_is_a_silent_no_op</code> and every <code>/ask</code> test fail with <code>AttributeError</code>, even though tracing is disabled.
+      A tracing feature that can break requests when it's switched off is the worst kind of optional. Put it back.</li>
+    <li>Set <code>LANGFUSE__HOST</code> to a wrong port and rebuild. <code>/ask</code> still answers; the logs fill with export errors from the background sender. Tracing
+      fails without taking the request down. Fix the port.</li>
+    <li><b>Debugging exercise: a real warning from the reference logs.</b> The reference API logged this for every agentic request today:
+      <pre><code>WARNING - Failed to create span for guardrail validation: LangfuseTracer.create_span() got an unexpected keyword argument 'metadata'
+WARNING - Failed to create span for retrieve node: LangfuseTracer.create_span() got an unexpected keyword argument 'metadata'
+WARNING - Failed to create span for generate_answer node: LangfuseTracer.create_span() got an unexpected keyword argument 'metadata'</code></pre>
+      Yet Langfuse still showed full agent traces. Work out why before opening the hint. Then reproduce it with a test and fix it.</li>
+  </ol>
+  <details class="hint"><summary>Hint: where to look</summary>
+    <p>Search the reference for <code>create_span(</code>. The agent nodes (Module 7) call it with <code>metadata={...}</code>; the working-tree
+      <code>create_span</code> has no such parameter, so Python raises <code>TypeError</code>, which each node catches and logs as a warning, then carries on without its
+      manual span. The traces you see come from a <em>different</em> mechanism: LangChain's <code>CallbackHandler</code> records every LLM call and graph step automatically.
+      So "manual node spans fail; automatic tracing still works". (In the original code, <code>create_span</code> didn't exist at all, so the same nodes logged an
+      <code>AttributeError</code> instead.)</p></details>
+  <details class="hint"><summary>Hint: the test and the fix</summary>
+    <p>Test: call <code>live_tracer.create_span(trace=trace, name="guardrail_validation", input_data={"query": "q"}, metadata={"node": "guardrail"})</code> and assert
+      <code>trace.start_span.call_args.kwargs["metadata"] == {"node": "guardrail"}</code>. It fails with the <code>TypeError</code>. Fix: add
+      <code>metadata: Optional[Dict[str, Any]] = None</code> to <code>create_span</code> and pass <code>metadata=metadata</code> to both <code>start_span</code> calls (Langfuse v3's
+      <code>start_span</code> accepts it). Your earlier tests only check <code>name</code> and <code>input</code>, so they keep passing. Keep this fix: it's a real improvement
+      over the reference, and your Module 7 nodes will need it.</p></details>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 6" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. How does your cache decide two requests are the same?</summary>
+    <div class="answer">It builds a dictionary of every request field that affects the answer (query, model, top_k, use_hybrid, sorted categories), serialises it
+      with <code>json.dumps(sort_keys=True)</code>, hashes it with SHA-256, and uses <code>exact_cache:</code> plus the first 16 hex characters as the Redis key. Same
+      fields, same key.</div></details>
+
+  <details class="drill"><summary>2. What speedup did you measure, and why is it so large?</summary>
+    <div class="answer">(Give your own numbers.) A few minutes versus well under a second. A miss runs an embedding call, a search, and minutes of CPU inference; a hit
+      is one Redis GET of a small JSON string plus Pydantic parsing.</div></details>
+
+  <details class="drill"><summary>3. Exact-match versus semantic caching: trade-offs?</summary>
+    <div class="answer">Exact: simple, never returns an answer to a different question, but misses on any rewording, even a trailing space. Semantic: embed the question
+      and reuse an answer when similarity is above a threshold; many more hits, but it costs an embedding per request and risks answering "RAG in 2023" with the
+      "RAG in 2020" answer. Threshold tuning and evaluation are the hard part.</div></details>
+
+  <details class="drill"><summary>4. Tell me about the stale cache incident.</summary>
+    <div class="answer">An answer with fabricated citations was cached before we added citation checks. After deploying the fix, the same question still returned the bad
+      answer, because the key doesn't include the prompt or code version and the TTL is 6 hours. We flushed Redis. Prevention: a version component in the key,
+      bumped on prompt or logic changes, or flushing <code>exact_cache:*</code> on deploy. Lesson: caches store the behaviour of old code.</div></details>
+
+  <details class="drill"><summary>5. What happens if Redis goes down?</summary>
+    <div class="answer">During requests: the client catches the error and treats it as a miss, and store failures return False, so answers are just slower. At startup:
+      <code>make_cache_client</code> pings and re-raises, and the lifespan doesn't catch it, so the API won't start. I'd catch it in the lifespan and leave
+      <code>cache_client</code> unset; <code>get_cache_client</code> already returns None when it's missing.</div></details>
+
+  <details class="drill"><summary>6. What is and isn't cached, and why?</summary>
+    <div class="answer">Successful answers from <code>/ask</code> and completed <code>/stream</code> answers (non-empty). Not cached: errors (they raise before the store step) and
+      "no relevant information" responses (they return early), because both might be different a minute or a day later.</div></details>
+
+  <details class="drill"><summary>7. What do TTL and <code>allkeys-lru</code> each protect against?</summary>
+    <div class="answer">TTL bounds how long any entry, including a wrong one, can live (6 hours). <code>maxmemory 256mb</code> with <code>allkeys-lru</code> bounds memory: when full,
+      Redis evicts the least recently used keys, so popular answers stay and the cache can't take down the host.</div></details>
+
+  <details class="drill"><summary>8. Is there a performance issue in the cache client code?</summary>
+    <div class="answer">It uses the synchronous <code>redis</code> client inside <code>async def</code> methods, so each GET/SET blocks the event loop. Locally that's sub-millisecond, but
+      with a remote Redis under load it would stall every concurrent request. Use <code>redis.asyncio</code> and <code>await</code> the calls.</div></details>
+
+  <details class="drill"><summary>9. What's a trace, a span, and a generation? Why do LLM apps need tracing more than most?</summary>
+    <div class="answer">A trace is one request; spans are its timed steps with inputs and outputs, possibly nested; a generation is a span for an LLM call with model, prompt,
+      completion and tokens. LLM output is non-deterministic and failures are "plausible but wrong" rather than exceptions, so you need the exact prompt,
+      retrieved passages and timings of the specific bad request to debug it.</div></details>
+
+  <details class="drill"><summary>10. How do you make sure tracing can never break a request?</summary>
+    <div class="answer">The tracer holds <code>client = None</code> when disabled or misconfigured, and every method returns early or yields None in that case; every call to Langfuse is
+      wrapped in try/except with logging; events are sent in the background by the SDK. The original code violated this: the tracer called a method that didn't
+      exist, so every <code>/ask</code> failed even with tracing off, and a test accepting 500 hid it.</div></details>
+
+  <details class="drill"><summary>11. Explain the warning <code>create_span() got an unexpected keyword argument 'metadata'</code>, and why traces still appeared.</summary>
+    <div class="answer">The agent nodes call <code>create_span(..., metadata=...)</code> but the method didn't accept <code>metadata</code>, so each call raised TypeError, which the node caught
+      and logged, and the node's manual span was lost. The traces came from LangChain's <code>CallbackHandler</code>, which traces LLM calls and graph steps automatically.
+      Fix: add a <code>metadata</code> parameter and forward it. A signature mismatch between caller and callee is exactly what a unit test on the tracer catches.</div></details>
+
+  <details class="drill"><summary>12. Why is Langfuse v3 six services? Would you self-host it?</summary>
+    <div class="answer">Web UI/API and a worker, with Postgres for users and keys, ClickHouse for fast analytics over many traces, Redis as a queue, and S3-compatible storage for
+      raw events. That's built for scale. For a small team I'd use the hosted version or share one instance; self-host when data can't leave the network. We also hit
+      an image-pull 401 on MinIO and had to substitute an S3-compatible replacement.</div></details>
+
+  <details class="drill"><summary>13. What did you learn from reading a real trace?</summary>
+    <div class="answer">(Answer from your own trace.) Typically: <code>llm_generation</code> is almost all of the time, embedding and search take well under a second, and the prompt
+      is several thousand characters, so the optimisation targets are the model and prompt size, not the search. And you can check any cited arXiv ID against
+      <code>search_retrieval</code>'s output.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m6-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 7</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m6-tests" /><span><code>uv run pytest -q</code> is green, including this module's cache, endpoint and tracer tests</span></li>
+    <li><input type="checkbox" data-id="m6-diff" /><span>Your <code>src/routers/ask.py</code> matches <code>git show HEAD:src/routers/ask.py</code></span></li>
+    <li><input type="checkbox" data-id="m6-speed" /><span>You measured and wrote down cold versus cached <code>/ask</code> times</span></li>
+    <li><input type="checkbox" data-id="m6-trace" /><span>You opened a trace in Langfuse and can say where the time went</span></li>
+    <li><input type="checkbox" data-id="m6-break" /><span>You can explain the stale cache and the <code>metadata</code> warning without notes</span></li>
+  </ul>
+  <p>
+    Then send me "Module 6 passed". Module 7 replaces the fixed pipeline with an agent that decides for itself whether to
+    search, grade, rewrite the question, or refuse.
+  </p>
+  <p><a href="module-07-agentic-rag.html">Next: Module 7 &mdash; Agentic RAG &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 7 — Agentic RAG</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 7 &middot; 5&ndash;6 days</p>
+    <h1><span class="grad">Agentic RAG</span>: a pipeline that can decide, retry, and refuse</h1>
+    <p class="lede">
+      Your <code>/ask</code> endpoint always does the same thing: search, then answer. In this module you build the course's
+      agent with LangGraph. It checks whether a question is in scope, decides when to search, grades what it found, rewrites
+      the query if the results are poor, and only then answers. You'll build the ORIGINAL course version, gaps included,
+      because Module 8 is where you fix them.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: agents &amp; LangGraph (toy graph)</span>
+      <span class="pill">Day 2: state, context, prompts, guardrail</span>
+      <span class="pill">Day 3: tool, retrieve, rewrite</span>
+      <span class="pill">Day 4: grade, generate, wire the graph</span>
+      <span class="pill">Day 5: endpoint, mermaid, run it</span>
+      <span class="pill">Day 6: Telegram bot &amp; known gaps</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 7</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: Agents versus pipelines, and a toy LangGraph graph</a></li>
+      <li><a href="#day2">Day 2: State, context, models, config, prompts, and the guardrail</a></li>
+      <li><a href="#day3">Day 3: The retriever tool, the retrieve node, and query rewriting</a></li>
+      <li><a href="#day4">Day 4: Grading, generating, and wiring the graph</a></li>
+      <li><a href="#day5">Day 5: The endpoint, the dependency, and seeing the graph</a></li>
+      <li><a href="#day6">Day 6: The Telegram bot, and the gaps Module 8 fixes</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 8</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>Read the ORIGINAL files, not the working tree</b>
+    The reference repo's working tree already contains Module 8's hallucination hardening and an unrelated "on-demand
+    ingestion" experiment. For every agent file this module mentions, read the course version with
+    <code>git -C C:\Users\mrigsing\Downloads\production-agentic-rag-course show HEAD:src/services/agents/nodes/grade_documents_node.py</code>
+    (change the path as needed). If you open the file in Cursor instead, you'll see code this module deliberately doesn't teach yet.
+    Pipe long files into a pager with <code>| more</code>.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>Agents versus pipelines, and a toy LangGraph graph</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Your Module 5 RAG endpoint is a <b>pipeline</b>: a fixed sequence of steps that runs the same way for every question.
+    Ask it "what's the weather?" and it still searches arXiv papers and asks the LLM to answer from them. Retrieve bad chunks,
+    and it answers from bad chunks anyway. An <b>agent</b> lets the program choose its next step based on what just happened.
+    Interviewers ask about this constantly, and the honest answer ("it's a graph of steps with LLM-made decisions at the
+    branches") is much more convincing than buzzwords.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Agent, in this project's sense</h4>
+  <p>
+    "Agent" is used loosely in industry. Here it means: an LLM-driven program whose control flow has <b>branches</b> (it can
+    refuse, or answer) and <b>loops</b> (it can retry retrieval with a better query), with a hard limit on how many times it loops.
+    It isn't a free-roaming assistant: every possible path is drawn in advance. That's deliberate. A drawn graph is testable
+    and debuggable; "let the LLM figure it out" isn't.
+  </p>
+
+  <h4>LangGraph vocabulary</h4>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>State</td><td>A dictionary shared by every step. Defined as a <code>TypedDict</code>: a dict whose keys and value types are declared.</td></tr>
+    <tr><td>Node</td><td>A function that receives the state and returns a dict of <b>updates</b> (only the keys it changes).</td></tr>
+    <tr><td>Edge</td><td>"After node A, run node B." Always taken.</td></tr>
+    <tr><td>Conditional edge</td><td>A function that looks at the state and returns the name of the next node.</td></tr>
+    <tr><td><code>START</code>, <code>END</code></td><td>Special node names for where the graph begins and stops.</td></tr>
+    <tr><td>Reducer</td><td>A rule for merging a node's update into the state. Default: replace. <code>add_messages</code>: append.</td></tr>
+    <tr><td><code>compile()</code></td><td>Checks the graph (no dangling edges) and returns a runnable object with <code>invoke</code> / <code>ainvoke</code>.</td></tr>
+    <tr><td>Runtime context</td><td>Read-only objects for this run (clients, settings), declared with <code>context_schema</code>. Not part of the state.</td></tr>
+  </table>
+
+  <h4>Reducers and <code>add_messages</code></h4>
+  <p>
+    If two nodes both return <code>{"messages": [...]}</code>, should the second replace the first, or add to it? For a chat
+    history you want "add". You declare that on the state key: <code>messages: Annotated[list, add_messages]</code>.
+    <code>Annotated[type, extra]</code> attaches extra information to a type hint; LangGraph reads the extra as the reducer.
+    Keys without a reducer are simply overwritten.
+  </p>
+
+  <h4>Messages</h4>
+  <p>
+    LangChain represents a conversation as a list of message objects: <code>HumanMessage</code> (the user),
+    <code>AIMessage</code> (the model; can carry <code>tool_calls</code>), <code>ToolMessage</code> (a tool's result), and
+    <code>SystemMessage</code> (instructions). The agent's whole conversation lives in <code>state["messages"]</code>.
+  </p>
+
+  <h4>Runtime context versus state</h4>
+  <p>
+    State changes as the graph runs and is what nodes communicate through. Context is fixed for a run: the Ollama client, the
+    OpenSearch client, the model name, <code>top_k</code>. In LangGraph 1.0 you declare it with
+    <code>StateGraph(State, context_schema=Context)</code>, pass it with <code>graph.ainvoke(inputs, context=Context(...))</code>,
+    and a node reads it through a second parameter: <code>async def node(state, runtime: Runtime[Context])</code>, then
+    <code>runtime.context.ollama_client</code>. Keeping live clients out of the state keeps the state small and printable.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p>
+    Before building anything, look at the finished shape. The course graph is assembled in
+    <code>src/services/agents/agentic_rag.py</code> (HEAD version), in a method that builds the <code>StateGraph</code>. Run:
+  </p>
+  <pre><code>cd C:\Users\mrigsing\Downloads\production-agentic-rag-course
+git show HEAD:src/services/agents/agentic_rag.py | more</code></pre>
+  <p>Find the lines that call <code>add_node</code>, <code>add_edge</code>, and <code>add_conditional_edges</code>, and draw the graph on paper. You should end up with this:</p>
+  <div class="flow">
+    <span class="node"><b>START</b></span><span class="arrow">&rarr;</span>
+    <span class="node">guardrail</span><span class="arrow">&rarr;</span>
+    <span class="node">out_of_scope &rarr; END</span><span class="arrow">or</span>
+    <span class="node">retrieve</span><span class="arrow">&rarr;</span>
+    <span class="node">tool_retrieve</span><span class="arrow">&rarr;</span>
+    <span class="node">grade_documents</span><span class="arrow">&rarr;</span>
+    <span class="node">generate_answer &rarr; END</span><span class="arrow">or</span>
+    <span class="node">rewrite_query &rarr; retrieve</span>
+  </div>
+  <p>
+    Every branch in that picture is one conditional edge. The loop <code>rewrite_query &rarr; retrieve</code> is bounded by
+    <code>max_retrieval_attempts</code> in the context. Today you build a tiny graph with the same ingredients so that
+    tomorrow's code reads as familiar.
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: add the dependencies</h4>
+  <pre><code>cd C:\Users\mrigsing\Downloads\my-paper-curator
+uv add langgraph==1.0.2 langgraph-checkpoint==3.0.0 langgraph-prebuilt==1.0.2 langchain-core==1.0.2 langchain==1.0.3 langchain-ollama==1.0.1
+uv run python -c "import langgraph, langchain_core; print('ok')"</code></pre>
+  <p>
+    These are the exact versions in the reference project's <code>uv.lock</code>. Pin them: with looser ranges like
+    <code>langgraph&gt;=1.0,&lt;1.1</code>, uv picked a newer <code>langgraph-checkpoint</code> that crashes with
+    langchain-core 1.0.2 (an error mentioning <code>Reviver</code> and <code>allowed_objects</code>). Likewise, an unpinned
+    <code>langgraph-prebuilt</code> resolves to a newer release whose <code>ToolNode</code> import fails with langgraph 1.0.2
+    (<code>cannot import name 'ExecutionInfo'</code>). LangGraph also changed its
+    context API between 0.x releases, and this module's code is written for 1.0. If <code>uv add</code> fails with a
+    certificate error, run <code>$env:UV_SYSTEM_CERTS=1</code> and retry.
+  </p>
+
+  <h4>Step B: write <code>playground/toy_graph.py</code></h4>
+  <p>A "triage" graph: questions mentioning papers get answered; anything else gets refused. No LLM, so it runs instantly.</p>
+  <ol>
+    <li><code>ToyState</code>, a <code>TypedDict</code>: <code>messages: Annotated[list, add_messages]</code>, <code>route: str</code>, <code>attempts: int</code>.</li>
+    <li><code>ToyContext</code>, a dataclass: <code>keyword: str = "paper"</code>, <code>max_attempts: int = 2</code>.</li>
+    <li><code>classify(state, runtime: Runtime[ToyContext]) -&gt; dict</code>: reads the last message's <code>content</code>; returns
+      <code>{"route": "answer"}</code> if <code>runtime.context.keyword</code> appears in it (case-insensitive), otherwise <code>{"route": "refuse"}</code>.</li>
+    <li><code>answer(state) -&gt; dict</code>: returns <code>{"messages": [AIMessage(content="Here is what the papers say.")], "attempts": state.get("attempts", 0) + 1}</code>.</li>
+    <li><code>refuse(state) -&gt; dict</code>: returns <code>{"messages": [AIMessage(content="I only answer questions about papers.")]}</code>.</li>
+    <li><code>pick_route(state) -&gt; str</code>: returns <code>state["route"]</code>.</li>
+    <li><code>build_toy_graph()</code>: <code>StateGraph(ToyState, context_schema=ToyContext)</code>, nodes <code>classify</code>, <code>answer</code>,
+      <code>refuse</code>; <code>START &rarr; classify</code>; a conditional edge from <code>classify</code> using <code>pick_route</code>
+      with the mapping <code>{"answer": "answer", "refuse": "refuse"}</code>; both <code>answer</code> and <code>refuse</code> go to <code>END</code>. Return <code>graph.compile()</code>.</li>
+  </ol>
+  <details class="hint"><summary>Hint: imports</summary>
+    <p><code>from langgraph.graph import StateGraph, START, END</code>, <code>from langgraph.graph.message import add_messages</code>,
+      <code>from langgraph.runtime import Runtime</code>, <code>from langchain_core.messages import AIMessage, HumanMessage</code>.</p></details>
+  <details class="hint"><summary>Hint: a node that doesn't need the context</summary>
+    <p>Just leave out the <code>runtime</code> parameter. LangGraph inspects the function's signature and only passes it when asked.</p></details>
+
+  <h4>Step C: type the tests</h4>
+  <p class="file"><b>tests/playground/test_toy_graph.py</b></p>
+  <pre><code>from langchain_core.messages import AIMessage, HumanMessage
+
+from playground.toy_graph import ToyContext, build_toy_graph
+
+
+async def test_paper_question_is_answered():
+    graph = build_toy_graph()
+    result = await graph.ainvoke({"messages": [HumanMessage(content="Which PAPER covers RAG?")]}, context=ToyContext())
+    assert result["route"] == "answer"
+    assert result["attempts"] == 1
+    assert isinstance(result["messages"][-1], AIMessage)
+    assert "papers say" in result["messages"][-1].content
+
+
+async def test_other_question_is_refused():
+    graph = build_toy_graph()
+    result = await graph.ainvoke({"messages": [HumanMessage(content="What's the weather?")]}, context=ToyContext())
+    assert result["route"] == "refuse"
+    assert "only answer" in result["messages"][-1].content
+
+
+async def test_add_messages_appends_instead_of_replacing():
+    graph = build_toy_graph()
+    result = await graph.ainvoke({"messages": [HumanMessage(content="a paper please")]}, context=ToyContext())
+    assert len(result["messages"]) == 2
+    assert isinstance(result["messages"][0], HumanMessage)
+
+
+async def test_context_changes_behaviour():
+    graph = build_toy_graph()
+    result = await graph.ainvoke({"messages": [HumanMessage(content="tell me about llamas")]}, context=ToyContext(keyword="llama"))
+    assert result["route"] == "answer"
+
+
+def test_graph_has_expected_nodes():
+    nodes = set(build_toy_graph().get_graph().nodes)
+    assert {"classify", "answer", "refuse"} &lt;= nodes</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/playground/test_toy_graph.py -q</code></pre>
+  <p>You should see <code>5 passed</code>. Then:</p>
+  <pre><code>git add -A
+git commit -m "Module 7 Day 1: LangGraph toy graph"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove <code>add_messages</code> from <code>ToyState</code> (keep <code>messages: list</code>). The append test fails: the answer
+      <b>replaced</b> the question. That's what "default reducer = overwrite" means.</li>
+    <li>In <code>build_toy_graph</code>, delete the edge from <code>refuse</code> to <code>END</code>. Depending on the version you get
+      an error at <code>compile()</code> or the refused run simply stops at <code>refuse</code>; read what happens. Put it back.</li>
+    <li>Make <code>pick_route</code> return <code>"maybe"</code>. The run fails with an error naming the unknown branch. Conditional
+      edges must return a key from the mapping you declared.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>State, context, models, config, prompts, and the guardrail</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Nodes only talk to each other through the state, read their clients from the context, and parse LLM replies with the
+    Pydantic models. Get these four files right and every node becomes a short function. The guardrail is the first
+    decision the agent makes: is this question even about research papers?
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Structured output</h4>
+  <p>
+    Asking an LLM "reply with JSON" and parsing its text is fragile. LangChain's <code>llm.with_structured_output(Model)</code>
+    turns a Pydantic model into a JSON schema, asks the model to answer in that shape, and returns a validated instance of
+    <code>Model</code>. If the reply doesn't match, you get an exception, which the nodes catch.
+  </p>
+  <h4>Getting a LangChain model from Ollama</h4>
+  <p>
+    <code>OllamaClient</code> from Module 5 talks to Ollama with raw <code>httpx</code>. LangChain nodes need a LangChain chat model
+    object instead. Every HEAD node calls <code>runtime.context.ollama_client.get_langchain_model(model=..., temperature=...)</code>,
+    and then <code>.with_structured_output(...)</code> on the result.
+  </p>
+  <div class="callout story"><b>The method the original code calls doesn't exist in the original code</b>
+    Run <code>git show HEAD:src/services/ollama/client.py | Select-String "def "</code>. HEAD's <code>OllamaClient</code> has
+    <code>health_check</code>, <code>list_models</code>, <code>generate</code>, <code>generate_stream</code>,
+    <code>generate_rag_answer</code>, and <code>generate_rag_answer_stream</code>, but <b>no</b> <code>get_langchain_model</code>. So in the
+    original course code, every LLM call in the agent raised <code>AttributeError</code>, and each node's <code>except</code> quietly
+    switched to its fallback. The working tree adds the method
+    (<code>def get_langchain_model(self, model: Optional[str] = None, temperature: float = 0.0, **kwargs)</code>, returning a cached
+    <code>ChatOllama</code>). You'll write a simpler version of it. Lesson: a broad <code>except</code> can hide a bug that breaks
+    every request.</div>
+  <h4>Guardrail</h4>
+  <p>
+    A <b>guardrail</b> is a check that stops unwanted input or output. Here the LLM scores how related the question is to
+    research papers (0&ndash;100). Below <code>guardrail_threshold</code> (60 in <code>Context</code>), the agent refuses politely
+    instead of searching. It's cheap insurance: one short LLM call instead of a full retrieve-grade-generate run.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/context.py</b> &middot; the runtime context (HEAD)</p>
+  <pre><code>@dataclass
+class Context:
+    ollama_client: OllamaClient
+    opensearch_client: OpenSearchClient
+    embeddings_client: JinaEmbeddingsClient
+    langfuse_tracer: Optional[LangfuseTracer]
+    trace: Optional["LangfuseSpan"] = None
+    langfuse_enabled: bool = False
+    model_name: str = "llama3.2:1b"
+    temperature: float = 0.0
+    top_k: int = 3
+    max_retrieval_attempts: int = 2
+    guardrail_threshold: int = 60</code></pre>
+  <p>
+    You met this dataclass in Module 0. Now it has a job: it's the <code>context_schema</code> of the agent graph. Every node
+    reads <code>runtime.context.model_name</code>, <code>runtime.context.top_k</code>, and so on. Note that nothing here comes from
+    the request's <code>model</code> field; remember that for Day 6.
+  </p>
+
+  <p class="file"><b>src/services/agents/state.py</b> &middot; the shared state (HEAD)</p>
+  <p>
+    Open it with <code>git show HEAD:src/services/agents/state.py</code>. It's a <code>TypedDict</code> named <code>AgentState</code>
+    whose <code>messages</code> key uses <code>add_messages</code>, exactly like your toy. The other keys hold what nodes pass along:
+    the original and rewritten query, the retrieval attempt counter, the guardrail result, the routing decision, sources and
+    grading results. Read each key and write down which node you think writes it; you'll check tomorrow.
+  </p>
+
+  <p class="file"><b>src/services/agents/models.py</b> &middot; contracts with the LLM</p>
+  <pre><code>class GradeDocuments(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="Document relevance: 'yes' or 'no'")
+    reasoning: str = Field(default="", description="Explanation for the decision")</code></pre>
+  <p>
+    The same file defines <code>GuardrailScoring</code> (<code>score: int</code> from 0 to 100, and <code>reason: str</code>),
+    <code>SourceItem</code>, <code>ToolArtefact</code>, <code>RoutingDecision</code>, <code>GradingResult</code>, and <code>ReasoningStep</code>.
+    The query-rewrite model <code>QueryRewriteOutput</code> is <b>not</b> here; it lives in <code>nodes/rewrite_query_node.py</code>.
+  </p>
+
+  <p class="file"><b>src/services/agents/config.py</b> and <b>prompts.py</b></p>
+  <p>
+    <code>config.py</code> holds <code>GraphConfig</code>, a Pydantic model with the agent's defaults (<code>max_retrieval_attempts=2</code>,
+    <code>guardrail_threshold=60</code>, <code>model="llama3.2:1b"</code>, <code>temperature</code>, <code>top_k</code>, <code>use_hybrid</code>,
+    and <code>settings</code> from <code>get_settings</code>). <code>prompts.py</code> holds the prompt templates as module-level
+    strings with <code>{placeholders}</code>: one each for the guardrail, grading, rewriting, and generating. Read the guardrail
+    prompt and notice it asks for a score, not a yes/no; a number lets you tune the threshold without editing the prompt.
+  </p>
+
+  <p class="file"><b>src/services/agents/nodes/guardrail_node.py</b> &middot; two functions</p>
+  <p>Open it and read it with this line-by-line guide to what each part does:</p>
+  <table class="walk">
+    <tr><td><pre><code>def continue_after_guardrail(state: AgentState, runtime: Runtime[Context]) -&gt; Literal["continue", "out_of_scope"]:</code></pre></td>
+      <td>The <b>conditional edge</b> function. Returns a branch name, never a state update.</td></tr>
+    <tr><td><pre><code>    score = guardrail_result.score
+    threshold = runtime.context.guardrail_threshold
+    ...
+    return "continue" if score &gt;= threshold else "out_of_scope"</code></pre></td>
+      <td>Compares the LLM's score with the threshold from the context. Exactly 60 continues.</td></tr>
+    <tr><td><pre><code>async def ainvoke_guardrail_step(
+    state: AgentState,
+    runtime: Runtime[Context],
+) -&gt; Dict[str, GuardrailScoring]:
+    ...
+    query = get_latest_query(state["messages"])</code></pre></td>
+      <td>The <b>node</b>. <code>get_latest_query</code> (in <code>nodes/utils.py</code>) walks the messages backwards and returns the
+        first <code>HumanMessage</code>'s content.</td></tr>
+    <tr><td><pre><code>        llm = runtime.context.ollama_client.get_langchain_model(
+            model=runtime.context.model_name,
+            temperature=0.0,
+        )
+        structured_llm = llm.with_structured_output(GuardrailScoring)
+        response = await structured_llm.ainvoke(guardrail_prompt)</code></pre></td>
+      <td>The pattern every LLM-calling node repeats: get a chat model for the context's model name and temperature, wrap it
+        for structured output, await it with the filled-in prompt.</td></tr>
+    <tr><td><pre><code>except Exception as e:
+    response = GuardrailScoring(
+        score=50,
+        reason=f"LLM validation failed, using conservative default: {str(e)}"
+    )</code></pre></td>
+      <td>If the LLM call or parsing fails, the node doesn't crash the request. It records a score of 50, which is below the
+        threshold of 60, so the question goes to <code>out_of_scope</code>. But look at <code>continue_after_guardrail</code>: if there is
+        <b>no</b> guardrail result at all, it logs "defaulting to continue" and lets the question through. Module 8 changes that.</td></tr>
+    <tr><td><pre><code>return {"guardrail_result": response}</code></pre></td>
+      <td>A node returns only the keys it changes.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/nodes/out_of_scope_node.py</b></p>
+  <p>
+    The simplest node: no LLM call. It returns <code>{"messages": [AIMessage(content=...)]}</code> with a fixed explanation that
+    the assistant only handles research-paper questions. The graph then goes to <code>END</code>.
+  </p>
+
+  <h3>4. Build</h3>
+  <p>
+    Create <code>src/services/agents/</code> with an empty <code>__init__.py</code>, a <code>nodes/</code> subpackage with its own
+    <code>__init__.py</code>, and these files. Mirror the HEAD names exactly, because Module 8 edits them.
+  </p>
+  <ol>
+    <li><code>src/services/ollama/client.py</code>: add <code>get_langchain_model(self, model: Optional[str] = None, temperature: float = 0.0)</code>
+      returning <code>ChatOllama(base_url=self.base_url, model=model or "llama3.2:1b", temperature=temperature)</code>
+      (import <code>ChatOllama</code> from <code>langchain_ollama</code>). This is a simplified, uncached version of the working-tree method.</li>
+    <li><code>context.py</code>: the <code>Context</code> dataclass above.</li>
+    <li><code>state.py</code>: <code>AgentState</code>, copying the HEAD keys.</li>
+    <li><code>models.py</code>: the HEAD models listed above.</li>
+    <li><code>config.py</code> (<code>GraphConfig</code>) and <code>prompts.py</code>: copy by typing, not pasting; you'll remember the prompts better.</li>
+    <li><code>nodes/utils.py</code>: at least <code>get_latest_query</code> and <code>get_latest_context</code> (the latest <code>ToolMessage</code>'s content, or <code>""</code>).</li>
+    <li><code>nodes/guardrail_node.py</code>: <code>continue_after_guardrail</code> and <code>ainvoke_guardrail_step</code>.</li>
+    <li><code>nodes/out_of_scope_node.py</code>: <code>ainvoke_out_of_scope_step</code>.</li>
+  </ol>
+  <details class="hint"><summary>Hint: Langfuse spans in the nodes</summary>
+    <p>HEAD nodes create Langfuse spans only when <code>runtime.context.langfuse_enabled and runtime.context.trace</code>. You can leave
+      the span code out for now; the tests run with tracing disabled.</p></details>
+
+  <h4>Tests with a mocked LLM</h4>
+  <p>
+    You can't wait six minutes for Ollama in a unit test, and a real model gives different answers each run. So you replace
+    the LLM with a <code>MagicMock</code>. <code>MagicMock</code> records calls and returns whatever you configure;
+    <code>AsyncMock</code> does the same for things you <code>await</code>. The fixture below makes
+    <code>ollama_client.get_langchain_model(...)</code> return a fake LLM whose
+    <code>with_structured_output(...).ainvoke(...)</code> returns what each test chooses.
+  </p>
+  <p class="file"><b>tests/unit/services/agents/conftest.py</b></p>
+  <pre><code>from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from src.services.agents.context import Context
+
+
+@pytest.fixture
+def mock_llm():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock()
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock()
+    llm.with_structured_output.return_value = structured
+    return llm
+
+
+@pytest.fixture
+def context(mock_llm):
+    ollama_client = MagicMock()
+    ollama_client.get_langchain_model.return_value = mock_llm
+    return Context(
+        ollama_client=ollama_client,
+        opensearch_client=MagicMock(),
+        embeddings_client=MagicMock(),
+        langfuse_tracer=None,
+    )
+
+
+@pytest.fixture
+def runtime(context):
+    fake_runtime = MagicMock()
+    fake_runtime.context = context
+    return fake_runtime
+
+
+@pytest.fixture
+def llm_returns(mock_llm):
+    """Set what the next structured-output call returns."""
+    def _set(value):
+        mock_llm.with_structured_output.return_value.ainvoke.return_value = value
+    return _set</code></pre>
+
+  <p class="file"><b>tests/unit/services/agents/test_guardrail_nodes.py</b></p>
+  <pre><code>from langchain_core.messages import AIMessage, HumanMessage
+
+from src.services.agents.models import GuardrailScoring
+from src.services.agents.nodes.guardrail_node import ainvoke_guardrail_step, continue_after_guardrail
+from src.services.agents.nodes.out_of_scope_node import ainvoke_out_of_scope_step
+
+
+async def test_guardrail_stores_llm_score(runtime, llm_returns):
+    llm_returns(GuardrailScoring(score=85, reason="about transformers"))
+    state = {"messages": [HumanMessage(content="How do transformers work?")]}
+    result = await ainvoke_guardrail_step(state, runtime)
+    assert result["guardrail_result"].score == 85
+
+
+def test_high_score_continues(runtime):
+    state = {"guardrail_result": GuardrailScoring(score=85, reason="ok")}
+    assert continue_after_guardrail(state, runtime) == "continue"
+
+
+def test_low_score_goes_out_of_scope(runtime):
+    state = {"guardrail_result": GuardrailScoring(score=10, reason="weather")}
+    assert continue_after_guardrail(state, runtime) == "out_of_scope"
+
+
+async def test_out_of_scope_replies_without_llm(runtime, mock_llm):
+    state = {"messages": [HumanMessage(content="What's the weather?")]}
+    result = await ainvoke_out_of_scope_step(state, runtime)
+    assert isinstance(result["messages"][-1], AIMessage)
+    mock_llm.ainvoke.assert_not_called()</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents -q</code></pre>
+  <p>You should see <code>4 passed</code>. Commit with <code>git add -A; git commit -m "Module 7 Day 2: agent state, context, guardrail"</code>.</p>
+  <div class="callout story"><b>22 tests that never ran</b>
+    The reference repo's own agent tests silently didn't run for a long time because their fixtures (<code>conftest.py</code>) were
+    missing; pytest reported errors for them that nobody read. You just wrote that missing piece yourself. Always read the
+    summary line: "errors" are not "passed".</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In the test, pass <code>GuardrailScoring(score="high", reason="x")</code>. Pydantic raises before the node even runs. That's the same
+      error the node catches when a 1B model returns junk.</li>
+    <li>Temporarily delete the <code>llm_returns(...)</code> line. The mock returns a <code>MagicMock</code> instead of a model, so
+      <code>.score</code> is a mock too, and comparisons behave oddly. Mocks never fail loudly on their own; your asserts must.</li>
+    <li>Change <code>structured.ainvoke = AsyncMock()</code> to <code>MagicMock()</code> in the fixture. Now <code>await</code> fails with
+      "object MagicMock can't be used in 'await' expression". Anything the code awaits must be an <code>AsyncMock</code>.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>The retriever tool, the retrieve node, and query rewriting</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    This is where the agent actually searches. It does so through a <b>tool</b>, the standard way LLM frameworks let a model
+    trigger code. Understanding tool calls is the most transferable skill in this module: every agent framework uses them.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Tools and tool calls</h4>
+  <p>
+    A <b>tool</b> is a function wrapped with a name, a description, and an argument schema, via LangChain's <code>@tool</code>
+    decorator. An <code>AIMessage</code> can carry <code>tool_calls</code>: a list like
+    <code>[{"name": "retrieve_papers", "args": {"query": "..."}, "id": "..."}]</code>. The model doesn't run anything; it
+    <i>requests</i> a call.
+  </p>
+  <h4><code>ToolNode</code> and <code>tools_condition</code></h4>
+  <p>
+    LangGraph's prebuilt <code>ToolNode([tool])</code> is a node that reads the last <code>AIMessage</code>'s <code>tool_calls</code>,
+    runs the matching tools, and appends a <code>ToolMessage</code> with each result. <code>tools_condition</code> is a ready-made
+    conditional edge: it returns <code>"tools"</code> if the last message has tool calls, otherwise <code>END</code>.
+  </p>
+  <h4>A closure-built tool</h4>
+  <p>
+    The tool needs the OpenSearch and Jina clients, but a tool's arguments are what the model supplies (just a query).
+    So a factory function <code>create_retriever_tool(opensearch_client, embeddings_client, top_k, use_hybrid)</code>
+    defines the tool <i>inside</i> itself; the inner function "closes over" the clients. That's a <b>closure</b>.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/tools.py</b> (HEAD)</p>
+  <p>
+    Read it block by block. The factory builds a <code>@tool</code>-decorated async function named <code>retrieve_papers</code>
+    whose docstring is the description the model sees. Inside it: embed the query with the Jina client, call the OpenSearch
+    client's unified search (hybrid or BM25), and turn each hit into a LangChain <code>Document</code> with the chunk text as
+    <code>page_content</code> and paper details (arXiv ID, title, authors, score, PDF URL as <code>source</code>, section) in
+    <code>metadata</code>. In HEAD it returns <code>list[Document]</code>; <code>ToolNode</code> turns that list into the text of a
+    <code>ToolMessage</code>, so later nodes see one long string, not separate chunks. The <code>content_and_artifact</code> format you may see
+    in the working tree is Module 8. Note that the search call is <code>opensearch_client.search_unified(...)</code>, a synchronous call
+    inside an async function.
+  </p>
+
+  <p class="file"><b>src/services/agents/nodes/retrieve_node.py</b> (HEAD, not the working tree)</p>
+  <table class="walk">
+    <tr><td><pre><code>    messages = state["messages"]
+    question = get_latest_query(messages)
+    current_attempts = state.get("retrieval_attempts", 0)
+    max_attempts = runtime.context.max_retrieval_attempts</code></pre></td>
+      <td>The node that <i>asks</i> for retrieval; it doesn't search itself. The question is the latest <code>HumanMessage</code>, which
+        after a rewrite is the rewritten query. The attempt counter is what bounds the loop.</td></tr>
+    <tr><td><pre><code>    updates = {}
+    if state.get("original_query") is None:
+        updates["original_query"] = question</code></pre></td>
+      <td>On the first pass, remember the user's original wording.</td></tr>
+    <tr><td><pre><code>    if current_attempts &gt;= max_attempts:
+        fallback_msg = (
+            f"I apologize, but I couldn't find relevant research papers after {max_attempts} attempts.\n"
+            ...
+        )
+        return {**updates, "messages": [AIMessage(content=fallback_msg)]}</code></pre></td>
+      <td>The <b>fallback</b>: at the limit it gives up with a fixed message instead of another tool call. With no tool call,
+        <code>tools_condition</code> routes to <code>END</code>. (The working tree replaces this with on-demand ingestion; that's an
+        optional extension outside this course, and its test currently fails.)</td></tr>
+    <tr><td><pre><code>    new_attempt_count = current_attempts + 1
+    updates["retrieval_attempts"] = new_attempt_count</code></pre></td>
+      <td>The counter goes up on every real attempt.</td></tr>
+    <tr><td><pre><code>    updates["messages"] = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": f"retrieve_{new_attempt_count}",
+                    "name": "retrieve_papers",
+                    "args": {"query": question},
+                }
+            ],
+        )
+    ]
+    return updates</code></pre></td>
+      <td>It builds the tool call <b>itself</b>, without an LLM call. A small model is unreliable at producing tool calls, so the
+        code makes this step deterministic. The <code>name</code> must match the tool's name exactly.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/nodes/rewrite_query_node.py</b></p>
+  <p>
+    Called when grading decides the documents aren't relevant. It defines its own structured-output model and asks the LLM for a
+    better query, starting from <code>state.get("original_query")</code>:
+  </p>
+  <pre><code>class QueryRewriteOutput(BaseModel):
+    rewritten_query: str = Field(...)
+    reasoning: str = Field(...)
+...
+        llm = runtime.context.ollama_client.get_langchain_model(
+            model=runtime.context.model_name,
+            temperature=0.3,  # Lower temperature for more focused rewriting
+        )
+        structured_llm = llm.with_structured_output(QueryRewriteOutput)
+...
+    except Exception as e:
+        ...
+        rewritten_query = f"{original_question} research paper arxiv machine learning"
+...
+    return {
+        "messages": [HumanMessage(content=rewritten_query)],
+        "rewritten_query": rewritten_query,
+    }</code></pre>
+  <p>
+    The rewritten query goes into the messages as a <code>HumanMessage</code>. That's how <code>retrieve</code> picks it up: it always uses
+    the latest <code>HumanMessage</code>. If the LLM fails, the fallback appends generic keywords to the original question.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>tools.py</code>: <code>create_retriever_tool(...)</code> returning the <code>retrieve_papers</code> tool, following HEAD.</li>
+    <li><code>nodes/retrieve_node.py</code>: <code>ainvoke_retrieve_step</code> with the HEAD fallback, as walked through above.</li>
+    <li><code>nodes/rewrite_query_node.py</code>: <code>ainvoke_rewrite_query_step</code>.</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/agents/test_retrieve_and_rewrite.py</b></p>
+  <pre><code>from langchain_core.messages import AIMessage, HumanMessage
+
+from src.services.agents.nodes.retrieve_node import ainvoke_retrieve_step
+from src.services.agents.nodes.rewrite_query_node import QueryRewriteOutput, ainvoke_rewrite_query_step
+
+
+async def test_retrieve_requests_a_tool_call(runtime):
+    state = {"messages": [HumanMessage(content="What is RAG?")], "retrieval_attempts": 0}
+    result = await ainvoke_retrieve_step(state, runtime)
+    message = result["messages"][-1]
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls[0]["name"] == "retrieve_papers"
+    assert result["retrieval_attempts"] == 1
+
+
+async def test_retrieve_gives_up_after_max_attempts(runtime):
+    state = {"messages": [HumanMessage(content="What is RAG?")], "retrieval_attempts": 2}
+    result = await ainvoke_retrieve_step(state, runtime)
+    message = result["messages"][-1]
+    assert not message.tool_calls
+    assert message.content
+
+
+async def test_rewrite_stores_new_query(runtime, llm_returns):
+    llm_returns(QueryRewriteOutput(rewritten_query="retrieval augmented generation", reasoning="expand acronym"))
+    state = {"messages": [HumanMessage(content="What is RAG?")], "original_query": "What is RAG?"}
+    result = await ainvoke_rewrite_query_step(state, runtime)
+    assert result["rewritten_query"] == "retrieval augmented generation"
+    assert isinstance(result["messages"][-1], HumanMessage)</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents -q</code></pre>
+  <p>You should see <code>7 passed</code>. Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Remove the max-attempts check. The give-up test fails. In the running graph, a question with no good chunks would loop
+      retrieve &rarr; grade &rarr; rewrite forever, until LangGraph's recursion limit (25 steps by default) raises
+      <code>GraphRecursionError</code>. Every loop needs a counter.</li>
+    <li>Change the tool call's <code>"name"</code> to <code>"search"</code>. The unit test catches it; in the full graph, <code>ToolNode</code>
+      would reply with an error <code>ToolMessage</code> saying the tool doesn't exist.</li>
+    <li>Delete the docstring of <code>retrieve_papers</code>. <code>@tool</code> refuses: a tool needs a description for the model.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>Grading, generating, and wiring the graph</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Grading is what makes this "agentic" rather than a pipeline with extra steps: the agent judges its own retrieval before
+    answering. Today you also wire every node into one graph and wrap it in a service class, the shape an interviewer will ask
+    you to draw.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>LLM-as-judge</h4>
+  <p>
+    Using an LLM to evaluate something (here: "are these documents relevant to the question?") is called <b>LLM-as-judge</b>.
+    It's convenient, but a small model is a weak judge. Keep that in mind; Module 8 is built on the consequences.
+  </p>
+  <h4>Service class and factory</h4>
+  <p>
+    <code>AgenticRAGService</code> owns the compiled graph and exposes one method, <code>ask(...)</code>. A factory function
+    <code>make_agentic_rag_service(...)</code> builds it from the clients, the same factory pattern as the other services.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/nodes/grade_documents_node.py</b> (HEAD: the original single-verdict version)</p>
+  <table class="walk">
+    <tr><td><pre><code>async def ainvoke_grade_documents_step(
+    state: AgentState,
+    runtime: Runtime[Context],
+)</code></pre></td>
+      <td>Runs right after <code>tool_retrieve</code>, so the latest <code>ToolMessage</code> holds the retrieved text. The node reads the
+        question with <code>get_latest_query</code> and the context with <code>get_latest_context</code>.</td></tr>
+    <tr><td><pre><code>    if not context:
+        ...
+        return {"routing_decision": "rewrite_query", "grading_results": []}</code></pre></td>
+      <td>Nothing retrieved: go straight to rewriting.</td></tr>
+    <tr><td><pre><code>        grading_prompt = GRADE_DOCUMENTS_PROMPT.format(
+            context=context,
+            question=question,
+        )
+        ...
+        structured_llm = llm.with_structured_output(GradeDocuments)
+        grading_response = await structured_llm.ainvoke(grading_prompt)
+        is_relevant = grading_response.binary_score == "yes"</code></pre></td>
+      <td>One LLM call, one <code>yes</code>/<code>no</code> for <b>all</b> chunks together. If one chunk looks relevant, everything passes,
+        irrelevant chunks included. That's gap #1.</td></tr>
+    <tr><td><pre><code>    except Exception as e:
+        ...
+        is_relevant = len(context.strip()) &gt; 50</code></pre></td>
+      <td>If the LLM fails, a heuristic: any context longer than 50 characters counts as relevant. Fail-open: when in doubt, answer.</td></tr>
+    <tr><td><pre><code>    route = "generate_answer" if is_relevant else "rewrite_query"
+    ...
+    return {
+        "routing_decision": route,
+        "grading_results": [grading_result],
+    }</code></pre></td>
+      <td>The verdict goes into the state. In <code>agentic_rag.py</code>, the conditional edge is
+        <code>lambda state: state.get("routing_decision", "generate_answer")</code>.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/nodes/generate_answer_node.py</b> (HEAD)</p>
+  <p>
+    Reads <code>question = get_latest_query(...)</code> and <code>context = get_latest_context(...)</code> (using
+    <code>"No relevant documents found."</code> if empty), then:</p>
+  <pre><code>        answer_prompt = GENERATE_ANSWER_PROMPT.format(
+            context=context,
+            question=question,
+        )
+        llm = runtime.context.ollama_client.get_langchain_model(
+            model=runtime.context.model_name,
+            temperature=runtime.context.temperature,
+        )
+        response = await llm.ainvoke(answer_prompt)
+        answer = response.content if hasattr(response, 'content') else str(response)
+    except Exception as e:
+        ...
+        answer = f"I apologize, but I encountered an error while generating the answer: {str(e)}\n\nPlease try again or rephrase your question."
+
+    return {"messages": [AIMessage(content=answer)]}</code></pre>
+  <p>No structured output here: the answer is free text. There's no check that the answer is supported by
+    the context. That's gap #2.
+  </p>
+
+  <p class="file"><b>src/services/agents/agentic_rag.py</b> &middot; <code>AgenticRAGService._build_graph</code></p>
+  <p>The constructor stores the clients and a <code>GraphConfig</code>, then calls <code>self.graph = self._build_graph()</code>. The graph-building method, block by block:</p>
+  <pre><code>        workflow = StateGraph(AgentState, context_schema=Context)
+workflow.add_node("guardrail", ainvoke_guardrail_step)
+workflow.add_node("out_of_scope", ainvoke_out_of_scope_step)
+workflow.add_node("retrieve", ainvoke_retrieve_step)
+workflow.add_node("tool_retrieve", ToolNode(tools))
+workflow.add_node("grade_documents", ainvoke_grade_documents_step)
+workflow.add_node("rewrite_query", ainvoke_rewrite_query_step)
+workflow.add_node("generate_answer", ainvoke_generate_answer_step)
+...</code></pre>
+  <p>
+    This is the shape to look for, not a verbatim quote: compare it with the HEAD file line by line and note every difference.
+    Then the edges: <code>START &rarr; guardrail</code>; conditional edge from <code>guardrail</code> via
+    <code>continue_after_guardrail</code> to <code>retrieve</code> or <code>out_of_scope</code>; conditional edge from
+    <code>retrieve</code> via <code>tools_condition</code> to <code>tool_retrieve</code> or <code>END</code>;
+    <code>tool_retrieve &rarr; grade_documents</code>; conditional edge from <code>grade_documents</code> to
+    <code>generate_answer</code> or <code>rewrite_query</code>; <code>rewrite_query &rarr; retrieve</code>; and the two ends.
+  </p>
+  <p>
+    The method <code>async def ask(self, query: str, user_id: str = "api_user", model: Optional[str] = None) -&gt; dict</code> sets
+    <code>model_to_use = model or self.graph_config.model</code>, builds the initial state (the question as a <code>HumanMessage</code>,
+    counters at zero, <code>relevant_sources: []</code>), builds a <code>Context</code> from the clients and <code>GraphConfig</code>, runs
+    <code>await self.graph.ainvoke(state_input, ...)</code>, and returns a dict with <code>query</code>, <code>answer</code>,
+    <code>sources</code>, <code>reasoning_steps</code>, <code>retrieval_attempts</code>, <code>rewritten_query</code>,
+    <code>execution_time</code>, and <code>guardrail_score</code>. The answer is the last message's content (<code>_extract_answer</code>).
+    Read <code>_extract_sources</code>: it reads <code>relevant_sources</code> from the final state. Search the HEAD nodes for anything that writes that key. You won't find one.
+    That's gap #3.
+  </p>
+
+  <p class="file"><b>src/services/agents/factory.py</b></p>
+  <p><code>make_agentic_rag_service(opensearch_client, ollama_client, embeddings_client, langfuse_tracer=None, top_k=3, use_hybrid=True)</code> builds a <code>GraphConfig(top_k=top_k, use_hybrid=use_hybrid)</code> and constructs the service. Keeping construction in one place makes it easy to swap in fakes.</p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>nodes/grade_documents_node.py</code>: <code>ainvoke_grade_documents_step</code>, the HEAD single-verdict version.</li>
+    <li><code>nodes/generate_answer_node.py</code>: <code>ainvoke_generate_answer_step</code>, the HEAD version.</li>
+    <li><code>agentic_rag.py</code>: <code>AgenticRAGService</code> with the graph and <code>ask</code>.</li>
+    <li><code>factory.py</code>: <code>make_agentic_rag_service</code>.</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/agents/test_grade_and_generate.py</b></p>
+  <pre><code>from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from src.services.agents.models import GradeDocuments
+from src.services.agents.nodes.generate_answer_node import ainvoke_generate_answer_step
+from src.services.agents.nodes.grade_documents_node import ainvoke_grade_documents_step
+
+
+def _state():
+    return {
+        "messages": [
+            HumanMessage(content="What is RAG?"),
+            ToolMessage(content="RAG combines retrieval with generation.", tool_call_id="1"),
+        ],
+        "original_query": "What is RAG?",
+    }
+
+
+async def test_relevant_documents_route_to_generate(runtime, llm_returns):
+    llm_returns(GradeDocuments(binary_score="yes", reasoning="on topic"))
+    result = await ainvoke_grade_documents_step(_state(), runtime)
+    assert result["routing_decision"] == "generate_answer"
+
+
+async def test_irrelevant_documents_route_to_rewrite(runtime, llm_returns):
+    llm_returns(GradeDocuments(binary_score="no", reasoning="off topic"))
+    result = await ainvoke_grade_documents_step(_state(), runtime)
+    assert result["routing_decision"] == "rewrite_query"
+
+
+async def test_generate_returns_llm_answer(runtime, mock_llm):
+    mock_llm.ainvoke.return_value = AIMessage(content="RAG retrieves then generates.")
+    result = await ainvoke_generate_answer_step(_state(), runtime)
+    assert "retrieves" in result["messages"][-1].content</code></pre>
+  <p class="file"><b>tests/unit/services/agents/test_agentic_rag_graph.py</b></p>
+  <pre><code>from unittest.mock import MagicMock
+
+from src.services.agents.factory import make_agentic_rag_service
+
+
+def test_graph_has_all_nodes():
+    service = make_agentic_rag_service(
+        opensearch_client=MagicMock(), ollama_client=MagicMock(), embeddings_client=MagicMock()
+    )
+    nodes = set(service.graph.get_graph().nodes)
+    assert {"guardrail", "out_of_scope", "retrieve", "tool_retrieve",
+            "grade_documents", "rewrite_query", "generate_answer"} &lt;= nodes</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents -q</code></pre>
+  <p>You should see <code>11 passed</code>. Commit with <code>git commit -m "Module 7 Day 4: grading, generation, graph"</code>.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day4" /><span>Day 4 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Swap the two branches in the grading conditional edge. The unit tests still pass (they test the node, not the edge),
+      but the graph now rewrites good results and answers from bad ones. Unit tests don't prove wiring; that's why you'll run the
+      real endpoint tomorrow.</li>
+    <li>Remove <code>context_schema=Context</code> from <code>StateGraph(...)</code>. Nodes that read <code>runtime.context</code> now get
+      no usable context at run time. Read the error.</li>
+    <li>Add a node with <code>add_node</code> but no edge into it. <code>compile()</code> (or the mermaid view tomorrow) shows it
+      unreachable.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 5                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day5"><span class="day">Day 5</span>The endpoint, the dependency, and seeing the graph</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Until it's behind an endpoint, the agent is a library. Today you expose it at <code>/api/v1/ask-agentic</code>, see the
+    graph as a diagram, and run one real question end to end on your own stack.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <p>
+    Nothing new: a router (Module 1), a dependency alias with <code>Annotated</code> and <code>Depends</code> (Module 1), a
+    service created once in <code>lifespan</code> and stored on <code>app.state</code>. The one new thing is <b>mermaid</b>, a
+    text format for diagrams; LangGraph can emit it with <code>graph.get_graph().draw_mermaid()</code>, and Cursor, GitHub, and
+    <a href="https://mermaid.live">mermaid.live</a> render it.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/schemas/api/ask.py</b> (HEAD) &middot; the agentic response</p>
+  <p>
+    The request reuses <code>AskRequest</code> from Module 5.
+  </p>
+  <pre><code>class AgenticAskResponse(AskResponse):
+    """Response model for agentic RAG question answering."""
+
+    reasoning_steps: List[str] = Field(..., description="Agent's decision-making steps")
+    retrieval_attempts: int = Field(..., description="Number of document retrieval attempts")
+    trace_id: Optional[str] = Field(None, description="Langfuse trace ID for feedback and debugging")</code></pre>
+  <p>
+    It inherits <code>query</code>, <code>answer</code>, <code>sources</code> (<code>List[str]</code>, "PDF URLs of source papers"),
+    <code>chunks_used</code>, and <code>search_mode</code> from <code>AskResponse</code>. The same file also has
+    <code>FeedbackRequest</code>/<code>FeedbackResponse</code> for the Langfuse feedback endpoint; you can skip those.
+  </p>
+  <p class="file"><b>src/routers/agentic_ask.py</b> (HEAD) &middot; the core of <code>ask_agentic</code></p>
+  <pre><code>router = APIRouter(prefix="/api/v1", tags=["agentic-rag"])
+
+
+@router.post("/ask-agentic", response_model=AgenticAskResponse)
+async def ask_agentic(
+    request: AskRequest,
+    agentic_rag: AgenticRAGDep,
+) -&gt; AgenticAskResponse:
+    ...
+    try:
+        result = await agentic_rag.ask(
+            query=request.query,
+        )
+
+        return AgenticAskResponse(
+            query=result["query"],
+            answer=result["answer"],
+            sources=result.get("sources", []),
+            chunks_used=request.top_k,
+            search_mode="hybrid" if request.use_hybrid else "bm25",
+            reasoning_steps=result.get("reasoning_steps", []),
+            retrieval_attempts=result.get("retrieval_attempts", 0),
+            trace_id=result.get("trace_id"),
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")</code></pre>
+  <p>
+    Only <code>query</code> reaches the agent. <code>ask</code> accepts a <code>model</code> argument, but the router never passes
+    <code>request.model</code> (gap #4); <code>top_k</code>, <code>use_hybrid</code>, and <code>categories</code> are ignored too, apart
+    from being echoed back. <code>chunks_used=request.top_k</code> reports what was requested, not what the agent used (gap #5), and
+    <code>search_mode</code> is likewise just echoed from the request.
+  </p>
+  <p class="file"><b>src/dependencies.py</b> and <b>src/main.py</b> (HEAD)</p>
+  <p>
+    In HEAD, <code>get_agentic_rag_service</code> depends on the OpenSearch, Ollama, embeddings, Langfuse, and settings dependencies and
+    calls <code>make_agentic_rag_service(...)</code> on every request, and
+    <code>AgenticRAGDep = Annotated[AgenticRAGService, Depends(get_agentic_rag_service)]</code>. The router declares
+    <code>APIRouter(prefix="/api/v1")</code> itself, so <code>src/main.py</code> includes it without a prefix. In your build you'll
+    simplify this: create the service once in <code>lifespan</code>, store it on <code>app.state.agentic_rag_service</code>, and have
+    <code>get_agentic_rag_service(request)</code> return it.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Add <code>AgenticAskResponse</code> to <code>src/schemas/api/ask.py</code> with the HEAD fields.</li>
+    <li>Write <code>src/routers/agentic_ask.py</code>; add <code>get_agentic_rag_service</code> and <code>AgenticRAGDep</code> to
+      <code>src/dependencies.py</code>; create the service in <code>lifespan</code>; include the router in <code>src/main.py</code>.</li>
+    <li>Write <code>scripts/show_agent_graph.py</code> (learner-only): build the service with <code>MagicMock</code> clients and print
+      <code>service.graph.get_graph().draw_mermaid()</code>.</li>
+  </ol>
+  <p class="file"><b>tests/api/routers/test_agentic_ask.py</b></p>
+  <pre><code>from unittest.mock import AsyncMock, MagicMock
+
+from fastapi.testclient import TestClient
+
+from src.dependencies import get_agentic_rag_service
+from src.main import app
+
+
+def test_ask_agentic_returns_answer():
+    fake_service = MagicMock()
+    fake_service.ask = AsyncMock(return_value={
+        "query": "What is RAG?",
+        "answer": "RAG retrieves then generates.",
+        "sources": [],
+        "reasoning_steps": [],
+        "retrieval_attempts": 1,
+        "rewritten_query": None,
+    })
+    app.dependency_overrides[get_agentic_rag_service] = lambda: fake_service
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/v1/ask-agentic", json={"query": "What is RAG?"})
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json()["answer"] == "RAG retrieves then generates."
+    assert response.json()["chunks_used"] == 3
+    fake_service.ask.assert_awaited_once_with(query="What is RAG?")
+    assert response.json()["chunks_used"] == 3
+    fake_service.ask.assert_awaited_once_with(query="What is RAG?")</code></pre>
+  <div class="callout warn"><b>Adjust the fake to your response model</b>
+    The dict above must contain whatever keys your router reads from the service result. If the router reads a key the fake
+    doesn't have, you'll get a 500; add the key. <code>with TestClient(app)</code> runs your lifespan, so if lifespan connects to
+    services that aren't running, drop the <code>with</code> and create <code>TestClient(app)</code> directly.</div>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents tests/api/routers/test_agentic_ask.py -q
+uv run python scripts/show_agent_graph.py</code></pre>
+  <p>
+    Expect <code>12 passed</code>, and a mermaid diagram starting with <code>graph TD;</code> (or similar) that lists all seven nodes
+    plus <code>__start__</code> and <code>__end__</code>. Paste it into mermaid.live and compare with your Day 1 drawing.
+  </p>
+  <p>Now the real run. Rebuild and start your stack (stop the reference stack first to save RAM), then:</p>
+  <pre><code>docker compose up -d --build api
+'{"query": "What is retrieval augmented generation?", "top_k": 3}' | Out-File -Encoding ascii body.json
+curl.exe -s -X POST http://localhost:18000/api/v1/ask-agentic -H "Content-Type: application/json" --data-binary "@body.json" --max-time 900</code></pre>
+  <p>
+    Expect a JSON body with an <code>answer</code>, <code>retrieval_attempts</code> of 1 or 2, and <code>sources</code> that is an empty list
+    (gap #3). Then ask <code>"What is the best pizza topping?"</code>: it should come back quickly with the out-of-scope message.
+  </p>
+  <div class="callout story"><b>Six minutes per answer</b>
+    On this CPU-only laptop the reference agentic endpoint took about 6 minutes per question: roughly six LLM calls to llama3.2:1b
+    (guardrail, grading, maybe a rewrite and a second grading, generation). That's why the curl command above has
+    <code>--max-time 900</code>, and why the Gradio client's original 60-second timeout produced a misleading "is the API running?" error.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day5" /><span>Day 5 checkpoint passed, real question answered, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Forget to create the service in <code>lifespan</code>. The endpoint returns 500 with an <code>AttributeError</code> about
+      <code>app.state</code>. Dependencies only fetch what startup created.</li>
+    <li>Stop Ollama (<code>docker compose stop ollama</code>) and ask again. Watch <code>docker compose logs api</code>: the guardrail's LLM call
+      fails, its fallback score of 50 is below 60, and you get the out-of-scope message, which is misleading: the question was fine, the
+      model was down. A silent fallback can hide an outage.</li>
+    <li>Set <code>max_retrieval_attempts</code> to 0 in <code>Context</code>. Every question now ends with the fallback message.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 6                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day6"><span class="day">Day 6</span>The Telegram bot, and the gaps Module 8 fixes</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The bot shows the agent is a service, not a web page: a second front end calls the same <code>ask</code> method. Then you
+    look critically at what you built. Being able to say "here's what's wrong with this design and how I fixed it" is the
+    strongest thing you can bring to an interview.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <p>
+    A Telegram bot is a program that receives messages from Telegram's servers. You register one with <b>BotFather</b> (a Telegram
+    account that creates bots) and get a <b>token</b>, a secret that identifies your bot. The course bot uses <b>long polling</b>:
+    it repeatedly asks Telegram "any new messages?", so it needs no public URL. It runs inside the API process, started and
+    stopped by <code>lifespan</code>.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/telegram/bot.py</b> and <b>factory.py</b> (HEAD)</p>
+  <p>
+    Read them block by block: the bot class takes the token and the agentic service; it registers handlers (a <code>/start</code> command
+    and a text handler); the text handler calls the agent's <code>ask</code> and replies with the answer; <code>start()</code> and
+    <code>stop()</code> manage polling. The factory returns <code>None</code> when Telegram is disabled or has no token, and
+    <code>src/main.py</code>'s lifespan only starts the bot if the factory returned one. Note the exact settings names in
+    <code>src/config.py</code> and <code>.env.example</code> for the Telegram section, and mirror them in your <code>.env</code>.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Add the Telegram settings, <code>src/services/telegram/bot.py</code>, <code>factory.py</code>, and the lifespan start/stop, following HEAD.</li>
+    <li>Optional, only if you want a live bot: in Telegram, message <code>@BotFather</code>, send <code>/newbot</code>, follow the prompts, and
+      put the token in your <code>.env</code> (never commit it).</li>
+  </ol>
+  <div class="callout info"><b>No token? That's fine</b>
+    Without a token, the factory returns <code>None</code> and the API starts normally. Your checkpoint is then: the API starts, the
+    logs say the bot is disabled, and <code>/api/v1/ask-agentic</code> still works. This part of the guide could not be tested live when it
+    was written, because there was no bot token; follow the HEAD code closely.</div>
+
+  <h4>The known gaps (write these down; Module 8 fixes each one)</h4>
+  <ol>
+    <li><b>Whole-context grading.</b> One yes/no for all chunks together; one relevant chunk lets irrelevant ones through to generation.</li>
+    <li><b>No answer verification.</b> Nothing checks the generated answer against the retrieved text, so invented citations and
+      authors go straight to the user.</li>
+    <li><b>Empty sources.</b> The response's <code>sources</code> come from <code>relevant_sources</code>, which no node ever fills.</li>
+    <li><b>Ignored <code>model</code>.</b> The request's <code>model</code> field never reaches the agent; the context's default is always used.</li>
+    <li><b><code>chunks_used = top_k</code>.</b> The response reports the requested number, not what was actually used.</li>
+  </ol>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q
+docker compose up -d --build api
+docker compose logs api --tail 50</code></pre>
+  <p>
+    All tests pass, including your earlier modules'. The logs show startup completing, with the bot either started (token set) or
+    reported as disabled. With a token, send your bot "What is RAG?" and expect a reply after several minutes. For each of the five gaps,
+    point to the exact HEAD line that causes it. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-day6" /><span>Day 6 checkpoint passed, gaps located in code, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Put a wrong token in <code>.env</code> and restart. Telegram rejects it at startup; read the error and make sure the API still serves
+      requests (if it doesn't, your lifespan isn't guarding the bot start).</li>
+    <li>Send the request with <code>"model": "some-model-that-does-not-exist"</code>. It still answers, using llama3.2:1b. That's gap #4 proven.</li>
+    <li>Ask a question about a paper you haven't ingested. Read <code>retrieval_attempts</code> and the answer: grading may still say "yes".</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me "Drill me on Module 7".</p>
+
+  <details class="drill"><summary>1. What's the difference between your <code>/ask</code> pipeline and the agentic endpoint?</summary>
+    <div class="answer"><code>/ask</code> always retrieves and generates. The agent is a graph with decisions: a guardrail can refuse,
+      grading can send it back to rewrite the query and retrieve again, and a counter caps the retries. It's more robust to bad
+      retrieval and off-topic questions, and several times slower because it makes more LLM calls.</div></details>
+
+  <details class="drill"><summary>2. Explain LangGraph's state, nodes, and edges.</summary>
+    <div class="answer">State is a shared TypedDict. A node is a function that reads the state and returns only the keys it changes.
+      Edges say what runs next; conditional edges run a function on the state to choose. <code>START</code>/<code>END</code> mark entry and
+      exit, and <code>compile()</code> validates the graph and makes it runnable.</div></details>
+
+  <details class="drill"><summary>3. What is a reducer, and why does <code>messages</code> use <code>add_messages</code>?</summary>
+    <div class="answer">A reducer decides how an update merges into the state. The default overwrites. <code>add_messages</code> appends
+      (and updates messages with the same ID), so every node's message joins the conversation instead of replacing it.</div></details>
+
+  <details class="drill"><summary>4. Why keep clients in a runtime context rather than in the state?</summary>
+    <div class="answer">The state is data that changes and gets logged or checkpointed; clients are live connections that don't change and can't
+      be serialised. <code>context_schema=Context</code> gives every node typed access through <code>runtime.context</code> without polluting the state.</div></details>
+
+  <details class="drill"><summary>5. How do tool calls work, and what do <code>ToolNode</code> and <code>tools_condition</code> do?</summary>
+    <div class="answer">An AIMessage can request calls (name, args, id); nothing runs until code executes them. <code>ToolNode</code> executes the
+      requested tools and appends ToolMessages. <code>tools_condition</code> routes to the tool node if the last message has tool calls, else to END.
+      In this project the retrieve node builds the tool call itself, because a 1B model is unreliable at doing it.</div></details>
+
+  <details class="drill"><summary>6. What stops the agent from looping forever?</summary>
+    <div class="answer"><code>retrieval_attempts</code> in the state, compared with <code>max_retrieval_attempts</code> (2) in the context. At the limit
+      the retrieve node returns a fallback message with no tool call, so the graph ends. LangGraph's recursion limit is a second safety net.</div></details>
+
+  <details class="drill"><summary>7. What does <code>with_structured_output</code> do, and what happens when a small model gets it wrong?</summary>
+    <div class="answer">It converts a Pydantic model into a schema, asks the LLM for that shape, and returns a validated object. When validation or
+      the call fails, the node's <code>except</code> takes over with a fallback. Which way each fallback leans is a design decision. In the
+      original, the guardrail falls back to score 50 (refuse), but grading falls back to "any context over 50 characters is relevant" (answer),
+      and generation returns an apology as the answer.</div></details>
+
+  <details class="drill"><summary>8. What is the guardrail and why use a score instead of yes/no?</summary>
+    <div class="answer">An LLM check that the question is about research papers, before any retrieval. A 0&ndash;100 score lets you tune the
+      threshold (60) in config without rewriting the prompt, and it's cheaper to refuse early than to run the whole graph.</div></details>
+
+  <details class="drill"><summary>9. How did you unit-test nodes that call an LLM?</summary>
+    <div class="answer">A conftest fixture replaces the Ollama client with a MagicMock whose <code>get_langchain_model</code> returns a fake LLM;
+      its <code>with_structured_output(...).ainvoke</code> is an AsyncMock whose return value each test sets. Tests are fast, deterministic, and
+      assert on the node's returned updates. Separate tests cover the graph's shape and the endpoint with <code>dependency_overrides</code>.</div></details>
+
+  <details class="drill"><summary>10. Name the weaknesses of the original agent.</summary>
+    <div class="answer">Whole-context grading with a single verdict; no verification of the answer against the sources; <code>sources</code> always
+      empty because <code>relevant_sources</code> is never set; the request's <code>model</code> ignored; <code>chunks_used</code> reports
+      <code>top_k</code> rather than reality. I fixed these in the hardening work.</div></details>
+
+  <details class="drill"><summary>11. Why is the agentic endpoint so slow on your laptop, and what would you change?</summary>
+    <div class="answer">About six sequential LLM calls to a CPU-only model at tens of seconds each. Options: a GPU, a hosted model, fewer calls
+      (skip the guardrail for obvious cases, grade with a cheaper heuristic first), caching, or streaming progress so the user sees work happening.</div></details>
+
+  <details class="drill"><summary>12. When would you not use an agent?</summary>
+    <div class="answer">When the fixed pipeline already works: agents add latency, cost, and more ways to fail. Use one when inputs vary enough
+      that deciding per request pays off, and always bound its loops and test its branches.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m7-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 8</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m7-tests" /><span><code>uv run pytest -q</code> passes, including the 12 new agent and endpoint tests</span></li>
+    <li><input type="checkbox" data-id="m7-endpoint" /><span><code>/api/v1/ask-agentic</code> answered a real question on your stack, and refused an off-topic one</span></li>
+    <li><input type="checkbox" data-id="m7-graph" /><span>You can draw the agent graph from memory, including both loops' exits</span></li>
+    <li><input type="checkbox" data-id="m7-gaps" /><span>You can point to the HEAD line behind each of the five known gaps</span></li>
+  </ul>
+  <p>
+    Then send me "Module 7 passed". Module 8 fixes the gaps: deterministic citation checks, per-chunk grading, a verification node,
+    and real sources.
+  </p>
+  <p><a href="module-08-hallucination-hardening.html">Next: Module 8, Hallucination hardening &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

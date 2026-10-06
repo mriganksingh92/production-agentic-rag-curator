@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Roadmap — Rebuild the arXiv Paper Curator</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="kicker">Learning roadmap</p>
+    <h1>Rebuild the <span class="grad">arXiv Paper Curator</span> by hand</h1>
+    <p class="lede">
+      You will read the working reference project one layer at a time, then type your own version of each
+      layer into a new project, until you can build, run, break, fix, and explain every part of it.
+    </p>
+    <div class="pill-row">
+      <span class="pill">10 modules</span>
+      <span class="pill">~45 working days at 3 hours/day</span>
+      <span class="pill">You type every line</span>
+      <span class="pill">Interview drill after every module</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Modules completed</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="callout tip">
+    <b>Short on time?</b>
+    The <a href="fast-track.html">fast track</a> covers the same project in 17 days: read every layer, run and break the
+    reference project, hand-build the five pieces interviewers probe hardest, drill every module, and finish with a small
+    RAG app of your own.
+  </div>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#what">What you are building</a></li>
+      <li><a href="#folders">Your two folders</a></li>
+      <li><a href="#loop">How every module works</a></li>
+      <li><a href="#rules">Five rules</a></li>
+      <li><a href="#modules">The modules</a></li>
+      <li><a href="#ports">Running both projects side by side</a></li>
+      <li><a href="#me">How to work with me</a></li>
+      <li><a href="#resume">Talking about it in interviews</a></li>
+    </ol>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2 id="what">What you are building</h2>
+  <p>
+    A research assistant for AI papers. Every weekday it downloads new papers from arXiv, splits them into
+    short passages, and indexes them. When you ask a question, it finds the most relevant passages and has
+    a local language model write an answer that cites them. This pattern is called
+    <b>RAG</b> (retrieval-augmented generation): the model <em>retrieves</em> facts first, then
+    <em>generates</em> an answer from them, instead of answering from memory.
+  </p>
+
+  <h4>When a question comes in</h4>
+  <div class="flow">
+    <span class="node">Question</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>FastAPI</b> endpoint</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Guardrail</b>: is it about AI research?</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>OpenSearch</b>: find passages</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Grade</b> each passage</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Ollama</b> writes the answer</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Verify</b> it against the passages</span>
+  </div>
+
+  <h4>In the background, every weekday</h4>
+  <div class="flow">
+    <span class="node"><b>Airflow</b> schedule</span><span class="arrow">&rarr;</span>
+    <span class="node">Fetch papers from <b>arXiv</b></span><span class="arrow">&rarr;</span>
+    <span class="node">Parse PDFs</span><span class="arrow">&rarr;</span>
+    <span class="node">Save metadata in <b>PostgreSQL</b></span><span class="arrow">&rarr;</span>
+    <span class="node">Split, embed, index in <b>OpenSearch</b></span>
+  </div>
+
+  <p>
+    If you want the one-page overview of every service first, read
+    <a href="../production-agentic-rag-course/STACK_EXPLAINED.html">STACK_EXPLAINED.html</a> in the reference repo.
+  </p>
+
+  <!-- ================================================================ -->
+  <h2 id="folders">Your two folders</h2>
+  <table class="plain">
+    <tr><th>Folder</th><th>What it is</th><th>What you do with it</th></tr>
+    <tr>
+      <td><code>Downloads\production-agentic-rag-course</code></td>
+      <td>The working reference project, including the hallucination safeguards we added.</td>
+      <td>Read it, run it, and compare your version against it. Don't edit it while learning.</td>
+    </tr>
+    <tr>
+      <td><code>Downloads\my-paper-curator</code></td>
+      <td>Your own project. You create it on Day 1 of Module 0.</td>
+      <td>Type every file yourself. Commit to git at every checkpoint.</td>
+    </tr>
+  </table>
+  <p>This guide lives in <code>Downloads\rag-learning-guide</code>, one page per module.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="loop">How every module works</h2>
+  <p>Each module page is split into days of about three hours. Every day follows the same seven steps:</p>
+  <table class="plain">
+    <tr><th>Step</th><th>What happens</th></tr>
+    <tr><td>1. Why it exists</td><td>The problem this layer solves, and what breaks without it.</td></tr>
+    <tr><td>2. Concepts</td><td>Plain-English explanations before any code.</td></tr>
+    <tr><td>3. Walkthrough</td><td>Real code from the reference repo, explained line by line for core logic, block by block for glue.</td></tr>
+    <tr><td>4. Build</td><td>You type your own version, following a written spec.</td></tr>
+    <tr><td>5. Checkpoint</td><td>A command to run and what you should see. Then commit.</td></tr>
+    <tr><td>6. Break it</td><td>Things to break on purpose, so you learn what each error looks like and how to trace it.</td></tr>
+    <tr><td>7. Interview drill</td><td>At the end of the module: questions you answer to me in chat, with model answers hidden until you try.</td></tr>
+  </table>
+
+  <!-- ================================================================ -->
+  <h2 id="rules">Five rules</h2>
+  <ol>
+    <li><b>Type, don't paste.</b> Typing is how the code gets into your head. The code blocks have no copy buttons on purpose.</li>
+    <li><b>Commit at every checkpoint.</b> Your git history becomes proof you built it, and a safety net when you break things.</li>
+    <li><b>Explain it back before moving on.</b> If you can't explain a line without looking, you haven't learned it yet.</li>
+    <li><b>Hints before answers.</b> When stuck, open the hint first. If still stuck after 20 minutes, ask me.</li>
+    <li><b>Read every error message fully.</b> The last line usually says what went wrong; the lines above it say where.</li>
+  </ol>
+
+  <!-- ================================================================ -->
+  <h2 id="modules">The modules</h2>
+  <p>Work through them in order: each module builds on the project state the previous one leaves you with. Tick a module when you have passed its interview drill.</p>
+
+  <div class="modules">
+    <div class="module" data-module>
+      <div class="num">0</div>
+      <div>
+        <h3><a href="module-00-foundations.html">Foundations</a></h3>
+        <p>The Python this codebase uses (type hints, Pydantic, decorators, context managers, generators, async),
+          plus terminal, git, uv, pytest, HTTP, and Docker.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />4&ndash;5 days<br />
+        <label><input type="checkbox" data-id="module-0" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">1</div>
+      <div>
+        <h3><a href="module-01-infrastructure.html">Infrastructure</a></h3>
+        <p>Docker Compose stack, FastAPI app skeleton, settings from <code>.env</code>, PostgreSQL with SQLAlchemy,
+          repositories, dependency injection, health checks.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />5&ndash;6 days<br />
+        <label><input type="checkbox" data-id="module-1" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">2</div>
+      <div>
+        <h3><a href="module-02-data-ingestion.html">Data ingestion</a></h3>
+        <p>arXiv API client with rate limiting and retries, PDF parsing with Docling, the metadata fetcher,
+          and an Airflow pipeline that runs it on a schedule.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />5 days<br />
+        <label><input type="checkbox" data-id="module-2" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">3</div>
+      <div>
+        <h3><a href="module-03-keyword-search.html">Keyword search</a></h3>
+        <p>OpenSearch, index mappings, BM25 ranking, building queries with filters, and the search endpoint.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />4 days<br />
+        <label><input type="checkbox" data-id="module-3" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">4</div>
+      <div>
+        <h3><a href="module-04-hybrid-search.html">Chunking and hybrid search</a></h3>
+        <p>Section-aware chunking, Jina embeddings, vector search, and combining keyword and vector results with RRF.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />5 days<br />
+        <label><input type="checkbox" data-id="module-4" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">5</div>
+      <div>
+        <h3><a href="module-05-rag-llm.html">RAG with a local LLM</a></h3>
+        <p>Ollama, prompt building, the <code>/ask</code> endpoint, streaming responses, and the Gradio chat UI.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />4 days<br />
+        <label><input type="checkbox" data-id="module-5" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">6</div>
+      <div>
+        <h3><a href="module-06-caching-tracing.html">Caching and tracing</a></h3>
+        <p>An exact-match answer cache in Redis, and Langfuse tracing so you can see every step of every request.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />3 days<br />
+        <label><input type="checkbox" data-id="module-6" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">7</div>
+      <div>
+        <h3><a href="module-07-agentic-rag.html">Agentic RAG</a></h3>
+        <p>LangGraph state, nodes, and edges: guardrail, retrieval, grading, query rewriting, and a Telegram bot.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />5&ndash;6 days<br />
+        <label><input type="checkbox" data-id="module-7" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">8</div>
+      <div>
+        <h3><a href="module-08-hallucination-hardening.html">Hallucination hardening</a></h3>
+        <p>Beyond the course: citation checks, per-chunk grading, a groundedness check, safe failure, and an
+          evaluation script that measures the difference.</p>
+      </div>
+      <div class="meta"><span class="status new">Your addition</span><br />3&ndash;4 days<br />
+        <label><input type="checkbox" data-id="module-8" /> done</label></div>
+    </div>
+
+    <div class="module" data-module>
+      <div class="num">9</div>
+      <div>
+        <h3><a href="module-09-testing-interview.html">Testing and interview prep</a></h3>
+        <p>pytest and mocking, drawing the architecture from memory, trade-off questions, and your debugging stories.</p>
+      </div>
+      <div class="meta"><span class="status open">Available</span><br />4 days<br />
+        <label><input type="checkbox" data-id="module-9" /> done</label></div>
+    </div>
+  </div>
+
+  <p>At about three hours a day, six days a week, that's roughly 7&ndash;8 weeks.</p>
+
+  <!-- ================================================================ -->
+  <h2 id="ports">Running both projects side by side</h2>
+  <p>
+    The reference project already uses ports 8000, 5432, 6379, 9200, and others on your laptop. Two programs can't
+    listen on the same port, so your project adds 10000 to every port it publishes:
+  </p>
+  <table class="plain">
+    <tr><th>Service</th><th>Reference project</th><th>Your project</th></tr>
+    <tr><td>API</td><td>8000</td><td>18000</td></tr>
+    <tr><td>PostgreSQL</td><td>5432</td><td>15432</td></tr>
+    <tr><td>Redis</td><td>6379</td><td>16379</td></tr>
+    <tr><td>OpenSearch</td><td>9200</td><td>19200</td></tr>
+    <tr><td>Ollama</td><td>11434</td><td>21434</td></tr>
+  </table>
+  <div class="callout warn">
+    <b>Memory</b>
+    Both full stacks together need a lot of RAM. From Module 3 onwards, stop the reference stack
+    (<code>docker compose stop</code> in its folder) while you run yours, and start it again when you want to compare.
+  </div>
+
+  <!-- ================================================================ -->
+  <h2 id="me">How to work with me</h2>
+  <table class="plain">
+    <tr><th>Send me</th><th>I will</th></tr>
+    <tr><td>"Module 0, Day 2 done"</td><td>Read your files in <code>my-paper-curator</code> and review them: bugs, style, and anything to understand better.</td></tr>
+    <tr><td>"Stuck on ..." plus the full error</td><td>Give you a hint first, not the fix.</td></tr>
+    <tr><td>"Drill me on Module 0"</td><td>Ask the interview questions one at a time and push back on vague answers.</td></tr>
+    <tr><td>"Module 0 passed"</td><td>Adjust the next module for anything you found hard, before you start it.</td></tr>
+  </table>
+
+  <!-- ================================================================ -->
+  <h2 id="resume">Talking about it in interviews</h2>
+  <p>Be accurate about where the project came from. A framing that is honest and still strong:</p>
+  <div class="card">
+    "I built a production-style agentic RAG system over arXiv papers. I started from an open-source course, then
+    rebuilt it from scratch myself, and added hallucination safeguards the course didn't have: deterministic
+    citation checks, per-chunk relevance grading, and a groundedness check that withholds unsupported answers."
+  </div>
+  <p>
+    Interviewers will probe whatever you claim. By Module 9 you'll be able to go as deep as they want on any layer,
+    because you'll have built each one twice: once by reading, once by typing.
+  </p>
+
+  <footer>Progress is saved in this browser. Open this file from the same browser each time.</footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

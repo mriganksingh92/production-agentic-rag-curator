@@ -1,0 +1,1248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 9 — Testing and interview prep</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 9 &middot; 4 days</p>
+    <h1><span class="grad">Testing and interview prep</span>: prove it works, then explain it</h1>
+    <p class="lede">
+      You've built every layer. This module makes the project trustworthy and presentable: tests that run anywhere
+      without Docker, a lint and CI setup, and a README. Then you'll practise the three things interviews test:
+      drawing the system from memory, defending its trade-offs, and telling your debugging stories well.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: test strategy, fixtures, mocks</span>
+      <span class="pill">Day 2: testing the API and the agent</span>
+      <span class="pill">Day 3: hermetic tests, coverage, ruff, CI</span>
+      <span class="pill">Day 4: system design, stories, README</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 9</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: Test strategy, fixtures, and mocks</a></li>
+      <li><a href="#day2">Day 2: Testing the API and the agent</a></li>
+      <li><a href="#day3">Day 3: Hermetic tests, coverage, ruff, and CI</a></li>
+      <li><a href="#day4">Day 4: System design, debugging stories, and your README</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">You've finished</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>How to use this page</b>
+    Keep the reference repo open next to this page, as before. Today's "Build" steps are tests, config, and a README,
+    not new features. Stop the reference stack while you work (<code>docker compose stop</code> in its folder): on Day 3
+    you'll prove your tests pass with <b>no</b> services running at all.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>Test strategy, fixtures, and mocks</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Here is what running the reference project's test suite on your laptop printed this week:
+  </p>
+  <pre><code>2 failed, 126 passed, 31 warnings, 13 errors in 137.58s (0:02:17)</code></pre>
+  <p>
+    Of those 15 problems, only one is a real bug in the code under test, and even that one is a test that went stale
+    when someone else changed the code. The other 14 are tests that can't run on your laptop, because they need Docker's
+    private network or an internet connection that your office proxy blocks. A suite like that trains everyone to ignore red. Interviewers ask
+    "how did you test it?" because the answer shows whether you can tell those two kinds of failure apart. Today you
+    learn the vocabulary and the tools.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Three kinds of test</h4>
+  <table class="plain">
+    <tr><th>Kind</th><th>What it exercises</th><th>Speed</th><th>In this project</th></tr>
+    <tr><td>Unit</td><td>One function or class, with everything it talks to replaced by fakes</td><td>Milliseconds</td><td><code>tests/unit/</code>, e.g. <code>test_citations.py</code></td></tr>
+    <tr><td>Integration</td><td>Your code plus one real outside thing: a real Redis, a real OpenSearch, the real arXiv API</td><td>Seconds</td><td><code>tests/integration/test_services.py</code></td></tr>
+    <tr><td>End-to-end</td><td>The whole running system, from HTTP request to answer</td><td>Minutes on your CPU</td><td><code>scripts/eval_hallucination.py</code> against the live stack</td></tr>
+  </table>
+  <p>
+    The usual advice is a <b>test pyramid</b>: many unit tests (fast, precise), fewer integration tests, very few end-to-end
+    tests. An end-to-end run of the agent takes about 6 minutes here, so you can't run it on every change. A unit test of
+    one node takes a millisecond.
+  </p>
+  <p>
+    A test is <b>hermetic</b> when it depends on nothing outside the test process: no network, no containers, no files it
+    didn't create. Hermetic tests give the same result on your laptop, a colleague's laptop, and a CI server.
+  </p>
+
+  <h4>Fixtures and conftest.py</h4>
+  <p>
+    A <b>fixture</b> is a function marked <code>@pytest.fixture</code> that builds something a test needs. A test asks for
+    it by naming it as a parameter; pytest calls the fixture and passes the result in. A fixture that uses
+    <code>yield</code> instead of <code>return</code> runs setup before the <code>yield</code> and cleanup after the test finishes.
+  </p>
+  <p>
+    Fixtures in a file named <code>conftest.py</code> are shared with every test in that folder and the folders below it,
+    without any import. If two fixtures have the same name, the one <b>closest</b> to the test wins: a fixture defined in
+    the test file beats one in <code>tests/api/conftest.py</code>, which beats one in <code>tests/conftest.py</code>.
+    Fixtures can also ask for other fixtures. <code>uv run pytest --fixtures tests/unit/services/agents</code> lists every
+    fixture a folder can see and where it comes from.
+  </p>
+
+  <h4>Test doubles: Mock, MagicMock, AsyncMock</h4>
+  <table class="plain">
+    <tr><th>Tool</th><th>What it does</th></tr>
+    <tr><td><code>Mock()</code></td><td>An object that accepts any attribute or method call and records it. <code>m.get("k")</code> returns another Mock unless you set <code>m.get.return_value</code>.</td></tr>
+    <tr><td><code>return_value</code></td><td>What the call returns.</td></tr>
+    <tr><td><code>side_effect</code></td><td>An exception to raise, or a list of values to return one per call.</td></tr>
+    <tr><td><code>MagicMock()</code></td><td>A Mock that also supports Python's special methods: <code>with</code>, <code>len()</code>, iteration.</td></tr>
+    <tr><td><code>AsyncMock()</code></td><td>A Mock whose calls return something you can <code>await</code>. Use it for any <code>async def</code> you replace.</td></tr>
+    <tr><td><code>assert_called_once()</code>, <code>call_args</code>, <code>assert_not_called()</code></td><td>Check afterwards how the fake was used.</td></tr>
+  </table>
+
+  <h4>patch: replace a name while a test runs</h4>
+  <p>
+    <code>patch("a.b.name")</code> swaps the attribute <code>name</code> in module <code>a.b</code> for a Mock, and puts the
+    original back afterwards. The rule that trips everyone up: <b>patch where the name is looked up, not where it is
+    defined</b>. <code>from x import f</code> copies a reference to <code>f</code> into the importing module at import time.
+    Patching <code>x.f</code> later doesn't change that copy. You'll see this rule cause 13 errors on Day 3.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>pyproject.toml</b> &middot; the reference test configuration</p>
+  <pre><code>[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+env_files = ".env.test"</code></pre>
+  <p>
+    <code>asyncio_mode = "auto"</code> is the same setting you added in Module 0: every <code>async def test_...</code> runs
+    on an event loop without a decorator. <code>env_files</code> belongs to the <code>pytest-dotenv</code> plugin: before tests
+    start, it loads <code>.env.test</code>, which points hosts at <code>localhost</code>. It doesn't set
+    <code>REDIS__HOST</code>, so that value still comes from <code>.env</code> (<code>redis</code>). Keep that in mind for Day 3.
+  </p>
+
+  <p class="file"><b>tests/unit/services/test_telegram.py</b> &middot; patch, done right</p>
+  <pre><code>    @patch("src.services.telegram.factory.get_settings")
+    def test_factory_disabled(self, mock_settings):
+        """Test factory returns None when disabled."""
+        mock_settings.return_value.telegram.enabled = False
+        bot = make_telegram_service(
+            opensearch_client=MagicMock(),
+            embeddings_client=MagicMock(),
+            ollama_client=MagicMock(),
+        )
+        assert bot is None</code></pre>
+  <p>
+    The factory module does <code>from src.config import get_settings</code>, so the name the factory actually calls lives in
+    <code>src.services.telegram.factory</code>. That's the target. Used as a decorator, <code>@patch</code> passes the Mock in
+    as an extra argument. <code>mock_settings.return_value.telegram.enabled = False</code> says "when the factory calls
+    <code>get_settings()</code>, the result's <code>.telegram.enabled</code> is False." Chained attributes on a Mock create
+    child Mocks on demand, so you can configure a deep object in one line.
+  </p>
+
+  <p class="file"><b>src/services/cache/factory.py</b> &middot; what you'll test today</p>
+  <pre><code>def make_cache_client(settings: Settings) -&gt; CacheClient:
+    """Create exact match cache client."""
+    try:
+        redis_client = make_redis_client(settings)
+        cache_client = CacheClient(redis_client, settings.redis)
+        logger.info("Exact match cache client created successfully")
+        return cache_client
+    except Exception as e:
+        logger.error(f"Failed to create cache client: {e}")
+        raise</code></pre>
+  <p>
+    <code>make_redis_client</code> calls <code>client.ping()</code>. If Redis is unreachable, the error is logged and
+    <b>re-raised</b>. <code>src/main.py</code> calls <code>app.state.cache_client = make_cache_client(settings)</code> in the
+    lifespan without a <code>try</code>, so the API refuses to start without Redis. The cache is only "graceful" per request,
+    inside <code>CacheClient</code>:
+  </p>
+  <p class="file"><b>src/services/cache/client.py</b> &middot; <code>find_cached_response</code>, shortened</p>
+  <pre><code>        try:
+            cache_key = self._generate_cache_key(request)
+            ...
+            cached_response = self.redis.get(cache_key)
+            ...
+        except Exception as e:
+            logger.error(f"Error checking cache: {e}")
+            return None</code></pre>
+  <p>Any Redis error becomes a cache miss, and the request carries on to search and the LLM. Both behaviours are worth a test.</p>
+
+  <h3>4. Build</h3>
+  <p>No new dependencies today. Write <code>tests/unit/services/test_cache_client.py</code>. It uses a plain <code>Mock</code> in place of the Redis client, so it runs with Redis stopped.</p>
+  <p>Spec, one test each:</p>
+  <ol>
+    <li>Two <code>AskRequest</code>s that differ only in category order produce the same key, and the key starts with <code>exact_cache:</code>.</li>
+    <li>Changing <code>model</code> changes the key. (Why must it? An answer from the 1B model shouldn't be served to someone who asked for the 3B model.)</li>
+    <li>When <code>redis.get</code> returns a stored response's JSON, <code>find_cached_response</code> returns an equal <code>AskResponse</code>.</li>
+    <li>When <code>redis.get</code> raises <code>redis.ConnectionError</code>, <code>find_cached_response</code> returns <code>None</code>.</li>
+    <li><code>store_response</code> passes <code>ex=timedelta(hours=6)</code> to <code>redis.set</code> when <code>ttl_hours=6</code>.</li>
+    <li><code>make_cache_client</code> raises when <code>make_redis_client</code> fails. Patch <code>make_redis_client</code> where <code>make_cache_client</code> looks it up.</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/test_cache_client.py</b></p>
+  <pre><code>from datetime import timedelta
+from unittest.mock import Mock, patch
+
+import pytest
+import redis
+from src.config import RedisSettings, get_settings
+from src.schemas.api.ask import AskRequest, AskResponse
+from src.services.cache.client import CacheClient
+from src.services.cache.factory import make_cache_client
+
+
+@pytest.fixture
+def fake_redis():
+    return Mock()
+
+
+@pytest.fixture
+def cache(fake_redis):
+    return CacheClient(fake_redis, RedisSettings(ttl_hours=6))
+
+
+@pytest.fixture
+def response():
+    return AskResponse(
+        query="What is RAG?",
+        answer="Retrieval-augmented generation [arXiv:2005.11401].",
+        sources=["https://arxiv.org/pdf/2005.11401.pdf"],
+        chunks_used=1,
+        search_mode="hybrid",
+    )
+
+
+def test_key_ignores_category_order(cache):
+    first = AskRequest(query="What is RAG?", categories=["cs.AI", "cs.LG"])
+    second = AskRequest(query="What is RAG?", categories=["cs.LG", "cs.AI"])
+
+    assert cache._generate_cache_key(first) == cache._generate_cache_key(second)
+    assert cache._generate_cache_key(first).startswith("exact_cache:")
+
+
+def test_key_changes_with_model(cache):
+    small = AskRequest(query="What is RAG?", model="llama3.2:1b")
+    large = AskRequest(query="What is RAG?", model="llama3.2:3b")
+
+    assert cache._generate_cache_key(small) != cache._generate_cache_key(large)
+
+
+async def test_hit_returns_the_stored_response(cache, fake_redis, response):
+    fake_redis.get.return_value = response.model_dump_json()
+
+    assert await cache.find_cached_response(AskRequest(query="What is RAG?")) == response
+
+
+async def test_redis_error_counts_as_a_miss(cache, fake_redis):
+    fake_redis.get.side_effect = redis.ConnectionError("Error 11001 connecting to redis:6379")
+
+    assert await cache.find_cached_response(AskRequest(query="What is RAG?")) is None
+
+
+async def test_store_sets_the_ttl(cache, fake_redis, response):
+    fake_redis.set.return_value = True
+
+    assert await cache.store_response(AskRequest(query="What is RAG?"), response) is True
+    assert fake_redis.set.call_args.kwargs["ex"] == timedelta(hours=6)
+
+
+def test_factory_fails_fast_when_redis_is_down():
+    with patch("src.services.cache.factory.make_redis_client", side_effect=redis.ConnectionError("down")):
+        with pytest.raises(redis.ConnectionError):
+            make_cache_client(get_settings())</code></pre>
+  <p>
+    Testing <code>_generate_cache_key</code> directly touches a "private" method (leading underscore). It's acceptable here
+    because the key rules are the behaviour you care about; the alternative is inspecting what <code>redis.get</code> was
+    called with, which tests the same thing less readably.
+  </p>
+  <details class="hint"><summary>Hint: <code>call_args.kwargs</code></summary>
+    <p><code>fake_redis.set.call_args</code> records the last call. <code>.args</code> is the tuple of positional arguments,
+      <code>.kwargs</code> the dictionary of keyword arguments. The client calls <code>self.redis.set(cache_key, ..., ex=self.ttl)</code>, so <code>ex</code> is a keyword.</p></details>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>docker compose stop
+uv run pytest tests/unit/services/test_cache_client.py -q</code></pre>
+  <p>Expect <code>6 passed</code>, with your Redis container stopped. Start your stack again with <code>docker compose start</code>, then commit:</p>
+  <pre><code>git add -A
+git commit -m "Test the cache client with a fake Redis"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m9-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Change the patch target to <code>"src.services.cache.client.make_redis_client"</code>. You get an
+      <code>AttributeError</code> saying the module does not have that attribute. <code>patch</code> refuses to create names that don't exist, which protects you from typos. Change it back.</li>
+    <li>In <code>test_redis_error_counts_as_a_miss</code>, delete the <code>await</code>. The test fails: you're comparing a
+      coroutine object to <code>None</code>, and pytest warns it was "never awaited".</li>
+    <li>Set <code>fake_redis.get.side_effect = KeyError("bug")</code>. The test still passes. The client's
+      <code>except Exception</code> treats a programming bug exactly like Redis being down. Is that what you want? It keeps
+      answers flowing, but a real bug in the cache code would hide behind a log line. Good interview material.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Testing the API and the agent</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Endpoints and the LangGraph agent are where this project's behaviour lives, and both depend on slow or unreliable
+    things: OpenSearch, Jina, and an LLM that takes minutes on your CPU and doesn't answer the same way twice. You
+    need to test the <em>logic</em> (fall back to BM25 when embedding fails, refuse when grading finds nothing, strip fake
+    citations) without any of those services. There are two ways in: FastAPI's dependency overrides for endpoints, and a
+    scripted fake LLM for the agent.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>app.dependency_overrides</h4>
+  <p>
+    <code>app.dependency_overrides</code> is a dictionary on the FastAPI app. Its keys are dependency functions such as
+    <code>get_opensearch_client</code>; its values are replacement functions. When an endpoint declares
+    <code>opensearch_client: OpenSearchDep</code>, FastAPI checks the dictionary first and calls your replacement instead.
+    The endpoint code doesn't change. You must clear the dictionary after the test, or the override leaks into the next test.
+  </p>
+  <h4>TestClient, with and without <code>with</code></h4>
+  <p>
+    <code>TestClient(app)</code> sends requests straight into the app in-process, with no server and no port. Created plainly,
+    it does <b>not</b> run the lifespan, so no startup code connects to anything. Created as <code>with TestClient(app) as c:</code>,
+    it runs startup and shutdown. For dependency-override tests you want the first form.
+  </p>
+  <h4>A scripted LLM</h4>
+  <p>
+    Every node gets its model through <code>runtime.context.ollama_client.get_langchain_model(...)</code>, sometimes followed by
+    <code>.with_structured_output(SomeModel)</code>, then calls <code>await ...ainvoke(prompt)</code>. If <code>ollama_client</code>
+    is a Mock, you can decide what each <code>ainvoke</code> returns, in order. The test then reads like a script:
+    "the guardrail says 90, the grader says yes then no, the model writes this draft, the checker says grounded."
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>tests/api/routers/test_agentic_ask.py</b> &middot; dependency overrides</p>
+  <pre><code>@pytest.fixture
+def client(mock_agentic_rag_service):
+    """FastAPI test client with mocked dependencies."""
+    # Override the dependency to return our mock service
+    def override_get_agentic_rag_service():
+        return mock_agentic_rag_service
+
+    app.dependency_overrides[dependencies.get_agentic_rag_service] = override_get_agentic_rag_service
+
+    yield TestClient(app)
+
+    # Clean up after test
+    app.dependency_overrides.clear()</code></pre>
+  <p>
+    This fixture is also called <code>client</code>, like the one in <code>tests/api/conftest.py</code>. The one in the test file
+    is closer, so it wins. <code>TestClient(app)</code> isn't used with <code>with</code>, so the lifespan never runs. That's why these 11
+    tests passed on your laptop while their 13 neighbours errored. The fixture's <code>mock_agentic_rag_service</code> is a
+    <code>Mock(spec=AgenticRAGService)</code>: <code>spec</code> makes the Mock reject attributes the real class doesn't have,
+    so a typo like <code>service.aks</code> fails instead of silently returning another Mock.
+  </p>
+
+  <p class="file"><b>tests/unit/services/agents/conftest.py</b> &middot; the <code>llm_returns</code> fixture you wrote in Module 8</p>
+  <table class="walk">
+    <tr><td><pre><code>@pytest.fixture
+def mock_ollama_client():
+    return Mock()</code></pre></td>
+      <td>A bare Mock stands in for <code>OllamaClient</code>. <code>test_context</code> puts this same object into the agent's <code>Context</code>.</td></tr>
+    <tr><td><pre><code>@pytest.fixture
+def llm_returns(mock_ollama_client):</code></pre></td>
+      <td>A fixture that depends on another fixture, so it gets the <b>same</b> Mock the context holds, not a new one.</td></tr>
+    <tr><td><pre><code>    def _configure(*responses):</code></pre></td>
+      <td>The fixture returns a function, not a value. The test calls it with the responses it wants. This "factory fixture" pattern lets each test choose its own script.</td></tr>
+    <tr><td><pre><code>        llm = mock_ollama_client.get_langchain_model.return_value</code></pre></td>
+      <td>Whatever <code>get_langchain_model(...)</code> returns, with any arguments. Every node gets this same object.</td></tr>
+    <tr><td><pre><code>        invoke = AsyncMock(side_effect=list(responses))</code></pre></td>
+      <td>One awaitable fake. Each call returns the next item in the list. If an item is an exception instance, it is <b>raised</b> instead, which is how tests simulate a failing model.</td></tr>
+    <tr><td><pre><code>        llm.ainvoke = invoke
+        llm.with_structured_output.return_value.ainvoke = invoke</code></pre></td>
+      <td>Plain calls (<code>generate_answer</code>) and structured calls (guardrail, grading, verification) share one queue. So the order of responses must match the order the graph calls the model.</td></tr>
+    <tr><td><pre><code>        return invoke
+
+    return _configure</code></pre></td>
+      <td>Returning <code>invoke</code> lets the test check <code>invoke.call_count</code> or <code>invoke.assert_not_called()</code>: "the author check refused without asking the LLM" is provable.</td></tr>
+  </table>
+  <div class="callout story">
+    <b>What happened here: 22 tests that never ran</b>
+    The course shipped agent tests that asked for <code>test_context</code>, <code>mock_opensearch_client</code>, and friends,
+    but no <code>conftest.py</code> defined them. Every one of those tests errored at setup with <code>fixture '...' not found</code>,
+    so 22 tests had never checked anything. Nobody noticed because a wall of errors in a suite that "always has some errors"
+    looks normal. The fix was the conftest you wrote in Module 8. Lesson: an error is not a skip. Read the summary line.
+  </div>
+
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> &middot; a test that passes for the wrong reason</p>
+  <pre><code>    @pytest.mark.asyncio
+    async def test_rewrite_query_success(self, test_context, sample_human_message):
+        """Test query rewriting with LLM."""
+        mock_llm = Mock()
+        mock_llm.ainvoke = AsyncMock(return_value=Mock(
+            content="What are the key concepts in transformer neural network architectures?"
+        ))
+        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        ...
+        assert "rewritten_query" in result</code></pre>
+  <p>
+    The node never calls <code>create_llm</code>; it calls <code>get_langchain_model(...).with_structured_output(...)</code>. That
+    returns an ordinary Mock, and awaiting an ordinary Mock raises. The node catches the error and falls back to keyword
+    expansion. Run it with logging on and you'll see the truth:
+  </p>
+  <pre><code>uv run pytest "tests/unit/services/agents/test_nodes.py::TestRewriteQueryNode" -o log_cli=true --log-cli-level=WARNING</code></pre>
+  <pre><code>ERROR    ...rewrite_query_node.py:106 Failed to rewrite query using LLM: object Mock can't be used in 'await' expression
+WARNING  ...rewrite_query_node.py:107 Falling back to simple keyword expansion
+PASSED</code></pre>
+  <p>
+    The test is green, and it tests the fallback, not the LLM path its name promises. Its assertions are too weak to notice.
+    (If your version of this test uses <code>llm_returns</code>, yours is fine; check.)
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Part A: endpoint tests with dependency overrides</h4>
+  <p>Write <code>tests/api/routers/test_hybrid_search_overrides.py</code>. Spec:</p>
+  <ul>
+    <li>Fixtures <code>opensearch</code> (a Mock: <code>health_check</code> returns True, <code>search_unified</code> returns one hit) and <code>embeddings</code> (a Mock whose <code>embed_query</code> is an <code>AsyncMock</code> returning 1024 floats).</li>
+    <li>A local <code>client</code> fixture that overrides <code>get_opensearch_client</code> and <code>get_embeddings_service</code>, yields a plain <code>TestClient(app)</code>, then clears the overrides.</li>
+    <li>Four tests: hybrid mode passes the embedding to <code>search_unified</code>; an embedding failure falls back to BM25 with <code>query_embedding=None</code>; OpenSearch unhealthy gives 503 and no search; an invalid body gives 422 before OpenSearch is touched.</li>
+  </ul>
+  <p class="file"><b>tests/api/routers/test_hybrid_search_overrides.py</b></p>
+  <pre><code>from unittest.mock import AsyncMock, Mock
+
+import pytest
+from fastapi.testclient import TestClient
+from src.dependencies import get_embeddings_service, get_opensearch_client
+from src.main import app
+
+HIT = {"arxiv_id": "1706.03762", "title": "Attention Is All You Need", "chunk_text": "Self-attention...", "score": 0.016}
+
+
+@pytest.fixture
+def opensearch():
+    client = Mock()
+    client.health_check.return_value = True
+    client.search_unified.return_value = {"hits": [HIT], "total": 1}
+    return client
+
+
+@pytest.fixture
+def embeddings():
+    service = Mock()
+    service.embed_query = AsyncMock(return_value=[0.1] * 1024)
+    return service
+
+
+@pytest.fixture
+def client(opensearch, embeddings):
+    app.dependency_overrides[get_opensearch_client] = lambda: opensearch
+    app.dependency_overrides[get_embeddings_service] = lambda: embeddings
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_hybrid_search_sends_the_query_embedding(client, opensearch):
+    response = client.post("/api/v1/hybrid-search/", json={"query": "attention", "size": 1})
+
+    assert response.status_code == 200
+    assert response.json()["search_mode"] == "hybrid"
+    assert response.json()["hits"][0]["arxiv_id"] == "1706.03762"
+    assert opensearch.search_unified.call_args.kwargs["query_embedding"] == [0.1] * 1024
+
+
+def test_embedding_failure_falls_back_to_bm25(client, opensearch, embeddings):
+    embeddings.embed_query.side_effect = RuntimeError("Jina unreachable")
+
+    response = client.post("/api/v1/hybrid-search/", json={"query": "attention"})
+
+    assert response.status_code == 200
+    assert response.json()["search_mode"] == "bm25"
+    assert opensearch.search_unified.call_args.kwargs["query_embedding"] is None
+
+
+def test_opensearch_down_returns_503(client, opensearch):
+    opensearch.health_check.return_value = False
+
+    response = client.post("/api/v1/hybrid-search/", json={"query": "attention"})
+
+    assert response.status_code == 503
+    opensearch.search_unified.assert_not_called()
+
+
+def test_invalid_request_never_reaches_opensearch(client, opensearch):
+    response = client.post("/api/v1/hybrid-search/", json={"query": "attention", "size": 0})
+
+    assert response.status_code == 422
+    opensearch.health_check.assert_not_called()</code></pre>
+  <p>
+    <code>lambda: opensearch</code> is a tiny function with no parameters that returns the fixture's Mock. FastAPI calls it
+    in place of <code>get_opensearch_client(request)</code>. The <code>HIT</code> dictionary only needs the fields the router reads
+    with <code>.get(...)</code>; missing ones become <code>None</code>.
+  </p>
+
+  <h4>Part B: the whole agent graph with a scripted LLM</h4>
+  <p>
+    Your Module 8 node tests check one node at a time. Now test the compiled graph: the real <code>AgenticRAGService</code>,
+    real edges, real routing, with only the LLM, OpenSearch, and Jina faked by the fixtures in your agents
+    <code>conftest.py</code>. Write <code>tests/unit/services/agents/test_graph_flow.py</code> with three tests:
+  </p>
+  <ol>
+    <li>Guardrail score 10: the answer is the out-of-scope message, the LLM was called once, OpenSearch was never searched, <code>sources</code> is empty.</li>
+    <li>The happy path, with exactly five LLM responses in graph order: guardrail 90, grade "yes", grade "no", a draft citing a real and a fake ID, groundedness "yes". Check the fake citation was removed, only the relevant paper is a source, and <code>chunks_used</code> is 1.</li>
+    <li>A draft citing "Rasmussen et al.": only four LLM calls happen, because the deterministic author check withholds the answer before the groundedness LLM is asked.</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/agents/test_graph_flow.py</b></p>
+  <pre><code>from unittest.mock import Mock
+
+import pytest
+from src.services.agents.agentic_rag import AgenticRAGService
+from src.services.agents.config import GraphConfig
+from src.services.agents.models import GradeDocuments, GroundednessCheck, GuardrailScoring
+from src.services.agents.nodes.verify_answer_node import UNVERIFIED_ANSWER
+
+
+@pytest.fixture
+def service(mock_opensearch_client, mock_ollama_client, mock_jina_embeddings_client):
+    return AgenticRAGService(
+        opensearch_client=mock_opensearch_client,
+        ollama_client=mock_ollama_client,
+        embeddings_client=mock_jina_embeddings_client,
+        graph_config=GraphConfig(top_k=2),
+    )
+
+
+async def test_out_of_scope_question_stops_after_the_guardrail(service, llm_returns, mock_opensearch_client):
+    invoke = llm_returns(GuardrailScoring(score=10, reason="Cooking, not research"))
+
+    result = await service.ask(query="How do I bake sourdough bread?")
+
+    assert "I can only help with questions about academic research papers" in result["answer"]
+    assert invoke.call_count == 1
+    mock_opensearch_client.search_unified.assert_not_called()
+    assert result["sources"] == []
+
+
+async def test_in_scope_question_runs_every_step(service, llm_returns):
+    invoke = llm_returns(
+        GuardrailScoring(score=90, reason="Research question"),
+        GradeDocuments(binary_score="yes"),
+        GradeDocuments(binary_score="no"),
+        Mock(content="Transformers use self-attention [arXiv:1706.03762] [arXiv:2301.00001]."),
+        GroundednessCheck(binary_score="yes"),
+    )
+
+    result = await service.ask(query="What are transformers?")
+
+    assert invoke.call_count == 5
+    assert result["answer"] == "Transformers use self-attention [arXiv:1706.03762]."
+    assert result["removed_citations"] == ["2301.00001"]
+    assert result["sources"] == ["https://arxiv.org/pdf/1706.03762.pdf"]
+    assert result["chunks_used"] == 1
+    assert result["answer_grounded"] is True
+
+
+async def test_invented_author_is_withheld_without_asking_the_llm(service, llm_returns):
+    invoke = llm_returns(
+        GuardrailScoring(score=90, reason="Research question"),
+        GradeDocuments(binary_score="yes"),
+        GradeDocuments(binary_score="yes"),
+        Mock(content="Vaswani et al. introduced transformers; Rasmussen et al. extended them."),
+    )
+
+    result = await service.ask(query="Who introduced transformers?")
+
+    assert invoke.call_count == 4
+    assert result["answer_grounded"] is False
+    assert result["answer"].startswith(UNVERIFIED_ANSWER)
+    assert "Rasmussen" not in result["answer"]</code></pre>
+  <details class="hint"><summary>Hint: why does grading consume "yes" then "no" in that order?</summary>
+    <p>The grading node starts one coroutine per document with <code>asyncio.gather</code>. They start in list order, and each
+      calls <code>ainvoke</code> before its first real wait, so the first document takes the first queued response. The fake search
+      returns 1706.03762 (Vaswani) first, then 1810.04805 (Devlin).</p></details>
+  <details class="hint"><summary>Hint: why a <code>Mock(content=...)</code> for the draft?</summary>
+    <p><code>generate_answer</code> reads <code>response.content</code>. A Mock with a <code>content</code> attribute is the smallest thing that looks like an <code>AIMessage</code>.</p></details>
+  <div class="callout warn">
+    <b>If you built the optional on-demand ingestion</b>
+    None of these tests reach the "max retrieval attempts" branch, so they don't depend on it. That branch is where the
+    reference repo's one failing unit test lives: another session changed the node's message and didn't update its test.
+  </div>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/api/routers/test_hybrid_search_overrides.py tests/unit/services/agents/test_graph_flow.py -q</code></pre>
+  <p>Expect <code>7 passed</code> in a few seconds, with no LLM running. Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m9-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Swap the two <code>GradeDocuments</code> responses in the happy-path test. The source becomes BERT's paper,
+      and the kept citation to 1706.03762 is now "not retrieved", so it's stripped too. Read the assertion diff: the
+      fake LLM's script is part of the test's meaning.</li>
+    <li>Rename your agents <code>conftest.py</code> to <code>conftest.bak</code> and run <code>uv run pytest tests/unit/services/agents -q</code>.
+      Every test that asks for its fixtures errors with <code>fixture 'mock_opensearch_client' not found</code>. With the reference's
+      agent tests plus today's three, that was <code>37 errors</code>. That's the 22-tests incident, reproduced. Rename it back.</li>
+    <li>Delete <code>app.dependency_overrides.clear()</code> and run the whole <code>tests/api</code> folder. Tests after this file may
+      now get your fake OpenSearch instead of theirs. Leaking state between tests causes failures that depend on test order, which are
+      miserable to debug.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>Hermetic tests, coverage, ruff, and CI</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    <b>Continuous integration</b> (CI) means a server runs your checks on every push, so nobody merges broken code. A CI
+    server has no Docker network named <code>redis</code>, no Ollama, and no <code>.env</code>. Before CI can help, your suite
+    must be hermetic. Today you fix the reference's 13 host-only errors in your own project, measure how much code your tests
+    exercise, and automate lint and tests on GitHub.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Coverage</td><td>Which lines of <code>src</code> ran during the tests. <code>pytest-cov</code> measures it. High coverage doesn't prove the tests check anything (the rewrite-query test covers the fallback and asserts almost nothing), but low coverage proves code is untested.</td></tr>
+    <tr><td>Linter</td><td>A tool that flags suspicious or inconsistent code without running it. <code>ruff check</code>.</td></tr>
+    <tr><td>Formatter</td><td>A tool that rewrites layout (spacing, line breaks, quotes) to one style, so diffs show real changes only. <code>ruff format</code>.</td></tr>
+    <tr><td>Marker</td><td>A label on a test, like <code>@pytest.mark.integration</code>. <code>pytest -m "not integration"</code> runs everything else.</td></tr>
+    <tr><td>GitHub Actions</td><td>GitHub's CI. A YAML file in <code>.github/workflows/</code> lists <b>jobs</b>; each job runs <b>steps</b> on a fresh virtual machine.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>tests/api/conftest.py</b> &middot; the reference fixture behind the 13 errors</p>
+  <pre><code>@pytest.fixture
+async def client():
+    """HTTP client for API testing with mocked services."""
+    # Mock database startup and session to prevent real connections
+    with (
+        patch("src.db.interfaces.postgresql.PostgreSQLDatabase.startup") as mock_startup,
+        patch("src.db.interfaces.postgresql.PostgreSQLDatabase.get_session") as mock_get_session,
+        patch("src.services.opensearch.factory.make_opensearch_client") as mock_os,
+        patch("src.services.arxiv.factory.make_arxiv_client") as mock_arxiv,
+        patch("src.services.pdf_parser.factory.make_pdf_parser_service") as mock_pdf,
+        patch("src.services.ollama.client.OllamaClient") as mock_ollama,
+        patch("src.repositories.paper.PaperRepository.get_by_arxiv_id") as mock_get_by_id,
+    ):
+        ...
+        async with LifespanManager(app) as manager:
+            async with AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as client:
+                yield client</code></pre>
+  <p>Block by block:</p>
+  <ul>
+    <li><code>LifespanManager(app)</code> (from <code>asgi-lifespan</code>) runs the app's lifespan startup, and shutdown at the end. <code>ASGITransport</code> sends httpx requests straight into the app, in-process. Together they give an async client for the real app with its real startup.</li>
+    <li>The two <code>PostgreSQLDatabase</code> patches replace methods on the <b>class</b>. Every instance sees the change, so these work.</li>
+    <li>The OpenSearch, arXiv, and PDF parser patches replace names in the <b>factory</b> modules. But <code>src/main.py</code> did
+      <code>from src.services.opensearch.factory import make_opensearch_client</code> at import time and holds its own reference.
+      I checked: with the factory patched, <code>src.main.make_opensearch_client</code> is still the real function; patching
+      <code>src.main.make_opensearch_client</code> replaces it. The same applies to <code>OllamaClient</code>, which the Ollama factory imported by name.</li>
+    <li>Nothing patches <code>make_cache_client</code> at all. The lifespan calls it, it pings <code>redis:6379</code>, the name
+      <code>redis</code> doesn't exist on your laptop, and setup fails with <code>Error 11001 connecting to redis:6379. getaddrinfo failed</code>.
+      That's every test using this fixture: 6 in <code>test_ask.py</code>, 6 in <code>test_hybrid_search.py</code>, 1 in <code>test_ping.py</code>. Thirteen.</li>
+  </ul>
+  <div class="callout story">
+    <b>What happened here: 13 tests that needed the Docker network</b>
+    The errors looked like a Redis problem, and "start Redis" wouldn't have fixed them, because the hostname only exists inside
+    Docker. The real cause was a fixture that patched the wrong names, and a lifespan with no fallback when Redis is missing.
+    Inside the API container they happened to pass, against real services, which is why nobody noticed.
+  </div>
+  <p>
+    One more thing hides in those tests. <code>test_ask.py</code> asserts <code>response.status_code in [200, 500, 503]</code>.
+    A test that accepts "success, crash, or unavailable" can only fail on validation errors. When you write assertions,
+    ask: what bug would make this fail?
+  </p>
+
+  <p class="file"><b>pyproject.toml</b> &middot; the reference lint and type-check config</p>
+  <pre><code>[tool.ruff]
+line-length = 130
+exclude = ["notebooks/**", ".venv/**"]
+src = ["src", "tests"]
+lint.select = [
+  "I",
+]
+
+[tool.mypy]
+explicit_package_bases = true
+ignore_errors = true</code></pre>
+  <p>
+    <code>lint.select = ["I"]</code> turns on only the import-sorting rules (<code>I001</code>), nothing else. And
+    <code>ignore_errors = true</code> tells mypy to report no errors, so <code>mypy src/</code> can't fail. So the
+    reference's "lint and type check" really means "sort imports". That's honest to say in an interview, along with what you'd turn on next
+    (for example <code>E</code>, <code>F</code>, and <code>B</code> rules in ruff, and mypy without <code>ignore_errors</code>, one module at a time).
+  </p>
+  <p>Here is what those tools say about the reference repo today (read-only runs, no <code>--fix</code>):</p>
+  <pre><code>uv run ruff check
+...
+Found 8 errors.
+[*] 8 fixable with the `--fix` option.
+
+uv run ruff format --check
+...
+15 files would be reformatted, 112 files already formatted</code></pre>
+  <p>
+    All 8 check errors are <code>I001 Import block is un-sorted or un-formatted</code>, in files like <code>src/dependencies.py</code>
+    and <code>tests/api/routers/test_agentic_ask.py</code>. The <code>Makefile</code> runs <code>uv run ruff check --fix</code> and
+    <code>uv run mypy src/</code> for <code>make lint</code>, and <code>.pre-commit-config.yaml</code> runs ruff and mypy as git hooks.
+    But nothing forces anyone to run them, and the pre-commit file pins ruff <code>v0.11.5</code> while the project's
+    environment has <code>ruff 0.13.0</code>. CI is how you make the checks non-optional.
+  </p>
+  <div class="callout info">
+    <b>Why the reference puts <code>from src...</code> next to third-party imports</b>
+    <code>src = ["src", "tests"]</code> tells ruff where first-party code lives. With that setting, the top-level package named
+    <code>src</code> isn't recognised as first-party, so ruff sorts <code>from src.config import ...</code> in the same block as
+    <code>from fastapi import ...</code>. Use the same config as the reference so your imports sort the same way as the files
+    you've been diffing against.
+  </div>
+
+  <h3>4. Build</h3>
+  <pre><code>uv add --dev asgi-lifespan pytest-cov ruff</code></pre>
+  <p>(Skip any you already have from earlier modules.)</p>
+
+  <h4>Part A: a hermetic API fixture</h4>
+  <p>Replace the <code>client</code> fixture in your <code>tests/api/conftest.py</code>. Spec:</p>
+  <ul>
+    <li>A <code>fakes</code> fixture returning a <code>SimpleNamespace</code> (an object you can put named attributes on) with one fake per service:
+      <code>database</code> (MagicMock, because the health check uses it in a <code>with</code>), <code>opensearch</code> (healthy, no hits),
+      <code>embeddings</code> (async <code>embed_query</code>), <code>ollama</code>, <code>cache</code> (async methods, always a miss),
+      <code>langfuse</code> (MagicMock, because the tracer is used in <code>with</code> blocks).</li>
+    <li>A <code>client</code> fixture that patches <b>every</b> <code>make_*</code> factory in <code>src.main</code> to return those fakes
+      (the Telegram factory returns <code>None</code>), runs the real lifespan with <code>LifespanManager</code>, and yields an
+      <code>AsyncClient</code>. Tests can ask for both <code>client</code> and <code>fakes</code> and get the same fake objects.</li>
+  </ul>
+  <p class="file"><b>tests/api/conftest.py</b></p>
+  <pre><code>from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+from asgi_lifespan import LifespanManager
+from httpx import ASGITransport, AsyncClient
+from src.main import app
+
+
+@pytest.fixture
+def fakes():
+    """One stand-in per external service the lifespan would connect to."""
+    opensearch = Mock()
+    opensearch.health_check.return_value = True
+    opensearch.setup_indices.return_value = {"hybrid_index": False, "rrf_pipeline": False}
+    opensearch.get_index_stats.return_value = {"index_name": "arxiv-papers-chunks", "document_count": 0}
+    opensearch.search_unified.return_value = {"hits": [], "total": 0}
+
+    embeddings = Mock()
+    embeddings.embed_query = AsyncMock(return_value=[0.1] * 1024)
+
+    cache = Mock()
+    cache.find_cached_response = AsyncMock(return_value=None)
+    cache.store_response = AsyncMock(return_value=True)
+
+    return SimpleNamespace(
+        database=MagicMock(),
+        opensearch=opensearch,
+        embeddings=embeddings,
+        ollama=Mock(),
+        cache=cache,
+        langfuse=MagicMock(),
+    )
+
+
+@pytest.fixture
+async def client(fakes):
+    """The real app and lifespan, with every factory replaced where src.main looks it up."""
+    with (
+        patch("src.main.make_database", return_value=fakes.database),
+        patch("src.main.make_opensearch_client", return_value=fakes.opensearch),
+        patch("src.main.make_embeddings_service", return_value=fakes.embeddings),
+        patch("src.main.make_ollama_client", return_value=fakes.ollama),
+        patch("src.main.make_cache_client", return_value=fakes.cache),
+        patch("src.main.make_langfuse_tracer", return_value=fakes.langfuse),
+        patch("src.main.make_arxiv_client"),
+        patch("src.main.make_pdf_parser_service"),
+        patch("src.main.make_telegram_service", return_value=None),
+    ):
+        async with LifespanManager(app) as manager:
+            async with AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as http:
+                yield http</code></pre>
+  <p>
+    If your <code>src/main.py</code> doesn't have one of these factories (for example you skipped Telegram), drop that line.
+    <code>patch</code> fails loudly on names that don't exist, which is what you want.
+  </p>
+  <p>Then write two tests that use the fakes to check <code>/ask</code> end to end inside the process:</p>
+  <p class="file"><b>tests/api/routers/test_ask_offline.py</b></p>
+  <pre><code>from unittest.mock import AsyncMock
+
+from src.schemas.api.ask import AskResponse
+
+HIT = {"arxiv_id": "1706.03762", "title": "Attention Is All You Need", "chunk_text": "Self-attention...", "score": 0.9}
+
+
+async def test_ask_removes_citations_to_papers_it_did_not_retrieve(client, fakes):
+    fakes.opensearch.search_unified.return_value = {"hits": [HIT], "total": 1}
+    fakes.ollama.generate_rag_answer = AsyncMock(
+        return_value={"answer": "Transformers use self-attention [arXiv:1706.03762] [arXiv:2301.00001]."}
+    )
+
+    response = await client.post("/api/v1/ask", json={"query": "What are transformers?"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"] == "Transformers use self-attention [arXiv:1706.03762]."
+    assert data["removed_citations"] == ["2301.00001"]
+    assert data["sources"] == ["https://arxiv.org/pdf/1706.03762.pdf"]
+    fakes.cache.store_response.assert_awaited_once()
+
+
+async def test_cached_answer_skips_search_and_generation(client, fakes):
+    fakes.cache.find_cached_response.return_value = AskResponse(
+        query="What are transformers?", answer="From the cache", sources=[], chunks_used=0, search_mode="hybrid"
+    )
+    fakes.ollama.generate_rag_answer = AsyncMock()
+
+    response = await client.post("/api/v1/ask", json={"query": "What are transformers?"})
+
+    assert response.json()["answer"] == "From the cache"
+    fakes.opensearch.search_unified.assert_not_called()
+    fakes.ollama.generate_rag_answer.assert_not_called()</code></pre>
+
+  <h4>Part B: mark the tests that need real services</h4>
+  <p>Register a marker in <code>pyproject.toml</code>:</p>
+  <p class="file"><b>pyproject.toml</b> (add to your existing section)</p>
+  <pre><code>[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+markers = [
+    "integration: needs a running service or the internet; CI skips these",
+]</code></pre>
+  <p>
+    Then find the tests that need services. Stop everything (<code>docker compose stop</code> in your project <b>and</b> in the
+    reference folder) and run <code>uv run pytest -q</code>. Every failure or error is a test that needs a service. For each one,
+    either make it hermetic with a fake, or mark it. From Module 0, three are genuinely integration tests:
+    <code>test_fetch_health_from_reference_api</code>, <code>test_search_papers_against_reference_api</code>, and
+    <code>test_cache_round_trip</code>. Put <code>@pytest.mark.integration</code> above each. For a whole file, put
+    <code>pytestmark = pytest.mark.integration</code> near the top (after the imports).
+  </p>
+  <div class="callout story">
+    <b>The one integration test that failed on your host</b>
+    The reference's <code>tests/integration/test_services.py::test_arxiv_client_basic</code> failed this week with
+    <code>[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate</code>. It really calls
+    arXiv, and on the host, Python doesn't trust your office proxy's re-signed certificate (the containers do, thanks to the CA
+    fix in the Dockerfiles). That's exactly the kind of test to mark and keep out of CI.
+  </div>
+
+  <h4>Part C: lint and format</h4>
+  <p>Copy the reference's <code>[tool.ruff]</code> section (shown above) into your <code>pyproject.toml</code>. Then, <b>in your own project only</b>:</p>
+  <pre><code>uv run ruff check
+uv run ruff check --fix
+uv run ruff format
+git diff --stat</code></pre>
+  <p>
+    <code>--fix</code> rewrites your import blocks; <code>format</code> rewrites layout. Look at the diff before committing so you
+    know what changed. Never run either with fixing enabled in the reference repo.
+  </p>
+
+  <h4>Part D: a GitHub Actions workflow</h4>
+  <p>Create <code>.github/workflows/ci.yml</code>:</p>
+  <p class="file"><b>.github/workflows/ci.yml</b></p>
+  <pre><code>name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Check formatting
+        run: uv run ruff format --check
+
+      - name: Test
+        run: uv run pytest -m "not integration" --cov=src --cov-report=term-missing</code></pre>
+  <table class="walk">
+    <tr><td><pre><code>on:
+  push:
+    branches: [main]
+  pull_request:</code></pre></td>
+      <td>When to run: every push to <code>main</code>, and every pull request.</td></tr>
+    <tr><td><pre><code>    runs-on: ubuntu-latest</code></pre></td>
+      <td>A fresh Linux virtual machine per run. Nothing from your laptop exists there: no Docker stack, no <code>.env</code>, no proxy.</td></tr>
+    <tr><td><pre><code>      - uses: actions/checkout@v4</code></pre></td>
+      <td><code>uses</code> runs a published action. This one clones your repo into the machine.</td></tr>
+    <tr><td><pre><code>      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true</code></pre></td>
+      <td>Installs uv and caches downloaded packages between runs. uv reads <code>.python-version</code> and installs Python 3.12 itself.</td></tr>
+    <tr><td><pre><code>        run: uv sync --locked</code></pre></td>
+      <td>Installs exactly what <code>uv.lock</code> says, and fails if the lock file is out of date with <code>pyproject.toml</code>. The first run is slow: docling pulls in torch, a very large download.</td></tr>
+    <tr><td><pre><code>        run: uv run pytest -m "not integration" --cov=src --cov-report=term-missing</code></pre></td>
+      <td>Everything except marked tests, with a coverage table. Settings fall back to their defaults because there's no <code>.env</code>; every field in <code>Settings</code> has a default, so that works.</td></tr>
+  </table>
+
+  <h3>5. Checkpoint</h3>
+  <p>With both Docker stacks stopped:</p>
+  <pre><code>uv run pytest tests/api -q
+uv run pytest -m "not integration" --cov=src --cov-report=term-missing
+uv run ruff check
+uv run ruff format --check
+uv run python -c "import yaml, pathlib; print(list(yaml.safe_load(pathlib.Path('.github/workflows/ci.yml').read_text())['jobs']))"</code></pre>
+  <p>Expected:</p>
+  <ul>
+    <li><code>tests/api</code>: all pass, and no <code>getaddrinfo failed</code> anywhere. Against the reference's API tests plus today's files, that was <code>30 passed</code> in about 17 seconds.
+      Your count depends on how many API tests you wrote in earlier modules.</li>
+    <li>The full run: all pass, with a coverage table ending in a <code>TOTAL</code> line. Write your percentage down; it goes in your README.</li>
+    <li><code>All checks passed!</code> from ruff check, and no "would reformat" lines from the format check.</li>
+    <li>The last command prints <code>['test']</code>. That only proves the file is valid YAML with a <code>test</code> job; GitHub Actions can't run on your laptop. The real check is on Day 4, when you push and watch the run.</li>
+  </ul>
+  <p>Commit everything, then start your stack again.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m9-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In your conftest, change <code>patch("src.main.make_cache_client", ...)</code> to
+      <code>patch("src.services.cache.factory.make_cache_client", ...)</code>. The 13-style errors come straight back:
+      <code>Error 11001 connecting to redis:6379</code>. Now you have seen "patch where it's looked up" fail for real.</li>
+    <li>Run <code>uv run pytest tests/api/routers/test_ping.py -q --durations=3</code>. On this laptop it took about 12 seconds.
+      The health endpoint builds <code>OllamaClient(settings)</code> inside the function instead of receiving it as a dependency,
+      so no patch or override reaches it and it waits on a hostname that doesn't resolve. Objects created inside a function can't be replaced in tests; that's the practical argument for dependency injection.</li>
+    <li>Add an unused <code>import os</code> to a test file and run <code>uv run ruff check</code>. Nothing is reported, because only
+      <code>I</code> rules are on. Add <code>"F"</code> to <code>lint.select</code> and run again: <code>F401</code>, unused import. Decide whether to keep it on.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>System design, debugging stories, and your README</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A system-design interview is a conversation about a whiteboard. You'll be asked to draw what you built, follow one
+    request through it, and then defend choices: "why not X?", "what breaks at 100 users?". A behavioural interview asks
+    for stories: "tell me about a hard bug". You have the raw material for both. Today you shape it.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Draw it from memory</h4>
+  <p>Practise until you can draw this in two minutes, with ports, on paper:</p>
+  <div class="flow">
+    <span class="node"><b>Gradio</b> / Telegram / curl</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>FastAPI</b> api:8000</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Redis</b> cache</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Jina</b> query embedding (hosted)</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>OpenSearch</b> BM25 + kNN, RRF</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Ollama</b> llama3.2:1b</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Langfuse</b> traces</span>
+  </div>
+  <div class="flow">
+    <span class="node"><b>Airflow</b> weekday schedule</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>arXiv</b> API</span><span class="arrow">&rarr;</span>
+    <span class="node">Docling PDF parse</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>PostgreSQL</b> papers</span><span class="arrow">&rarr;</span>
+    <span class="node">Chunk 600/100 words, embed with Jina, index in OpenSearch</span>
+  </div>
+  <p>
+    Two paths share one store: the <b>offline</b> ingestion path writes to OpenSearch on a schedule; the <b>online</b> query path
+    only reads from it. Say that sentence out loud; it answers half the scaling questions before they're asked.
+  </p>
+
+  <h4>STAR stories</h4>
+  <p>
+    <b>STAR</b> is a structure for behavioural answers: <b>Situation</b> (one sentence of context), <b>Task</b> (what you had
+    to achieve), <b>Action</b> (what <em>you</em> did, specifically, including how you found the cause), <b>Result</b> (what
+    changed, with a number if you have one, and what you'd do differently). Aim for about 90 seconds per story.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <h4>One request, end to end: <code>POST /api/v1/ask-agentic</code></h4>
+  <ol>
+    <li>FastAPI parses the body into <code>AskRequest</code> (422 on bad input) and resolves <code>AgenticRAGDep</code>:</li>
+  </ol>
+  <p class="file"><b>src/dependencies.py</b></p>
+  <pre><code>def get_agentic_rag_service(
+    opensearch: OpenSearchDep,
+    ollama: OllamaDep,
+    embeddings: EmbeddingsDep,
+    langfuse: LangfuseDep,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -&gt; AgenticRAGService:
+    """Get agentic RAG service."""
+    return make_agentic_rag_service(
+        opensearch_client=opensearch,
+        ...
+        model=settings.ollama_model,
+    )</code></pre>
+  <p>
+    Notice this runs <b>per request</b>: every call builds a new <code>AgenticRAGService</code>, which compiles the LangGraph graph
+    in its constructor. The clients come from <code>app.state</code> (created once in the lifespan) so that part is cheap, but the
+    compile is repeated. A good "what would you change?" answer: build the service once in the lifespan and store it on <code>app.state</code>.
+  </p>
+  <ol start="2">
+    <li><code>ask()</code> rejects an empty query, opens a Langfuse trace if tracing is on, and runs the graph with a fresh
+      <code>Context</code> holding the clients and the requested model.</li>
+    <li><b>guardrail</b>: one LLM call with <code>GuardrailScoring</code>. Below 60 &rarr; <b>out_of_scope</b> &rarr; end.</li>
+    <li><b>retrieve</b> writes an <code>AIMessage</code> with a tool call; <code>tools_condition</code> routes to <b>tool_retrieve</b>, which runs
+      <code>retrieve_papers</code>: Jina <code>embed_query</code>, then OpenSearch <code>search_unified</code> (hybrid, RRF), returning text for the
+      LLM and <code>Document</code>s as the artifact.</li>
+    <li><b>grade_documents</b>: one LLM call per chunk, concurrently with <code>asyncio.gather</code>; failures exclude the chunk. None relevant
+      &rarr; <b>rewrite_query</b> &rarr; retrieve again, up to 2 attempts.</li>
+    <li><b>generate_answer</b> from the relevant chunks only; <b>verify_answer</b> strips unretrieved citations, rejects unknown
+      "Surname et al.", then asks the LLM whether the answer is grounded. Not grounded &rarr; refusal plus source links.</li>
+    <li>The router builds <code>AgenticAskResponse</code>: answer, source URLs, <code>chunks_used</code>, <code>removed_citations</code>,
+      <code>answer_grounded</code>, reasoning steps.</li>
+  </ol>
+  <p>
+    With 3 chunks that's 1 + 3 + 1 + 1 = 6 LLM calls, which is why the agentic endpoint takes about 6 minutes on your CPU and
+    <code>/ask</code> (one call) takes 2&ndash;4.
+  </p>
+
+  <h4>Trade-off questions, with the facts to answer them</h4>
+  <table class="plain">
+    <tr><th>Question</th><th>Fact from this codebase to anchor your answer</th></tr>
+    <tr><td>Anything wrong with <code>hybrid_search</code>?</td><td>It calls synchronous <code>opensearch_client.search_unified(...)</code> inside <code>async def</code>, blocking the event loop per search. The agent's tool does the same.</td></tr>
+    <tr><td>GPU or CPU?</td><td>CPU: 2&ndash;4 min per answer with a 1B model. A GPU cuts that to seconds and lets concurrent grading actually run in parallel.</td></tr>
+    <tr><td>Exact or semantic cache?</td><td>The cache key is a sha256 of query, model, top_k, use_hybrid, sorted categories. "What's RAG?" and "What is RAG?" miss each other.</td></tr>
+    <tr><td>Chunk size?</td><td>600 words with 100 overlap, section-aware. Smaller chunks are more precise but lose context and multiply embedding calls.</td></tr>
+    <tr><td>BM25, vector, or hybrid?</td><td>Hybrid with RRF, falling back to BM25 when Jina fails. RRF scores (around 0.016) are rank-based, not comparable to BM25 scores.</td></tr>
+    <tr><td>1B or larger model?</td><td>The 1B model invented IDs and authors; hardened, it often refuses. 3B answers more often, but more slowly on CPU.</td></tr>
+    <tr><td>Local or hosted LLM?</td><td>Local: free, private, slow here. Hosted: fast, costs per token, data leaves your machine. Embeddings are already hosted (Jina).</td></tr>
+    <tr><td>How does ingestion scale?</td><td>One Airflow task, semaphores for concurrent downloads and parsing, a 3-second arXiv rate limit. At scale: a queue with parallel workers, idempotent re-indexing.</td></tr>
+    <tr><td>What happens if Redis is down?</td><td>At request time, a cache miss. At startup, the API fails, because <code>make_cache_client</code> re-raises and the lifespan doesn't catch it.</td></tr>
+  </table>
+
+  <h4>Your five debugging stories</h4>
+  <div class="callout story">
+    <b>1. The proxy and the hash mismatch</b>
+    Situation: the Airflow image build failed with "THESE PACKAGES DO NOT MATCH THE HASHES" on large wheels like torch.
+    Action: noticed it was intermittent and only on big downloads, traced it to the TLS-inspecting corporate proxy corrupting or
+    truncating large transfers; added the corporate CA to the images and a BuildKit pip cache mount with a retry loop.
+    Result: builds succeed, and retries reuse what was already downloaded.
+  </div>
+  <div class="callout story">
+    <b>2. "Make sure the API server is running"</b>
+    Situation: Gradio said the API was down, but <code>/health</code> was fine. Action: read the underlying exception instead of the
+    friendly message: an httpx read timeout at 60 s, while CPU inference takes 2&ndash;4 minutes. Result: 600 s timeout; lesson about
+    error handlers that replace the real error with a guess.
+  </div>
+  <div class="callout story">
+    <b>3. The stale cached answer</b>
+    Situation: after adding the citation safeguards, one question still returned hallucinated citations. Action: realised the answer
+    came from Redis, cached before the fix, with a 6-hour TTL; flushed it. Result: correct answers; and a design point: cache keys should
+    include a version of the answer pipeline, so a logic change invalidates old entries.
+  </div>
+  <div class="callout story">
+    <b>4. Fabricated citations</b>
+    Situation: <code>/ask</code> cited <code>2304.06476</code> and <code>2305.08659</code> while only <code>2609.30227</code> and
+    <code>2609.30558</code> were retrieved; the prompt's example ID made the 1B model emit <code>2301.00001</code>; it invented
+    "Rasmussen et al.", and the LLM groundedness check passed it. Action: deterministic checks first (strip unretrieved IDs, reject
+    unknown authors), per-chunk grading, fail closed; an eval script to measure. Result: the agent refuses rather than invents; every
+    safeguard has a test.
+  </div>
+  <div class="callout story">
+    <b>5. Thirty-minute rebuilds</b>
+    Situation: every API rebuild took about 30 minutes. Action: found Docker's build cache at its 30 GB limit, evicting the big
+    dependency layer each time. Result: understood layer caching as a cost, not theory; pruning and ordering layers so dependencies
+    change rarely.
+  </div>
+  <p>A sixth, from this module: the 13 test errors (Day 3). It's a good one because it shows you debugging tests, not just code.</p>
+
+  <h3>4. Build</h3>
+  <h4>Part A: your README</h4>
+  <p>Replace your project's <code>README.md</code>. Use this outline and fill every bracket with your own facts:</p>
+  <p class="file"><b>README.md</b> (outline)</p>
+  <pre><code># arXiv Paper Curator (rebuilt)
+
+Agentic RAG over recent arXiv AI papers: hybrid search (BM25 + vectors, RRF), a local LLM,
+a LangGraph agent, and hallucination safeguards that refuse rather than invent.
+
+Rebuilt from scratch by following the open-source course
+[production-agentic-rag-course](https://github.com/jamwithai/production-agentic-rag-course) (MIT).
+My additions beyond the course: [citation checks, per-chunk grading, groundedness check, tests...]
+
+## Architecture
+[Your two flow diagrams: query path and ingestion path, with ports]
+
+## Quick start
+[Prerequisites; copy .env.example to .env; docker compose up -d --build; one curl.exe example]
+
+## Hallucination safeguards
+[What each safeguard does, and one real example it caught]
+
+## Testing
+[uv run pytest -m "not integration"; what is unit / API / integration; coverage: [N]%]
+
+## Known limitations
+[CPU speed; sync OpenSearch call in async endpoints; exact-match cache only; 1B model often refuses]
+
+## What I learned
+[Three or four sentences, e.g. from your debugging stories]</code></pre>
+  <p>
+    Link the original course and name its license. That's both honest and required by MIT. A "Known limitations" section is a
+    strength: it shows you know where the edges are, and it gives interviewers something good to ask about. And check every claim:
+    the reference README's endpoint table lists <code>/api/v1/papers</code> routes that <code>src/main.py</code> never registers.
+    Don't copy drift like that.
+  </p>
+  <h4>Part B: your resume bullets</h4>
+  <p>Start from the roadmap's framing and keep it that honest. For example:</p>
+  <div class="card">
+    <ul>
+      <li>Rebuilt a production-style agentic RAG system over arXiv papers from scratch, following an open-source course: FastAPI,
+        PostgreSQL, OpenSearch hybrid search (BM25 + vectors with RRF), Airflow ingestion, Redis caching, Langfuse tracing, LangGraph agent.</li>
+      <li>Added hallucination safeguards the course lacked: deterministic citation and author checks, per-chunk relevance grading,
+        and a groundedness check that withholds unsupported answers, each covered by unit tests.</li>
+      <li>Made the test suite hermetic and added CI (ruff, pytest with coverage), fixing fixture bugs that had left 22 agent tests
+        never running and 13 API tests dependent on the Docker network.</li>
+    </ul>
+  </div>
+  <p>Don't write "designed" or "architected" for things the course designed. "Rebuilt", "added", "fixed", and "measured" are true and strong.</p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>git add -A
+git commit -m "Portfolio README"
+git log --oneline | Measure-Object -Line</code></pre>
+  <p>
+    Then create an empty repository on GitHub (no README, no license), and push:
+    <code>git remote add origin https://github.com/&lt;you&gt;/my-paper-curator.git</code>, then <code>git push -u origin main</code>.
+    Open the repo's <b>Actions</b> tab and watch the CI run. The first run is slow because of the torch download.
+    Expected: a green check. If it's red, read the failing step's log. The usual causes are a test you forgot to mark as
+    integration, or a lock file you forgot to commit.
+  </p>
+  <div class="callout warn">
+    <b>Before you push</b>
+    Run <code>git ls-files | Select-String "\.env$|corp-ca"</code>. It must print nothing. Your <code>.env</code> holds your Jina key and
+    <code>certs/corp-ca.crt</code> is your employer's certificate; neither belongs on GitHub. If either is tracked, remove it with
+    <code>git rm --cached</code>, commit, and rotate the Jina key if it was ever pushed.
+  </div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m9-day4" /><span>README committed, repo pushed, CI green</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Tell story 2 to a timer. Over two minutes? Cut the Situation to one sentence. Under 45 seconds? You skipped the Action, the part interviewers score.</li>
+    <li>Have a friend (or me) ask "why not just use a bigger model?" after every answer to the trade-off table. Where your answer is only an opinion, find the fact in the code that backs it.</li>
+    <li>Draw the architecture with the page closed, then compare. Every box you missed or misplaced goes on tomorrow's review list.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud <b>before</b> opening the model answer. Then message me "Drill me on Module 9" and I'll run a
+    full mock interview: architecture, trade-offs, one story, and follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. How did you test this project?</summary>
+    <div class="answer">Three levels. Unit tests with fakes for every service: citation checks, cache keys, each agent node, and the whole
+      LangGraph graph with a scripted fake LLM. API tests that run the real FastAPI app and lifespan in-process, with factories patched
+      to fakes or dependencies overridden. A few marked integration tests plus an evaluation script against the live stack. CI runs
+      everything except integration tests, with ruff and coverage.</div></details>
+
+  <details class="drill"><summary>2. How do you test code that calls an LLM?</summary>
+    <div class="answer">Replace the model with an <code>AsyncMock</code> whose <code>side_effect</code> is a list of responses, returned in call
+      order. Structured outputs are just Pydantic objects, so the fake returns <code>GradeDocuments(binary_score="yes")</code> directly.
+      Put an exception in the list to test failure handling. Then assert on behaviour and on the call count, for example "the author check
+      refused without calling the LLM". Model quality is measured separately, with an eval script on real questions.</div></details>
+
+  <details class="drill"><summary>3. What does "patch where it's looked up" mean? Give the bug you found.</summary>
+    <div class="answer"><code>from x import f</code> copies a reference into the importing module, so patching <code>x.f</code> doesn't affect it.
+      The reference API fixture patched <code>src.services.opensearch.factory.make_opensearch_client</code>, but the lifespan uses
+      <code>src.main.make_opensearch_client</code>, and it didn't patch the cache factory at all. So the lifespan tried to reach
+      <code>redis:6379</code> and 13 tests errored on any machine outside Docker. Patching the names in <code>src.main</code> fixed it.</div></details>
+
+  <details class="drill"><summary>4. Dependency overrides versus patch: when do you use each?</summary>
+    <div class="answer"><code>app.dependency_overrides</code> replaces what FastAPI injects into an endpoint, cleanly and without touching
+      imports; ideal for endpoint tests without the lifespan. <code>patch</code> replaces any name anywhere, needed for things that aren't
+      dependencies: the lifespan's factories, or code that constructs objects itself, like the health endpoint's <code>OllamaClient(settings)</code>.
+      Needing <code>patch</code> often is a sign the code should take the object as a parameter.</div></details>
+
+  <details class="drill"><summary>5. What's a fixture, and what is conftest.py for?</summary>
+    <div class="answer">A fixture builds something a test needs; tests request it by parameter name, and <code>yield</code> fixtures clean up
+      afterwards. <code>conftest.py</code> shares fixtures with every test in its folder and below, without imports; the closest definition
+      wins. Missing conftest fixtures don't skip tests, they error, which is how 22 agent tests had never run.</div></details>
+
+  <details class="drill"><summary>6. What does code coverage tell you, and what doesn't it?</summary>
+    <div class="answer">Which lines ran during tests. It can't tell you whether anything was checked: the course's rewrite-query test covers the
+      fallback branch, passes, and never tests the LLM path its name claims. Use coverage to find untested code, and good assertions to make
+      covered code meaningful.</div></details>
+
+  <details class="drill"><summary>7. Walk me through one <code>/ask-agentic</code> request.</summary>
+    <div class="answer">Validate <code>AskRequest</code>; build the service via <code>AgenticRAGDep</code>; guardrail LLM score (below 60 goes to
+      out-of-scope); retrieve node emits a tool call; the tool embeds the query with Jina and runs hybrid search in OpenSearch; each chunk is
+      graded by the LLM concurrently; none relevant means rewrite and retry, up to 2 attempts; generate from relevant chunks only; verify:
+      strip unretrieved citations, reject unknown authors, LLM groundedness check, otherwise refuse with source links; return answer, sources,
+      removed citations, grounded flag, reasoning steps. About 6 LLM calls, about 6 minutes on this CPU.</div></details>
+
+  <details class="drill"><summary>8. The search endpoint is <code>async def</code>. Is it non-blocking?</summary>
+    <div class="answer">No. It calls the synchronous OpenSearch client inside <code>async def</code>, so each search blocks the event loop and
+      every other request waits. Fixes: the async OpenSearch client, <code>await asyncio.to_thread(...)</code>, or a plain <code>def</code>
+      endpoint, which FastAPI runs in a thread pool.</div></details>
+
+  <details class="drill"><summary>9. How would you serve 100 concurrent users?</summary>
+    <div class="answer">The LLM is the bottleneck: move inference to a GPU server (or a hosted model) that batches requests. Fix blocking calls in
+      async endpoints, build the agent service once instead of per request, run several API workers behind a load balancer, add a semantic
+      cache for paraphrased questions, and stream answers so users see progress. Ingestion is separate and scheduled, so it scales on its own.</div></details>
+
+  <details class="drill"><summary>10. Exact-match or semantic cache?</summary>
+    <div class="answer">This project uses exact match: a hash of query, model, top_k, hybrid flag, and sorted categories. It's safe (a hit is
+      always the same question) but misses paraphrases. A semantic cache embeds the question and reuses answers above a similarity threshold:
+      more hits, but the risk of serving an answer to a subtly different question. Both need invalidation when the pipeline changes; I learned
+      that from a stale cached answer that still had fabricated citations.</div></details>
+
+  <details class="drill"><summary>11. Why hybrid search, and why RRF?</summary>
+    <div class="answer">BM25 nails exact terms, model names, and IDs; vectors catch paraphrases. RRF combines the two rankings using only ranks,
+      1/(k + rank), so the incompatible raw scores never need to be compared. That's why the final scores look tiny, around 0.016. If
+      embedding fails, the endpoint falls back to BM25 instead of erroring.</div></details>
+
+  <details class="drill"><summary>12. Tell me about a hard bug.</summary>
+    <div class="answer">Pick one of your five stories and use STAR. Strong choice: fabricated citations. The 1B model cited papers that were never
+      retrieved and invented authors, and an LLM-based check approved it. I added deterministic checks before the LLM judge, graded chunks
+      individually, made every failure path refuse, and wrote tests plus an eval script to measure it. The trade-off: the small model now
+      refuses more often.</div></details>
+
+  <details class="drill"><summary>13. Did you build this yourself?</summary>
+    <div class="answer">Say exactly what's true: "I started from an open-source course, then rebuilt every layer from scratch myself, and added
+      things the course didn't have: the hallucination safeguards, a hermetic test suite with CI, and fixes to its test fixtures." Then offer to
+      go deep on any layer. Honesty plus depth beats an inflated claim that collapses at the first follow-up.</div></details>
+
+  <details class="drill"><summary>14. What would you improve next?</summary>
+    <div class="answer">Make the API start without Redis (catch the cache factory error and run uncached); build the agent once at startup;
+      remove blocking calls from async endpoints; turn on more ruff rules and real mypy checking; version the cache key with the pipeline;
+      add a small labelled evaluation set so groundedness and refusal rates are tracked over time.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m9-drill" /><span>Mock interview passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">You've finished</h2>
+  <p>There's no Module 10. Before you call it done, tick these:</p>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m9-final-tests" /><span><code>uv run pytest -m "not integration"</code> passes with every Docker container stopped</span></li>
+    <li><input type="checkbox" data-id="m9-final-ci" /><span>Your GitHub repo shows a green CI run, and <code>.env</code> and the corporate certificate were never pushed</span></li>
+    <li><input type="checkbox" data-id="m9-final-readme" /><span>The README credits the course, lists your additions, and states known limitations</span></li>
+    <li><input type="checkbox" data-id="m9-final-draw" /><span>You can draw both paths of the architecture from memory in two minutes</span></li>
+    <li><input type="checkbox" data-id="m9-final-stories" /><span>You can tell all five debugging stories in STAR form, about 90 seconds each</span></li>
+    <li><input type="checkbox" data-id="m9-final-tradeoffs" /><span>You can answer every row of the trade-off table with a fact from the code</span></li>
+    <li><input type="checkbox" data-id="m9-final-resume" /><span>Your resume bullets say "rebuilt" and "added", and every claim survives a follow-up question</span></li>
+  </ul>
+  <p>
+    Then send me "Module 9 passed". You've built this system twice, once by reading and once by typing, and hardened it beyond
+    the course. Go back to the roadmap and tick the last module.
+  </p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 0 — Foundations</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 0 &middot; 4&ndash;5 days</p>
+    <h1><span class="grad">Foundations</span>: the tools every other module assumes</h1>
+    <p class="lede">
+      Before you can read this codebase, you need the Python features it uses on every page, and the tools it runs on.
+      By the end of this module you'll have your own project set up, 24 passing tests, and a Redis container you
+      started yourself.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: typed Python &amp; Pydantic</span>
+      <span class="pill">Day 2: decorators, context managers, generators</span>
+      <span class="pill">Day 3: async/await</span>
+      <span class="pill">Day 4: HTTP, JSON, settings</span>
+      <span class="pill">Day 5: Docker</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 0</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: Set up your project, then typed Python and Pydantic</a></li>
+      <li><a href="#day2">Day 2: Decorators, context managers, generators, and pytest</a></li>
+      <li><a href="#day3">Day 3: async and await</a></li>
+      <li><a href="#day4">Day 4: HTTP, JSON, settings, and logging</a></li>
+      <li><a href="#day5">Day 5: Docker and Compose</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 1</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>How to use this page</b>
+    Keep the reference repo open in Cursor next to this page. When a walkthrough quotes a file, open the real file
+    and find the lines yourself; getting around the codebase is part of the skill. Your notes in
+    <code>python-masterclass.md</code> cover the basics this page builds on. Where it helps, I point to the section to
+    re-read.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>Set up your project, then typed Python and Pydantic</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Data in this project crosses many boundaries: from your browser into the API, from the API into OpenSearch,
+    from the LLM back into Python. Every boundary is a place where the data can arrive in the wrong shape: a missing
+    field, a string where a number should be, an LLM that answers "Yes!" instead of <code>"yes"</code>. The codebase
+    handles this in two ways. <b>Type hints</b> document what shape data should have. <b>Pydantic</b> checks that it
+    really does, while the program runs.
+  </p>
+
+  <h3>2. Concepts</h3>
+
+  <h4>Your toolbox for today</h4>
+  <table class="plain">
+    <tr><th>Tool</th><th>What it does</th><th>Commands you'll use</th></tr>
+    <tr><td>PowerShell</td><td>The terminal. You type commands; it runs programs.</td>
+      <td><code>cd</code> (change folder), <code>ls</code> (list files), <code>mkdir</code> (make folder), <code>pwd</code> (where am I)</td></tr>
+    <tr><td>uv</td><td>Manages the Python version, a private package folder for the project (<code>.venv</code>), and the dependency list (<code>pyproject.toml</code> + <code>uv.lock</code>).</td>
+      <td><code>uv init</code>, <code>uv add</code>, <code>uv run</code></td></tr>
+    <tr><td>git</td><td>Saves snapshots ("commits") of your project so you can see history and undo mistakes.</td>
+      <td><code>git status</code>, <code>git add</code>, <code>git commit</code>, <code>git log</code></td></tr>
+  </table>
+  <p>
+    The reference repo uses exactly this setup: open its <code>pyproject.toml</code> and you'll see the dependency
+    list, and <code>uv.lock</code> pins the exact version of every package so everyone installs identical code.
+  </p>
+
+  <h4>Type hints</h4>
+  <p>
+    A type hint is a label saying what type a value should be: <code>def get_latest_query(messages: List) -&gt; str</code>
+    says "takes a list, returns a string". Python itself <b>does not check</b> hints when the program runs. They exist for
+    readers, editors (autocomplete, warnings), and tools like Pydantic. Re-read section 1, item 6 ("Type Hints") and the
+    <code>Optional</code> part of section 19 in your masterclass notes. The ones you'll see most here:
+  </p>
+  <table class="plain">
+    <tr><th>Hint</th><th>Means</th></tr>
+    <tr><td><code>List[str]</code> or <code>list[str]</code></td><td>A list of strings</td></tr>
+    <tr><td><code>Dict[str, Any]</code></td><td>A dictionary with string keys and values of any type</td></tr>
+    <tr><td><code>Optional[str]</code></td><td>A string, or <code>None</code></td></tr>
+    <tr><td><code>Literal["yes", "no"]</code></td><td>Exactly one of these values</td></tr>
+    <tr><td><code>-&gt; bool</code></td><td>The function returns a bool</td></tr>
+  </table>
+
+  <h4>Dataclass versus Pydantic model</h4>
+  <p>Both turn a list of typed fields into a class with a constructor, so you don't write <code>__init__</code> by hand. The difference:</p>
+  <table class="plain">
+    <tr><th></th><th><code>@dataclass</code></th><th>Pydantic <code>BaseModel</code></th></tr>
+    <tr><td>Checks types at runtime?</td><td>No</td><td>Yes, and converts where sensible (<code>"7"</code> becomes <code>7</code>)</td></tr>
+    <tr><td>Rules like "between 1 and 10"?</td><td>No</td><td>Yes, via <code>Field(ge=1, le=10)</code></td></tr>
+    <tr><td>Converts to and from JSON?</td><td>Not built in</td><td>Yes: <code>model_dump_json()</code>, <code>Model(**data)</code></td></tr>
+    <tr><td>Used in this project for</td><td>Internal plumbing, e.g. the agent's <code>Context</code> holding live client objects</td><td>Anything crossing a boundary: API requests and responses, LLM output, settings</td></tr>
+  </table>
+  <div class="callout tip"><b>Rule of thumb</b>Use Pydantic where data enters from outside your code. Use a dataclass for objects your own code creates.</div>
+
+  <h3>3. Walkthrough: real code</h3>
+
+  <p class="file"><b>src/schemas/api/ask.py</b> &middot; the body of every <code>/ask</code> request</p>
+  <table class="walk">
+    <tr><td><pre><code>class AskRequest(BaseModel):</code></pre></td>
+      <td>Inheriting from <code>BaseModel</code> is what makes this a Pydantic model. Creating one runs validation.</td></tr>
+    <tr><td><pre><code>    query: str = Field(..., description="User's question", min_length=1, max_length=1000)</code></pre></td>
+      <td><code>...</code> (Python's "Ellipsis") as the first argument means <b>required</b>: no default. The length limits reject an empty question, and stop someone sending a 5 MB "question".</td></tr>
+    <tr><td><pre><code>    top_k: int = Field(3, description="Number of top chunks to retrieve", ge=1, le=10)</code></pre></td>
+      <td>Default 3. <code>ge</code> = greater or equal, <code>le</code> = less or equal. <code>top_k=50</code> is rejected before any search runs.</td></tr>
+    <tr><td><pre><code>    use_hybrid: bool = Field(True, description="Use hybrid search (BM25 + vector)")</code></pre></td>
+      <td>A plain default. You'll learn what hybrid search is in Module 4.</td></tr>
+    <tr><td><pre><code>    model: str = Field("llama3.2:1b", description="Ollama model to use for generation")</code></pre></td>
+      <td>Which local LLM answers. The same field that the agentic endpoint used to ignore until today's fix.</td></tr>
+    <tr><td><pre><code>    categories: Optional[List[str]] = Field(None, description="Filter by arXiv categories")</code></pre></td>
+      <td>Either a list like <code>["cs.AI"]</code>, or <code>None</code> meaning "no filter".</td></tr>
+    <tr><td><pre><code>    class Config:
+        json_schema_extra = {...}</code></pre></td>
+      <td>An example shown on the <code>/docs</code> page. This inner-<code>Config</code> style is from Pydantic v1; v2 prefers <code>model_config = ConfigDict(...)</code>, which is why the test run prints deprecation warnings.</td></tr>
+  </table>
+  <p>
+    When a request arrives, FastAPI builds an <code>AskRequest</code> from the JSON body. If validation fails,
+    FastAPI answers with <b>422 Unprocessable Entity</b> and a list of what was wrong, and your endpoint code never runs.
+  </p>
+
+  <p class="file"><b>src/services/agents/context.py</b> &middot; a dataclass</p>
+  <pre><code>@dataclass
+class Context:
+    ollama_client: OllamaClient
+    opensearch_client: OpenSearchClient
+    embeddings_client: JinaEmbeddingsClient
+    langfuse_tracer: Optional[LangfuseTracer]
+    trace: Optional["LangfuseSpan"] = None
+    langfuse_enabled: bool = False
+    model_name: str = "llama3.2:1b"
+    temperature: float = 0.0
+    top_k: int = 3
+    max_retrieval_attempts: int = 2
+    guardrail_threshold: int = 60</code></pre>
+  <p>
+    This bundles everything the agent's steps need: live connections to Ollama and OpenSearch, and a few settings.
+    The code creates it itself, so there's nothing to validate, and a dataclass is enough. Fields without defaults must
+    come first; that's a dataclass rule.
+  </p>
+
+  <p class="file"><b>src/services/agents/models.py</b> &middot; Pydantic as a contract with the LLM</p>
+  <pre><code>class GradeDocuments(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="Document relevance: 'yes' or 'no'")
+    reasoning: str = Field(default="", description="Explanation for the decision")</code></pre>
+  <p>
+    The grading step calls <code>llm.with_structured_output(GradeDocuments)</code>. LangChain turns this class into a
+    JSON schema, asks the model to answer in that shape, and validates the reply. If the model says <code>"Yes!"</code>,
+    validation fails; the grading step catches that and excludes the chunk. The same class that validates API input
+    here validates LLM output.
+  </p>
+
+  <h3>4. Build</h3>
+
+  <h4>Step A: create your project</h4>
+  <pre><code>cd C:\Users\mrigsing\Downloads
+uv init my-paper-curator --no-package --python 3.12
+cd my-paper-curator
+git status
+uv add pydantic
+uv add --dev pytest
+mkdir playground, tests\playground
+ni playground\__init__.py</code></pre>
+  <p>
+    <code>uv init</code> created <code>pyproject.toml</code>, a starter <code>main.py</code>, a <code>.gitignore</code>, and ran
+    <code>git init</code> for you, which is why <code>git status</code> works. <code>--no-package</code> keeps the same simple
+    layout as the reference project; without it, recent uv versions set the project up as an installable library instead. <code>ni</code> is PowerShell's short form of
+    <code>New-Item</code>; it creates an empty file. The empty <code>__init__.py</code> marks <code>playground</code> as a
+    Python package you can import from.
+  </p>
+  <div class="callout warn">
+    <b>If <code>uv add</code> fails with a certificate error</b>
+    Your office proxy re-signs HTTPS traffic. Run <code>$env:UV_SYSTEM_CERTS=1</code> first, which tells uv to trust the
+    Windows certificate store, then retry.
+  </div>
+  <p>Now tell pytest where your code lives. Add this to the end of <code>pyproject.toml</code>:</p>
+  <p class="file"><b>pyproject.toml</b> (append)</p>
+  <pre><code>[tool.pytest.ini_options]
+pythonpath = ["."]</code></pre>
+
+  <h4>Step B: write <code>playground/models.py</code></h4>
+  <p>Write these four things. The tests in Step C define exactly what "correct" means.</p>
+  <ol>
+    <li><code>Paper</code>, a Pydantic model: <code>arxiv_id</code> (string that must look like <code>1706.03762</code> or
+      <code>1706.03762v2</code>), <code>title</code> (non-empty string), <code>authors</code> (list of strings, defaults to an
+      empty list), <code>citation_count</code> (int, at least 0, defaults to 0).</li>
+    <li><code>SearchRequest</code>, a Pydantic model modelled on the reference <code>HybridSearchRequest</code>:
+      <code>query</code> (1&ndash;500 characters, required), <code>size</code> (int, 1&ndash;50, default 10),
+      <code>use_hybrid</code> (bool, default <code>True</code>), <code>categories</code> (optional list of strings, default <code>None</code>).</li>
+    <li><code>SearchSettings</code>, a <b>dataclass</b>: <code>base_url</code> (str, required) and <code>timeout_seconds</code> (float, default 30.0).</li>
+    <li><code>base_arxiv_id(arxiv_id: str) -&gt; str</code>: strips surrounding spaces and a version suffix, so
+      <code>"2609.30558v2"</code> becomes <code>"2609.30558"</code>. This is a function from the hallucination safeguards you'll
+      build in Module 8.</li>
+  </ol>
+  <details class="hint"><summary>Hint: the arXiv ID rule</summary>
+    <p><code>Field(pattern=r"^\d{4}\.\d{4,5}(v\d+)?$")</code>. Read it as: start, 4 digits, a dot, 4 or 5 digits, optionally
+      "v" plus digits, end.</p></details>
+  <details class="hint"><summary>Hint: a list default</summary>
+    <p>Never write <code>authors: list[str] = []</code> in a dataclass; every instance would share one list. Pydantic copies
+      defaults safely, but the habit worth building is <code>Field(default_factory=list)</code>.</p></details>
+  <details class="hint"><summary>Hint: removing the version</summary>
+    <p><code>re.sub(r"v\d+$", "", text)</code> replaces "v plus digits at the very end" with nothing. Call <code>.strip()</code> first.</p></details>
+
+  <h4>Step C: type the tests</h4>
+  <p class="file"><b>tests/playground/test_models.py</b></p>
+  <pre><code>import pytest
+from pydantic import ValidationError
+
+from playground.models import Paper, SearchRequest, SearchSettings, base_arxiv_id
+
+
+def test_paper_defaults():
+    paper = Paper(arxiv_id="1706.03762", title="Attention Is All You Need")
+    assert paper.authors == []
+    assert paper.citation_count == 0
+
+
+def test_paper_rejects_bad_arxiv_id():
+    with pytest.raises(ValidationError):
+        Paper(arxiv_id="not-an-id", title="Something")
+
+
+def test_search_request_defaults():
+    request = SearchRequest(query="transformers")
+    assert request.size == 10
+    assert request.use_hybrid is True
+    assert request.categories is None
+
+
+@pytest.mark.parametrize("bad", [{"query": ""}, {"query": "x", "size": 0}, {"query": "x", "size": 51}])
+def test_search_request_validation(bad):
+    with pytest.raises(ValidationError):
+        SearchRequest(**bad)
+
+
+def test_search_settings_is_a_plain_dataclass():
+    settings = SearchSettings(base_url="http://localhost:8000")
+    assert settings.timeout_seconds == 30.0
+
+
+def test_base_arxiv_id():
+    assert base_arxiv_id("2609.30558v2") == "2609.30558"
+    assert base_arxiv_id(" 2609.30558 ") == "2609.30558"</code></pre>
+  <p>
+    <code>pytest.raises</code> passes only if the code inside raises that error. <code>parametrize</code> runs one test
+    function once per input, so that one function counts as 3 tests. <code>SearchRequest(**bad)</code> unpacks the
+    dictionary into keyword arguments.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q</code></pre>
+  <p>You should see <code>8 passed</code>. Then save your work:</p>
+  <pre><code>git add -A
+git commit -m "Day 1: typed models with Pydantic"</code></pre>
+  <div class="callout warn"><b>First commit on this machine?</b>
+    If git asks who you are, run <code>git config --global user.name "Your Name"</code> and
+    <code>git config --global user.email "you@example.com"</code>, then commit again.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <p>Start an interactive Python session with <code>uv run python</code>, then try each of these. Exit with <code>exit()</code>.</p>
+  <ol>
+    <li><code>from playground.models import SearchRequest</code>, then <code>SearchRequest(query="x", size=500)</code>. Read the
+      error: which field, which rule, what value? This is the same information a 422 response contains.</li>
+    <li><code>SearchRequest(query="x", size="7").size</code>. It works and returns the number 7. Pydantic converts strings
+      that clearly are numbers, which is useful because everything arriving over HTTP starts as text.
+      Now try <code>size="seven"</code>.</li>
+    <li>Define <code>def double(x: int) -&gt; int: return x * 2</code> and call <code>double("ha")</code>. You get
+      <code>"haha"</code> and no error. Type hints alone check nothing at runtime.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Decorators, context managers, generators, and pytest</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Almost every file in the project uses at least one of <code>@something</code>, <code>with</code>, or <code>yield</code>.
+    They look like magic until you've written one. After today you'll read <code>@router.post</code>,
+    <code>async with httpx.AsyncClient()</code>, and a streaming endpoint as ordinary Python. Re-read section 16
+    (Comprehensions &amp; Generators) and section 17 (Decorators &amp; Context Managers) in your masterclass first.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Decorators</h4>
+  <p>
+    In Python a function is a value, like a number: you can pass it to another function and get a function back.
+    A decorator is a function that takes a function and returns a replacement. Writing <code>@timed</code> above
+    <code>def f</code> is shorthand for <code>f = timed(f)</code>.
+  </p>
+  <p>
+    A decorator <b>with arguments</b>, like <code>@retry(times=3)</code>, has one more layer: <code>retry(times=3)</code>
+    runs first and <em>returns</em> the real decorator, which is then applied to <code>f</code>. So
+    <code>f = retry(times=3)(f)</code>. Decorators usually wrap the function with <code>functools.wraps</code>, which copies
+    the original name and docstring onto the replacement so logs and tools still see the right name.
+  </p>
+  <h4>Context managers</h4>
+  <p>
+    A <code>with</code> block guarantees that setup and cleanup happen in pairs, even if an error is raised halfway:
+    a file gets closed, a network connection gets released, a tracing span gets ended. <code>with X() as y:</code> calls
+    <code>X().__enter__()</code> (its return value becomes <code>y</code>), runs your block, and always calls
+    <code>__exit__</code> at the end.
+  </p>
+  <h4>Generators</h4>
+  <p>
+    A function containing <code>yield</code> doesn't run when you call it. It returns a generator, which produces one
+    value each time someone asks for the next one, pausing in between. That makes generators ideal for
+    <b>streaming</b>: sending an answer word by word as the LLM produces it, instead of waiting for the whole thing.
+    An <code>async def</code> with <code>yield</code> is an async generator, consumed with <code>async for</code>.
+  </p>
+  <h4>pytest in one paragraph</h4>
+  <p>
+    pytest finds files named <code>test_*.py</code>, runs every function named <code>test_*</code>, and reports any
+    <code>assert</code> that fails. <code>pytest.raises</code> checks that an error happens.
+    <code>@pytest.mark.parametrize</code> runs a test once per input. <code>@pytest.fixture</code> defines reusable setup
+    that tests receive as arguments. The reference repo's <code>tests/unit/services/agents/conftest.py</code> is a real
+    example; those fixtures were missing until today, so 22 agent tests had never run.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; a decorator that registers a function</p>
+  <pre><code>@ask_router.post("/ask", response_model=AskResponse)
+async def ask_question(
+    request: AskRequest,
+    opensearch_client: OpenSearchDep,
+    ...</code></pre>
+  <p>
+    <code>ask_router.post("/ask", ...)</code> returns a decorator that records "POST requests to <code>/ask</code> go to this
+    function, and the reply must match <code>AskResponse</code>." It hands back the same function unchanged, so the
+    decorator's only job is registration. FastAPI reads the parameter type hints to decide that <code>request</code> comes
+    from the JSON body.
+  </p>
+
+  <p class="file"><b>src/services/agents/tools.py</b> &middot; a decorator with arguments that replaces the function</p>
+  <pre><code>    @tool(response_format="content_and_artifact")
+    async def retrieve_papers(query: str) -&gt; tuple[str, list[Document]]:
+        """Search and return relevant arXiv research papers.
+        ..."""</code></pre>
+  <p>
+    <code>tool(response_format=...)</code> returns a decorator that wraps <code>retrieve_papers</code> in a LangChain
+    <b>tool object</b>: it has a <code>.name</code>, a <code>.description</code> taken from the docstring, and an
+    <code>.ainvoke()</code> method. This time the decorator really does replace the function, which is why the tests call
+    <code>tool.ainvoke(...)</code> instead of <code>retrieve_papers(...)</code>. <code>content_and_artifact</code> means
+    the function returns two things: text for the LLM, and the raw documents for the code (the per-chunk grading
+    you'll build in Module 8 depends on that).
+  </p>
+
+  <p class="file"><b>src/config.py</b> &middot; stacked decorators</p>
+  <pre><code>    @field_validator("pdf_cache_dir")
+    @classmethod
+    def validate_cache_dir(cls, v: str) -&gt; str:
+        os.makedirs(v, exist_ok=True)
+        return v</code></pre>
+  <p>
+    Decorators apply bottom-up: first <code>@classmethod</code>, then <code>@field_validator</code>. The result is a Pydantic
+    hook that runs whenever the setting is loaded; here it creates the PDF folder if it doesn't exist.
+  </p>
+
+  <p class="file"><b>src/gradio_app.py</b> &middot; context managers, and a bug they were part of</p>
+  <table class="walk">
+    <tr><td><pre><code>async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:</code></pre></td>
+      <td>Opens an HTTP client with a connection pool. When the block ends, even through an error, the pool is closed. Without the <code>with</code>, a crash would leak open connections.</td></tr>
+    <tr><td><pre><code>    async with client.stream("POST", url, json=payload, headers={"Accept": "text/plain"}) as response:</code></pre></td>
+      <td>A second context manager: one streaming request. Leaving the block releases the connection back to the pool.</td></tr>
+    <tr><td><pre><code>        async for line in response.aiter_lines():</code></pre></td>
+      <td>Reads the response one line at a time <em>as it arrives</em>: an async generator on the client side.</td></tr>
+  </table>
+  <div class="callout story">
+    <b>What happened here this week</b>
+    The timeout used to be <code>60.0</code>. On your laptop's CPU the model needs 2&ndash;4 minutes per answer, so
+    <code>httpx</code> gave up at 60 seconds. The error was caught by a handler that printed "make sure the API server is
+    running", so the UI blamed a server that was fine. The fix was this one argument. Lesson: read the actual exception,
+    not the friendly message someone wrapped around it.
+  </div>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; a generator on the server side</p>
+  <pre><code>                        if chunk.get("response"):
+                            text_chunk = chunk["response"]
+                            full_response += text_chunk
+                            yield f"data: {json.dumps({'chunk': text_chunk})}\n\n"</code></pre>
+  <p>
+    Every time Ollama produces a piece of text, the endpoint <code>yield</code>s a line in the Server-Sent Events format
+    (<code>data: ...</code> followed by a blank line). FastAPI's <code>StreamingResponse</code> sends each yielded line
+    immediately. Gradio's <code>async for</code> above is the other end of this pipe.
+  </p>
+
+  <h3>4. Build</h3>
+  <p>Write <code>playground/wrappers.py</code> with:</p>
+  <ol>
+    <li><code>timed</code>: a decorator. The wrapped function returns the same result as before, still has its original
+      <code>__name__</code>, and stores how long its last call took, in seconds, on an attribute named <code>last_seconds</code>.</li>
+    <li><code>retry(times, exceptions=(Exception,))</code>: a decorator factory. Calls the function up to
+      <code>times</code> times; if every attempt raises, re-raises the last error. This is the same idea as the retry loop
+      that got the Airflow build through your proxy.</li>
+    <li><code>Timer</code>: a context manager class. <code>with Timer() as t:</code> measures the block, then <code>t.seconds</code> holds the duration.</li>
+    <li><code>chunk_text(text, size, overlap=0)</code>: a generator that yields pieces of <code>size</code> characters, each
+      starting <code>size - overlap</code> characters after the previous one. Stop after yielding the piece that reaches the
+      end of the text. Empty text yields nothing. Raise <code>ValueError</code> if <code>overlap &gt;= size</code>.
+      The reference project splits papers the same way, with overlap so a sentence cut at a boundary still appears whole
+      in one piece. You'll build the real version in Module 4.</li>
+  </ol>
+  <details class="hint"><summary>Hint: the shape of a decorator</summary>
+<pre><code>def timed(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        ...  # start clock, call func(*args, **kwargs), stop clock
+    wrapper.last_seconds = 0.0
+    return wrapper</code></pre>
+    <p><code>*args, **kwargs</code> accept any arguments and pass them through unchanged. Use <code>time.perf_counter()</code> for timing.</p></details>
+  <details class="hint"><summary>Hint: a decorator factory</summary>
+    <p>Three nested functions: <code>retry(times)</code> returns <code>decorator(func)</code>, which returns <code>wrapper(*args, **kwargs)</code>.
+      Inside <code>wrapper</code>, loop <code>times</code> times with <code>try</code>/<code>except exceptions</code>; remember the last error and raise it after the loop.</p></details>
+  <details class="hint"><summary>Hint: the generator loop</summary>
+    <p>Keep a <code>start</code> index. Each loop: <code>end = start + size</code>, yield the slice, stop if
+      <code>end &gt;= len(text)</code>, otherwise move <code>start</code> forward by <code>size - overlap</code>.</p></details>
+
+  <p class="file"><b>tests/playground/test_wrappers.py</b></p>
+  <pre><code>import time
+
+import pytest
+
+from playground.wrappers import Timer, chunk_text, retry, timed
+
+
+def test_timed_returns_result_and_records_time():
+    @timed
+    def slow_add(a, b):
+        time.sleep(0.05)
+        return a + b
+
+    assert slow_add(2, 3) == 5
+    assert slow_add.last_seconds &gt;= 0.05
+    assert slow_add.__name__ == "slow_add"
+
+
+def test_retry_succeeds_after_failures():
+    calls = []
+
+    @retry(times=3)
+    def flaky():
+        calls.append(1)
+        if len(calls) &lt; 3:
+            raise ConnectionError("try again")
+        return "ok"
+
+    assert flaky() == "ok"
+    assert len(calls) == 3
+
+
+def test_retry_gives_up_and_reraises():
+    @retry(times=2)
+    def always_fails():
+        raise ConnectionError("down")
+
+    with pytest.raises(ConnectionError):
+        always_fails()
+
+
+def test_timer_context_manager():
+    with Timer() as t:
+        time.sleep(0.05)
+    assert t.seconds &gt;= 0.05
+
+
+@pytest.mark.parametrize(
+    "text, size, overlap, expected",
+    [
+        ("abcdefgh", 4, 0, ["abcd", "efgh"]),
+        ("abcdefgh", 4, 2, ["abcd", "cdef", "efgh"]),
+        ("abcde", 4, 0, ["abcd", "e"]),
+        ("", 4, 0, []),
+    ],
+)
+def test_chunk_text(text, size, overlap, expected):
+    assert list(chunk_text(text, size, overlap)) == expected
+
+
+def test_chunk_text_rejects_overlap_not_smaller_than_size():
+    with pytest.raises(ValueError):
+        list(chunk_text("abc", 2, 2))</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest -q</code></pre>
+  <p>Expect <code>17 passed</code> (8 from Day 1, 9 today). Commit with a message describing what you added.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Delete the <code>@functools.wraps(func)</code> line from <code>timed</code> and run the tests. Which assertion fails, and why?</li>
+    <li>In <code>timed</code>'s wrapper, call the function but forget to <code>return</code> its result. What does <code>slow_add(2, 3)</code> return now?</li>
+    <li>In <code>uv run python</code>: <code>chunk_text("abc", 2, 2)</code> with no <code>list()</code> around it. No error! Now call
+      <code>next()</code> on the result. Why does the <code>ValueError</code> only appear now? (That's why the test wraps it in <code>list()</code>.)</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>async and await</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Your masterclass notes don't cover this, and it's everywhere in the project. The API spends most of its time
+    <b>waiting</b>: for OpenSearch to search, for Jina to embed, for Ollama to write. Async code lets one Python
+    process do other useful work during those waits, such as serving another user's request, or grading three
+    chunks at once instead of one after another.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <div class="card">
+    <b>The kitchen picture.</b> One cook (one Python thread) has three pots to boil. A <em>synchronous</em> cook puts
+    pot 1 on the stove and stands staring at it until it boils, then starts pot 2. An <em>asynchronous</em> cook puts
+    pot 1 on, and while it heats, puts pots 2 and 3 on too, then serves whichever boils first. Same cook, same stove,
+    far less standing around. Async doesn't make the stove hotter; it only removes idle waiting.
+  </div>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td><code>async def f()</code></td><td>Defines a <b>coroutine function</b>. Calling <code>f()</code> doesn't run it; it creates a coroutine object, a paused piece of work.</td></tr>
+    <tr><td><code>await x</code></td><td>"Run <code>x</code>, and while it waits, let other coroutines run. Resume me when it's done." Only allowed inside <code>async def</code>.</td></tr>
+    <tr><td>Event loop</td><td>The scheduler that runs coroutines and switches between them at every <code>await</code>. <code>asyncio.run(main())</code> starts one; FastAPI and pytest-asyncio start one for you.</td></tr>
+    <tr><td><code>asyncio.gather(a, b, c)</code></td><td>Runs several coroutines concurrently and returns their results in the same order you passed them.</td></tr>
+    <tr><td>I/O-bound</td><td>Waiting on a network, disk, or another program. Async helps.</td></tr>
+    <tr><td>CPU-bound</td><td>Computing, like a model running on your CPU. Async doesn't help, because nothing is waiting.</td></tr>
+  </table>
+  <div class="callout warn">
+    <b>The trap: blocking inside async</b>
+    A normal (synchronous) call like <code>time.sleep(1)</code> or <code>requests.get(...)</code> inside an
+    <code>async def</code> doesn't pause politely; it freezes the whole event loop, so every other request waits too.
+    Inside async code, use the async version: <code>await asyncio.sleep(1)</code>, <code>httpx.AsyncClient</code>.
+  </div>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/nodes/grade_documents_node.py</b> &middot; grading chunks concurrently</p>
+  <table class="walk">
+    <tr><td><pre><code>async def _grade_document(grader, question: str, document: Document) -&gt; GradingResult:</code></pre></td>
+      <td>A coroutine function that grades one chunk. The leading underscore signals "internal helper, not for use outside this file".</td></tr>
+    <tr><td><pre><code>    document_id = document.metadata.get("arxiv_id", "unknown")</code></pre></td>
+      <td><code>.get(key, default)</code> avoids a crash if the key is missing.</td></tr>
+    <tr><td><pre><code>    try:
+        grade: GradeDocuments = await grader.ainvoke(
+            GRADE_DOCUMENTS_PROMPT.format(context=document.page_content, question=question)
+        )</code></pre></td>
+      <td>Fills the prompt template, sends it to the LLM, and <b>awaits</b> the reply. While this waits on Ollama, the event loop can start grading the other chunks. <code>ainvoke</code> is LangChain's naming for "async invoke".</td></tr>
+    <tr><td><pre><code>        is_relevant = grade.binary_score == "yes"
+        return GradingResult(...)</code></pre></td>
+      <td>Turns the LLM's structured answer into a result record.</td></tr>
+    <tr><td><pre><code>    except Exception as e:
+        logger.warning(f"Grading failed for {document_id}, excluding it: {e}")
+        return GradingResult(document_id=document_id, is_relevant=False, ...)</code></pre></td>
+      <td><b>Fail closed</b>: if grading breaks, the chunk counts as irrelevant rather than slipping through. You'll see this pattern throughout Module 8.</td></tr>
+  </table>
+  <p>And the line that runs them all at once, further down the same file:</p>
+  <pre><code>    results = await asyncio.gather(*(_grade_document(grader, question, doc) for doc in documents))</code></pre>
+  <p>
+    The part in brackets is a generator expression producing one coroutine per chunk; <code>*</code> unpacks them into
+    separate arguments. <code>gather</code> runs them concurrently, and <code>results</code> lines up with
+    <code>documents</code> by position.
+  </p>
+  <div class="callout info">
+    <b>Honest nuance, and a good interview point</b>
+    Concurrency only overlaps the <em>waiting</em>. Ollama on your CPU may still work through the three prompts one at a
+    time, so grading might not get 3&times; faster here. On a GPU server handling parallel requests, it would.
+  </div>
+
+  <p class="file"><b>src/routers/hybrid_search.py</b> &middot; spot the issue</p>
+  <pre><code>@router.post("/", response_model=SearchResponse)
+async def hybrid_search(
+    request: HybridSearchRequest, opensearch_client: OpenSearchDep, embeddings_service: EmbeddingsDep
+) -&gt; SearchResponse:
+    ...
+        results = opensearch_client.search_unified(
+            query=request.query,
+            ...
+        )</code></pre>
+  <details class="hint"><summary>What's wrong? Think first, then open.</summary>
+    <p><code>search_unified</code> is a normal, synchronous call to OpenSearch, made inside an <code>async def</code> with no
+      <code>await</code>. While OpenSearch answers, the event loop is frozen and no other request is served. At one user,
+      nobody notices. Fixes: use an async OpenSearch client, or declare the endpoint with plain <code>def</code>, because FastAPI
+      runs non-async endpoints in a thread pool so they don't block the loop. Finding issues like this in real code is
+      exactly what interviewers want to hear about.</p></details>
+
+  <h3>4. Build</h3>
+  <p>First, install the async test plugin and the HTTP client, and tell pytest to run async tests automatically:</p>
+  <pre><code>uv add httpx
+uv add --dev pytest-asyncio</code></pre>
+  <p class="file"><b>pyproject.toml</b> (add the second line to your existing section)</p>
+  <pre><code>[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"</code></pre>
+  <p>Write <code>playground/async_basics.py</code> with:</p>
+  <ol>
+    <li><code>async def fake_grade(passage: str, delay: float = 0.2) -&gt; bool</code>: waits <code>delay</code> seconds
+      (pretending to be an LLM), then returns whether "transformer" appears in the passage, ignoring case.</li>
+    <li><code>async def grade_sequential(passages, delay) -&gt; list[bool]</code>: grades one after another.</li>
+    <li><code>async def grade_concurrent(passages, delay) -&gt; list[bool]</code>: grades all at once with <code>asyncio.gather</code>.</li>
+    <li><code>async def fetch_health(base_url: str) -&gt; str</code>: uses <code>httpx.AsyncClient</code> to GET
+      <code>{base_url}/health</code> and returns the <code>"status"</code> field of the JSON reply.</li>
+  </ol>
+  <details class="hint"><summary>Hint: fetch_health</summary>
+    <p>Inside <code>async with httpx.AsyncClient() as client:</code>, do <code>response = await client.get(url)</code>,
+      then <code>response.raise_for_status()</code> (turns 4xx/5xx replies into exceptions), then <code>response.json()["status"]</code>.</p></details>
+
+  <p class="file"><b>tests/playground/test_async_basics.py</b></p>
+  <pre><code>import time
+
+from playground.async_basics import fake_grade, fetch_health, grade_concurrent, grade_sequential
+
+PASSAGES = ["Transformers use attention", "Cooking pasta", "A transformer variant"]
+
+
+async def test_fake_grade():
+    assert await fake_grade("Transformers are great", delay=0) is True
+    assert await fake_grade("Bread recipes", delay=0) is False
+
+
+async def test_concurrent_is_faster_than_sequential():
+    start = time.perf_counter()
+    sequential = await grade_sequential(PASSAGES, delay=0.2)
+    sequential_seconds = time.perf_counter() - start
+
+    start = time.perf_counter()
+    concurrent = await grade_concurrent(PASSAGES, delay=0.2)
+    concurrent_seconds = time.perf_counter() - start
+
+    assert sequential == concurrent == [True, False, True]
+    assert sequential_seconds &gt;= 0.6
+    assert concurrent_seconds &lt; 0.4
+
+
+async def test_fetch_health_from_reference_api():
+    assert await fetch_health("http://localhost:8000/api/v1") == "ok"</code></pre>
+  <div class="callout warn"><b>The last test needs the reference stack running</b>
+    It calls the real API on port 8000. If Docker Desktop is closed, start it, then run <code>docker compose up -d</code>
+    in the reference folder.</div>
+
+  <h3>5. Checkpoint</h3>
+  <p><code>uv run pytest -q</code> should show <code>20 passed</code>. Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In <code>test_fake_grade</code>, remove one <code>await</code>. The test fails, and pytest warns
+      <code>coroutine 'fake_grade' was never awaited</code>. What are you comparing to <code>True</code> now?</li>
+    <li>In <code>fake_grade</code>, replace <code>await asyncio.sleep(delay)</code> with <code>time.sleep(delay)</code>. The
+      concurrency test now fails: "concurrent" takes 0.6 seconds. You just froze the event loop, which is the trap
+      from the concepts section.</li>
+    <li>Change the health URL's port to 8001 and read the <code>httpx.ConnectError</code>. That's what "nothing is listening
+      on that port" looks like.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>HTTP, JSON, settings, and logging</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Every part of this system talks to the others over HTTP with JSON: your browser to the API, the API to OpenSearch,
+    Ollama, and Jina. When something fails, the status code and the response body tell you which hop failed and why.
+    And every service reads its configuration (URLs, keys, limits) from environment variables, so the same code runs
+    on your laptop, inside Docker, and on a server.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>An HTTP exchange</h4>
+  <table class="plain">
+    <tr><th>Request part</th><th>Example from this project</th></tr>
+    <tr><td>Method</td><td><code>GET</code> to read, <code>POST</code> to send a body. Search and ask use <code>POST</code> because the question travels in a JSON body.</td></tr>
+    <tr><td>URL</td><td><code>http://localhost:8000/api/v1/hybrid-search/</code>: host, port, path</td></tr>
+    <tr><td>Headers</td><td><code>Content-Type: application/json</code> tells the server how to read the body</td></tr>
+    <tr><td>Body</td><td><code>{"query": "transformers", "size": 3}</code></td></tr>
+  </table>
+  <p>The reply has a status code, headers, and a body. The codes you'll meet in this project:</p>
+  <table class="plain">
+    <tr><th>Code</th><th>Meaning</th><th>When this API returns it</th></tr>
+    <tr><td>200</td><td>OK</td><td>Everything worked</td></tr>
+    <tr><td>404</td><td>Not Found</td><td>No endpoint at that path (typo in the URL)</td></tr>
+    <tr><td>422</td><td>Unprocessable Entity</td><td>The body failed Pydantic validation, or wasn't valid JSON</td></tr>
+    <tr><td>500</td><td>Internal Server Error</td><td>The endpoint code raised an unexpected exception</td></tr>
+    <tr><td>503</td><td>Service Unavailable</td><td><code>hybrid_search</code> returns this when OpenSearch is down</td></tr>
+  </table>
+  <p>
+    FastAPI also generates interactive documentation from your Pydantic models. Open
+    <a href="http://localhost:8000/docs">localhost:8000/docs</a> while the reference stack is running: every endpoint,
+    its request model, and a "Try it out" button.
+  </p>
+
+  <h4>Settings from the environment</h4>
+  <p>
+    An <b>environment variable</b> is a named value the operating system hands to a program when it starts. A
+    <code>.env</code> file is a convenient list of them. Keeping settings there instead of in code means different values per
+    machine without editing code, and secrets like your Jina API key stay out of git. <code>pydantic-settings</code> reads
+    them into a validated model, so a typo like <code>TIMEOUT=abc</code> fails immediately at startup instead of mysteriously later.
+  </p>
+
+  <h4>Logging</h4>
+  <p>
+    Nearly every file in the project starts with <code>logger = logging.getLogger(__name__)</code>. <code>__name__</code> is
+    the module's import path (like <code>src.routers.ask</code>), so each log line says where it came from. Levels, from
+    quiet to loud: <code>DEBUG</code>, <code>INFO</code>, <code>WARNING</code>, <code>ERROR</code>. Those API log lines we read
+    today, like <code>WARNING - Answer cites authors not in the retrieved papers</code>, came from exactly this.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/config.py</b> &middot; settings with pydantic-settings</p>
+  <table class="walk">
+    <tr><td><pre><code>class ArxivSettings(BaseConfigSettings):
+    model_config = SettingsConfigDict(
+        env_file=[".env", str(ENV_FILE_PATH)],</code></pre></td>
+      <td>A settings class. <code>env_file</code> lists <code>.env</code> files to read, in the current folder and the project root.</td></tr>
+    <tr><td><pre><code>        env_prefix="ARXIV__",</code></pre></td>
+      <td>Only variables starting with <code>ARXIV__</code> belong here. <code>ARXIV__MAX_RESULTS=15</code> in <code>.env</code> fills <code>max_results</code>.</td></tr>
+    <tr><td><pre><code>        extra="ignore",
+        frozen=True,
+        case_sensitive=False,</code></pre></td>
+      <td>Ignore unrelated variables; make settings read-only after loading; accept any capitalisation.</td></tr>
+    <tr><td><pre><code>    base_url: str = "https://export.arxiv.org/api/query"
+    rate_limit_delay: float = 3.0
+    max_results: int = 15</code></pre></td>
+      <td>Defaults, used when no variable is set. An environment value such as <code>"3.0"</code> is text, and Pydantic converts it to a float, just like <code>size="7"</code> on Day 1.</td></tr>
+  </table>
+  <p>
+    Open the reference <code>.env</code> and <code>compose.yml</code> side by side: <code>.env</code> says
+    <code>OPENSEARCH_HOST=http://opensearch:9200</code>, and <code>compose.yml</code> sets the same kind of values for the
+    containers under <code>environment:</code>. You'll see why the host is called <code>opensearch</code> and not
+    <code>localhost</code> tomorrow.
+  </p>
+
+  <div class="callout story">
+    <b>What happened here this week</b>
+    The first test question we sent from PowerShell came back as
+    <code>422 JSON decode error: Expecting property name enclosed in double quotes</code>. The API was fine. PowerShell
+    had mangled the quotes in the JSON before <code>curl.exe</code> sent it. The fix was to put the JSON in a file and send the
+    file. A 422 always means "your request is malformed", so look at what you sent.
+  </div>
+
+  <h3>4. Build</h3>
+  <h4>Part A: talk to the reference API by hand</h4>
+  <p>In PowerShell, with the reference stack running:</p>
+  <pre><code># 1. A GET request
+curl.exe -s http://localhost:8000/api/v1/health
+
+# 2. A POST request with a JSON body, sent from a file to avoid PowerShell's quoting problems
+'{"query": "retrieval augmented generation", "size": 3}' | Out-File -Encoding ascii search.json
+curl.exe -s -X POST http://localhost:8000/api/v1/hybrid-search/ -H "Content-Type: application/json" --data-binary "@search.json"
+
+# 3. The same POST, the PowerShell-native way
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/hybrid-search/ -ContentType "application/json" -Body '{"query": "transformers", "size": 2}'
+
+# 4. Provoke a 422 and a 404, and add -i to see the status line and headers
+curl.exe -s -i -X POST http://localhost:8000/api/v1/hybrid-search/ -H "Content-Type: application/json" -d "{bad json"
+curl.exe -s -i http://localhost:8000/api/v1/nope</code></pre>
+  <p>Delete <code>search.json</code> afterwards. Then open <a href="http://localhost:8000/docs">/docs</a> and run a hybrid search from the browser.</p>
+
+  <h4>Part B: settings</h4>
+  <pre><code>uv add pydantic-settings</code></pre>
+  <p>Write <code>playground/settings.py</code> with a <code>CuratorSettings</code> class based on <code>BaseSettings</code>:</p>
+  <ul>
+    <li>Reads variables with the prefix <code>CURATOR__</code> from the environment and from a <code>.env</code> file.</li>
+    <li><code>api_base_url: str</code>, default <code>"http://localhost:8000/api/v1"</code></li>
+    <li><code>timeout_seconds: float</code>, default <code>30.0</code></li>
+    <li><code>log_level: str</code>, default <code>"INFO"</code></li>
+  </ul>
+  <p>Then create a <code>.env</code> file in your project root containing <code>CURATOR__TIMEOUT_SECONDS=60</code>, and make sure
+    <code>.env</code> is listed in <code>.gitignore</code>. Add it if it isn't. A <code>.env</code> file must never be committed; the
+    reference project's <code>.env</code> holds a real API key.</p>
+
+  <h4>Part C: an API client</h4>
+  <p>Write <code>playground/api_client.py</code> with:</p>
+  <ul>
+    <li><code>PaperHit</code>, a Pydantic model: <code>arxiv_id: str</code>, <code>title: str</code>, <code>score: float</code>, <code>chunk_text: Optional[str] = None</code>.</li>
+    <li><code>search_papers(query: str, size: int = 3, settings: Optional[CuratorSettings] = None) -&gt; list[PaperHit]</code>:
+      uses a synchronous <code>httpx.Client</code> with the configured timeout to POST <code>{"query", "size", "use_hybrid": True}</code>
+      to <code>{api_base_url}/hybrid-search/</code>, calls <code>raise_for_status()</code>, and turns each item in the reply's
+      <code>"hits"</code> list into a <code>PaperHit</code>. Pydantic ignores the extra fields you didn't declare.</li>
+    <li>An <code>if __name__ == "__main__":</code> block: set up logging with <code>logging.basicConfig(level=settings.log_level)</code>,
+      read the query from <code>sys.argv[1]</code>, and print one line per hit: score, arxiv_id, title.</li>
+  </ul>
+  <p class="file"><b>tests/playground/test_day4.py</b></p>
+  <pre><code>from playground.api_client import PaperHit, search_papers
+from playground.settings import CuratorSettings
+
+
+def test_settings_defaults(monkeypatch):
+    monkeypatch.delenv("CURATOR__TIMEOUT_SECONDS", raising=False)
+    settings = CuratorSettings(_env_file=None)
+    assert settings.api_base_url == "http://localhost:8000/api/v1"
+    assert settings.timeout_seconds == 30.0
+
+
+def test_settings_read_from_environment(monkeypatch):
+    monkeypatch.setenv("CURATOR__TIMEOUT_SECONDS", "45")
+    assert CuratorSettings(_env_file=None).timeout_seconds == 45.0
+
+
+def test_search_papers_against_reference_api():
+    hits = search_papers("retrieval augmented generation", size=3)
+    assert 1 &lt;= len(hits) &lt;= 3
+    assert all(isinstance(hit, PaperHit) for hit in hits)
+    assert hits[0].score &gt;= hits[-1].score</code></pre>
+  <p>
+    <code>monkeypatch</code> is a built-in pytest fixture that changes environment variables for one test and restores them
+    afterwards. <code>_env_file=None</code> tells pydantic-settings to skip your <code>.env</code> file, so the test sees only
+    what it set.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run python -m playground.api_client "retrieval augmented generation"
+uv run pytest -q
+git status</code></pre>
+  <p>
+    The first command prints three results. Don't worry if the same paper appears twice: each result is one passage,
+    and a paper has many. The scores look tiny (around 0.016) because hybrid search combines two rankings with a
+    formula you'll build in Module 4. Tests: <code>23 passed</code>. In <code>git status</code>, <code>.env</code> must <b>not</b> appear. Then commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-day4" /><span>Day 4 checkpoint passed and committed, with <code>.env</code> not committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Call <code>search_papers("x", size=500)</code>. The API's own model allows at most 100, so it replies 422, and
+      <code>raise_for_status()</code> turns that into <code>httpx.HTTPStatusError</code>. Print <code>error.response.text</code> to see which rule failed.</li>
+    <li>Set <code>CURATOR__TIMEOUT_SECONDS=abc</code> in <code>.env</code> and run the client. It fails immediately with a
+      <code>ValidationError</code>. Settings validation catches the mistake at startup. Put it back afterwards.</li>
+    <li>Set the timeout to <code>0.001</code> and run it: <code>httpx.ReadTimeout</code> or <code>ConnectTimeout</code>. Now you know
+      what the Gradio bug looked like underneath.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 5                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day5"><span class="day">Day 5</span>Docker and Compose</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The reference project is 13 programs: PostgreSQL, OpenSearch, Redis, Ollama, Airflow, the API, and the Langfuse
+    services. Installing each one by hand, in the right version, on every laptop and server would take days and never
+    match exactly. Docker packages each program with everything it needs. Compose starts them all with one command,
+    connected on a private network. You've already run <code>docker compose up</code>; today you'll understand every line of it.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Image</td><td>A read-only package: an operating system base, the program, its libraries. Like a class. Example: <code>redis:7-alpine</code>.</td></tr>
+    <tr><td>Container</td><td>A running instance of an image, with its own processes and filesystem. Like an object created from the class. You can run many from one image.</td></tr>
+    <tr><td>Dockerfile</td><td>The recipe for building your own image, one instruction per line.</td></tr>
+    <tr><td>Layer and cache</td><td>Each Dockerfile instruction produces a layer. Docker reuses unchanged layers on rebuild, which is why the order of instructions matters for build speed.</td></tr>
+    <tr><td>Port mapping <code>"16379:6379"</code></td><td><code>HOST:CONTAINER</code>. Traffic to port 16379 on your laptop is forwarded to port 6379 inside the container.</td></tr>
+    <tr><td>Volume</td><td>Storage that outlives the container. Remove and recreate the container, and the data is still there.</td></tr>
+    <tr><td>Network</td><td>Containers in the same Compose project can reach each other <b>by service name</b>: the API connects to <code>redis:6379</code>. That name only exists inside the network.</td></tr>
+    <tr><td>Healthcheck</td><td>A command Docker runs periodically to decide whether the service is actually ready, not just started.</td></tr>
+  </table>
+
+  <div class="callout story">
+    <b>What happened here this week</b>
+    Every API rebuild took about 30 minutes. The image's biggest layer (all the Python packages, torch included) is
+    normally cached, but Docker's build cache had reached 30 GB, its cleanup limit, so that layer kept being deleted and
+    re-downloaded through your proxy. Layers and caching aren't theory; they decide whether a deploy takes 30 seconds or 30 minutes.
+  </div>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>ollama/Dockerfile</b> &middot; the smallest Dockerfile in the repo</p>
+  <table class="walk">
+    <tr><td><pre><code>FROM ollama/ollama:0.11.2</code></pre></td>
+      <td>Start from the official Ollama image, pinned to an exact version so every build is identical.</td></tr>
+    <tr><td><pre><code># The corporate proxy on this network terminates TLS, so registry.ollama.ai
+# presents a re-signed certificate that the base image does not trust.</code></pre></td>
+      <td>A comment explaining a constraint the code can't show. That's the kind of comment worth writing.</td></tr>
+    <tr><td><pre><code>COPY certs/corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt</code></pre></td>
+      <td>Copy a file from your laptop (the build context) into the image: your company's root certificate.</td></tr>
+    <tr><td><pre><code>RUN update-ca-certificates</code></pre></td>
+      <td>Run a command while building: add that certificate to the image's trusted list, so Ollama can download models through the proxy.</td></tr>
+  </table>
+
+  <p class="file"><b>compose.yml</b> &middot; the Redis service</p>
+  <table class="walk">
+    <tr><td><pre><code>  redis:</code></pre></td>
+      <td>The service name. Other containers reach it as the hostname <code>redis</code>.</td></tr>
+    <tr><td><pre><code>    image: redis:7-alpine</code></pre></td>
+      <td>Use a ready-made image: Redis 7 on Alpine Linux, which keeps it small. No Dockerfile needed.</td></tr>
+    <tr><td><pre><code>    container_name: rag-redis</code></pre></td>
+      <td>A fixed name, so <code>docker exec rag-redis ...</code> works.</td></tr>
+    <tr><td><pre><code>    ports:
+      - "6379:6379"</code></pre></td>
+      <td>Publish the port to your laptop, so tools outside Docker can connect via <code>localhost:6379</code>.</td></tr>
+    <tr><td><pre><code>    volumes:
+      - redis_data:/data</code></pre></td>
+      <td>Keep Redis's data in a named volume, so cached answers survive a container restart.</td></tr>
+    <tr><td><pre><code>    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru</code></pre></td>
+      <td>Override the start command: save writes to disk, cap memory at 256 MB, and when full, evict the least-recently-used keys. Standard cache settings.</td></tr>
+    <tr><td><pre><code>    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s</code></pre></td>
+      <td>Every 10 seconds, run <code>redis-cli ping</code> inside the container. A <code>PONG</code> reply means healthy. The API's <code>depends_on: redis: condition: service_healthy</code> waits for this.</td></tr>
+    <tr><td><pre><code>    restart: unless-stopped
+    networks:
+      - rag-network</code></pre></td>
+      <td>Restart after crashes or reboots unless you stopped it yourself; join the shared private network.</td></tr>
+  </table>
+  <div class="callout story">
+    <b>Why 13 tests failed on your laptop today</b>
+    The API test suite errored with <code>Error 11001 connecting to redis:6379. getaddrinfo failed</code>. The settings say the
+    Redis host is <code>redis</code>. That's right inside the Docker network, where the API container runs, and meaningless on
+    your laptop, where the name doesn't exist. From your laptop, the same Redis is at <code>localhost:6379</code>, via the published port.
+  </div>
+
+  <h3>4. Build</h3>
+  <p>Create <code>compose.yml</code> in your project root, with one service:</p>
+  <ul>
+    <li>Service <code>redis</code>, image <code>redis:7-alpine</code>, container name <code>curator-redis</code>.</li>
+    <li>Publish container port 6379 on host port <b>16379</b>, which follows the roadmap's +10000 convention so it never clashes with the reference Redis.</li>
+    <li>A named volume <code>curator_redis_data</code> mounted at <code>/data</code>, declared under a top-level <code>volumes:</code> key.</li>
+    <li>A healthcheck using <code>redis-cli ping</code>.</li>
+  </ul>
+  <pre><code>docker compose up -d
+docker compose ps
+docker exec curator-redis redis-cli ping
+docker compose logs redis</code></pre>
+  <p>Wait until <code>ps</code> shows <code>(healthy)</code>; the <code>exec</code> line should print <code>PONG</code>. Then:</p>
+  <pre><code>uv add redis</code></pre>
+  <p>Write <code>playground/cache_demo.py</code>, a tiny version of the reference project's <code>CacheClient</code>:</p>
+  <ul>
+    <li><code>cache_set(client, key: str, value: str, ttl_seconds: int) -&gt; None</code>: stores the value with an expiry time.</li>
+    <li><code>cache_get(client, key: str) -&gt; Optional[str]</code>: returns the value, or <code>None</code> if missing or expired.</li>
+    <li>A <code>__main__</code> block that connects to <code>localhost:16379</code>, stores a key for 10 seconds, reads it back, and prints the remaining TTL.</li>
+  </ul>
+  <details class="hint"><summary>Hint: redis-py</summary>
+    <p><code>redis.Redis(host="localhost", port=16379, decode_responses=True)</code>. The last argument returns strings instead of bytes.
+      <code>client.set(key, value, ex=ttl_seconds)</code> sets with expiry; <code>client.get(key)</code> reads.</p></details>
+  <p class="file"><b>tests/playground/test_cache_demo.py</b></p>
+  <pre><code>import redis
+
+from playground.cache_demo import cache_get, cache_set
+
+
+def test_cache_round_trip():
+    client = redis.Redis(host="localhost", port=16379, decode_responses=True)
+    cache_set(client, "question:1", "answer", ttl_seconds=5)
+    assert cache_get(client, "question:1") == "answer"
+    assert 0 &lt; client.ttl("question:1") &lt;= 5</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <p><code>uv run pytest -q</code> shows <code>24 passed</code>. Commit, including <code>compose.yml</code>.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-day5" /><span>Day 5 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li><code>docker compose stop</code>, then run the tests. Read the <code>ConnectionError</code>. Start it again with <code>docker compose start</code>.</li>
+    <li>In the test, change <code>host="localhost"</code> to <code>host="redis"</code>. You'll get the same <code>getaddrinfo failed</code> as the reference test suite, and now you know why.</li>
+    <li>Remove the <code>ports:</code> section and run <code>docker compose up -d</code>. The container is healthy (the healthcheck runs inside it), but your test can't reach it. Put the ports back.</li>
+    <li>Store a key without a TTL, run <code>docker compose down</code>, then <code>up -d</code>: the key survives, thanks to the volume.
+      Now run <code>docker compose down -v</code>, then <code>up -d</code>: it's gone. <code>-v</code> deletes volumes. Never run that on a database you care about.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 0" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. What's the difference between a type hint and a Pydantic model?</summary>
+    <div class="answer">Type hints are annotations for readers and tools; Python ignores them at runtime. A Pydantic model uses the
+      same hints to validate and convert data when an object is created, and raises <code>ValidationError</code> on bad input. In this
+      project, <code>AskRequest</code> rejects <code>top_k=50</code> before any search runs, and FastAPI turns that into a 422 response.</div></details>
+
+  <details class="drill"><summary>2. When would you pick a dataclass over a Pydantic model?</summary>
+    <div class="answer">For internal objects your own code constructs, where validation adds nothing. The agent's <code>Context</code>
+      holds live client objects and a few settings, so it's a dataclass. Anything crossing a boundary (HTTP bodies, LLM output, config)
+      is Pydantic.</div></details>
+
+  <details class="drill"><summary>3. What is a decorator? Explain what <code>@tool(response_format="content_and_artifact")</code> does.</summary>
+    <div class="answer">A decorator takes a function and returns a replacement: <code>@d</code> on <code>f</code> means <code>f = d(f)</code>.
+      With arguments, <code>tool(response_format=...)</code> runs first and returns the actual decorator. Here it wraps
+      <code>retrieve_papers</code> in a LangChain tool object with a name, a description from the docstring, and <code>ainvoke</code>. The
+      response format makes the tool return both text for the LLM and the raw documents for the code.</div></details>
+
+  <details class="drill"><summary>4. What problem do context managers solve? Give an example from the project.</summary>
+    <div class="answer">They guarantee cleanup runs even if an error happens inside the block. The Gradio client uses
+      <code>async with httpx.AsyncClient(...)</code> so connections are always released, and the RAG endpoint wraps generation in a tracing
+      context manager so the span is always closed. Bonus: that same client's 60-second timeout caused the "server not running" false alarm.</div></details>
+
+  <details class="drill"><summary>5. What is a generator, and why does streaming use <code>yield</code>?</summary>
+    <div class="answer">A function with <code>yield</code> returns a generator that produces values one at a time, pausing in between. The
+      <code>/stream</code> endpoint yields each piece of text as Ollama produces it, and <code>StreamingResponse</code> sends it immediately,
+      so the user sees the answer build up instead of waiting minutes for the whole thing.</div></details>
+
+  <details class="drill"><summary>6. Explain async/await to someone who isn't an engineer.</summary>
+    <div class="answer">One cook with several pots: instead of staring at one pot until it boils, the cook starts all of them and tends
+      whichever is ready. The program does other work while it waits on the network, instead of sitting idle. It removes waiting; it doesn't
+      make any single task faster.</div></details>
+
+  <details class="drill"><summary>7. What happens if you call an async function without <code>await</code>?</summary>
+    <div class="answer">You get a coroutine object and nothing runs. Python warns "coroutine was never awaited" when it's garbage-collected. A
+      common bug: <code>if check_something():</code> on an async function is always true, because a coroutine object is truthy.</div></details>
+
+  <details class="drill"><summary>8. The agent grades three chunks with <code>asyncio.gather</code>. Is grading now three times faster?</summary>
+    <div class="answer">Not necessarily. <code>gather</code> overlaps the waiting, but if Ollama on one CPU processes prompts one at a time, the
+      work is still sequential underneath. On a GPU server that handles parallel requests, it would be faster. Knowing where the real
+      bottleneck is matters more than the keyword.</div></details>
+
+  <details class="drill"><summary>9. What's wrong with a synchronous network call inside <code>async def</code>? Where does the project do this?</summary>
+    <div class="answer">It blocks the event loop, so every other request waits until it returns. <code>hybrid_search</code> calls the synchronous
+      <code>search_unified</code> inside an <code>async def</code> endpoint. Fixes: an async OpenSearch client, or a plain <code>def</code>
+      endpoint, which FastAPI runs in a thread pool.</div></details>
+
+  <details class="drill"><summary>10. What do 404, 422, 500, and 503 mean in this API?</summary>
+    <div class="answer">404: no endpoint at that path. 422: the request body failed validation or wasn't valid JSON, and your code never ran.
+      500: your code raised an unexpected exception. 503: a dependency is down; <code>hybrid_search</code> returns it when OpenSearch fails its
+      health check. The code tells you which hop to investigate.</div></details>
+
+  <details class="drill"><summary>11. Why keep settings in environment variables instead of in code?</summary>
+    <div class="answer">The same code runs in different places (laptop, Docker, production) with different values, and secrets like API keys
+      stay out of git. pydantic-settings validates them at startup, so a bad value fails fast with a clear error instead of breaking later.</div></details>
+
+  <details class="drill"><summary>12. Image versus container? Dockerfile versus Compose?</summary>
+    <div class="answer">An image is a read-only package; a container is a running instance of it. A Dockerfile is the recipe for building one
+      image; Compose describes how several containers run together: ports, volumes, environment, network, health checks, and startup order.</div></details>
+
+  <details class="drill"><summary>13. Why does the API reach Redis at <code>redis:6379</code>, while your laptop must use <code>localhost:6379</code>?</summary>
+    <div class="answer">Compose puts the containers on a private network with built-in DNS, where each service name is a hostname. Your laptop
+      isn't on that network, so <code>redis</code> doesn't resolve; that's the <code>getaddrinfo failed</code> error. Your laptop reaches Redis
+      through the published port mapping on <code>localhost</code>.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m0-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 1</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m0-tests" /><span><code>uv run pytest -q</code> shows 24 passed</span></li>
+    <li><input type="checkbox" data-id="m0-log" /><span><code>git log --oneline</code> shows at least five commits, and <code>.env</code> was never committed</span></li>
+    <li><input type="checkbox" data-id="m0-break" /><span>You can explain every "Break it" error without looking it up</span></li>
+  </ul>
+  <p>
+    Then send me "Module 0 passed". Module 1 turns your playground into a real application: a FastAPI app, settings,
+    PostgreSQL, and a Compose stack of your own.
+  </p>
+  <p><a href="module-01-infrastructure.html">Next: Module 1, Infrastructure &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

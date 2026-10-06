@@ -1,0 +1,1521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 3 — Keyword search</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 3 &middot; 4 days</p>
+    <h1><span class="grad">Keyword search</span>: OpenSearch, BM25, and the search endpoint</h1>
+    <p class="lede">
+      Your papers sit in PostgreSQL, but a database is bad at "find the papers most relevant to this question".
+      This module adds a search engine. By the end, <code>POST http://localhost:18000/api/v1/hybrid-search/</code>
+      with <code>"use_hybrid": false</code> returns your own papers ranked by BM25, the classic keyword-relevance formula.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: search concepts &amp; OpenSearch in Compose</span>
+      <span class="pill">Day 2: the index mapping &amp; the client</span>
+      <span class="pill">Day 3: BM25 &amp; the query builder</span>
+      <span class="pill">Day 4: the endpoint &amp; indexing your papers</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 3</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: How search engines work, and OpenSearch in your stack</a></li>
+      <li><a href="#day2">Day 2: The chunk index mapping and the OpenSearch client</a></li>
+      <li><a href="#day3">Day 3: BM25 and the query builder</a></li>
+      <li><a href="#day4">Day 4: The search endpoint and a stepping-stone indexer</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 4</a></li>
+    </ol>
+  </div>
+
+  <div class="callout warn">
+    <b>RAM: stop the reference stack while you work</b>
+    From this module on, your stack gets heavy (OpenSearch alone reserves 512 MB of Java heap, plus Dashboards).
+    Before starting your containers, run <code>docker compose stop</code> in the reference folder. Start it again with
+    <code>docker compose start</code> when you want to compare. On Day 3 you'll briefly want the reference OpenSearch running
+    to look at real scores; stop yours for that.
+  </div>
+
+  <div class="callout info">
+    <b>What you have at the start</b>
+    From Module 1: a FastAPI app in <code>src/</code> with settings, PostgreSQL, the ping router, and a Compose stack
+    (redis, postgres, api). From Module 2: the arXiv client, PDF parsing, the metadata fetcher, and an Airflow DAG running
+    <code>setup &gt;&gt; fetch &gt;&gt; report</code> that puts papers into your Postgres.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>How search engines work, and OpenSearch in your stack</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    RAG is only as good as its retrieval. If the right passage never reaches the language model, no prompt can fix the
+    answer. Postgres can do <code>WHERE abstract LIKE '%transformer%'</code>, but that scans every row, can't tell a
+    passage that mentions "transformer" once from one that is about transformers, and misses "Transformers" and "transform".
+    A search engine solves all three: it's fast, it ranks, and it understands word forms.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Document</td><td>One JSON object stored in the search engine. In this project, one document = one <b>chunk</b> (a passage of a paper), not one paper.</td></tr>
+    <tr><td>Index</td><td>A named collection of documents with a shared schema, like a table. Yours will be <code>arxiv-papers-chunks</code>.</td></tr>
+    <tr><td>Mapping</td><td>The index schema: which fields exist and what type each is (<code>text</code>, <code>keyword</code>, <code>date</code>, ...).</td></tr>
+    <tr><td>Inverted index</td><td>A lookup table from each word to the list of documents containing it, like the index at the back of a book. Searching "attention" reads one list instead of scanning every document.</td></tr>
+    <tr><td>Analyzer</td><td>The recipe that turns text into the words (called <b>tokens</b> or <b>terms</b>) stored in the inverted index: split into words, lowercase, drop filler words, reduce to a stem.</td></tr>
+    <tr><td>Relevance score</td><td>A number saying how well a document matches a query. Results are sorted by it. BM25 (Day 3) computes it.</td></tr>
+    <tr><td>Shard / replica</td><td>An index is split into shards (pieces) that can live on different machines; a replica is a copy of a shard for safety. On one laptop: 1 shard, 0 replicas.</td></tr>
+  </table>
+
+  <h4>Analysis, by example</h4>
+  <p>The reference index defines an analyzer called <code>text_analyzer</code>. This is what it does to a real title (from the reference OpenSearch, via the <code>_analyze</code> API):</p>
+  <pre><code>"Retrieval-Augmented Generation for LLMs"
+  tokenizer "standard"   -&gt; Retrieval | Augmented | Generation | for | LLMs
+  filter "lowercase"     -&gt; retrieval | augmented | generation | for | llms
+  filter "stop"          -&gt; retrieval | augmented | generation | llms        ("for" removed)
+  filter "snowball"      -&gt; retriev   | augment   | generat    | llms         (stems)</code></pre>
+  <p>
+    The same analyzer runs on the <b>query</b>. So a user typing "generating retrievals" produces <code>generat</code> and
+    <code>retriev</code>, which match. That is the whole trick behind "understands word forms". A <code>keyword</code>
+    field is not analyzed at all: it stores the exact string, which is right for IDs and categories like <code>cs.AI</code>.
+  </p>
+
+  <h4>OpenSearch and Dashboards</h4>
+  <p>
+    <b>OpenSearch</b> is an open-source search engine (a fork of Elasticsearch), written in Java, that you talk to over
+    HTTP with JSON. <b>OpenSearch Dashboards</b> is its web UI; the part you'll use is <b>Dev Tools</b>, a console for
+    sending requests by hand. Java programs reserve a fixed block of memory called the <b>heap</b>;
+    <code>-Xms512m -Xmx512m</code> sets it to 512 MB at start and maximum.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>compose.yml</b> &middot; the reference <code>opensearch</code> service</p>
+  <table class="walk">
+    <tr><td><pre><code>  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: rag-opensearch</code></pre></td>
+      <td>Pinned version. The API and Airflow reach it at the hostname <code>opensearch</code>.</td></tr>
+    <tr><td><pre><code>    environment:
+      - discovery.type=single-node</code></pre></td>
+      <td>Don't look for other nodes to form a cluster. Without this, OpenSearch waits for peers and runs production checks that fail on a laptop.</td></tr>
+    <tr><td><pre><code>      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m</code></pre></td>
+      <td>Java heap fixed at 512 MB. Enough for a few thousand chunks; production clusters use many GB.</td></tr>
+    <tr><td><pre><code>      - DISABLE_SECURITY_PLUGIN=true</code></pre></td>
+      <td>No TLS and no login, so plain <code>http://</code> works. Fine for local development only; never on a server.</td></tr>
+    <tr><td><pre><code>      - bootstrap.memory_lock=true
+    ...
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1</code></pre></td>
+      <td>Lock the heap in RAM so the operating system never swaps it to disk, which would make searches crawl. The <code>ulimits</code> block gives the container permission to lock memory.</td></tr>
+    <tr><td><pre><code>    ports:
+      - "9200:9200"
+      - "9600:9600"</code></pre></td>
+      <td>9200 is the REST API you'll use. 9600 is the Performance Analyzer plugin's port.</td></tr>
+    <tr><td><pre><code>    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      ...
+      start_period: 60s</code></pre></td>
+      <td>Indexed data survives restarts. Healthy means the cluster-health endpoint answers. Java starts slowly, hence the 60 s grace period.</td></tr>
+  </table>
+  <p class="file"><b>compose.yml</b> &middot; <code>opensearch-dashboards</code></p>
+  <pre><code>  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    container_name: rag-dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    depends_on:
+      - opensearch</code></pre>
+  <p>
+    Dashboards is a separate program that talks to OpenSearch over the Docker network, so it uses the service name
+    <code>opensearch</code>, not <code>localhost</code>. Its version must match OpenSearch's.
+  </p>
+
+  <p class="file"><b>src/config.py</b> &middot; <code>OpenSearchSettings</code></p>
+  <pre><code>class OpenSearchSettings(BaseConfigSettings):
+    model_config = SettingsConfigDict(
+        env_file=[".env", str(ENV_FILE_PATH)],
+        env_prefix="OPENSEARCH__",
+        extra="ignore",
+        frozen=True,
+        case_sensitive=False,
+    )
+
+    host: str = "http://localhost:9200"
+    index_name: str = "arxiv-papers"
+    chunk_index_suffix: str = "chunks"  # Creates single hybrid index: {index_name}-{suffix}
+    max_text_size: int = 1000000
+
+    # Vector search settings
+    vector_dimension: int = 1024  # Jina embeddings dimension
+    vector_space_type: str = "cosinesimil"  # cosinesimil, l2, innerproduct
+
+    # Hybrid search settings
+    rrf_pipeline_name: str = "hybrid-rrf-pipeline"
+    hybrid_search_size_multiplier: int = 2  # Get k*multiplier for better recall</code></pre>
+  <p>
+    Same pattern as <code>ArxivSettings</code> in Module 1: a prefix, and <code>Settings</code> holds it as
+    <code>opensearch: OpenSearchSettings = Field(default_factory=OpenSearchSettings)</code>. The index name is built from two
+    settings: <code>arxiv-papers</code> + <code>-</code> + <code>chunks</code>. Only <code>host</code>, <code>index_name</code>, and
+    <code>chunk_index_suffix</code> are actually read by the code; the vector and RRF settings are documentation (the real
+    values are hard-coded in <code>index_config_hybrid.py</code>, which you'll see tomorrow).
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: add the two services to your <code>compose.yml</code></h4>
+  <ul>
+    <li><code>opensearch</code>: same image, environment, <code>ulimits</code>, and healthcheck as the reference; <code>container_name: curator-opensearch</code>;
+      ports <code>"19200:9200"</code> and <code>"19600:9600"</code>; named volume <code>curator_opensearch_data</code> (declare it under
+      top-level <code>volumes:</code>); network <code>curator-network</code>.</li>
+    <li><code>opensearch-dashboards</code>: same image and environment; <code>container_name: curator-dashboards</code>;
+      port <code>"15601:5601"</code>; <code>depends_on: - opensearch</code>; network <code>curator-network</code>.</li>
+    <li>In the <code>api</code> service: add <code>opensearch: condition: service_healthy</code> under <code>depends_on</code>, and
+      <code>OPENSEARCH__HOST=http://opensearch:9200</code> under <code>environment</code> (container port 9200, not 19200: inside the
+      network, published ports don't apply).</li>
+  </ul>
+
+  <h4>Step B: settings</h4>
+  <p>
+    Add <code>OpenSearchSettings</code> to <code>src/config.py</code> exactly as above, and the field
+    <code>opensearch: OpenSearchSettings = Field(default_factory=OpenSearchSettings)</code> to <code>Settings</code>.
+    Add these lines to your <code>.env</code> (and to <code>.env.example</code> if you keep one), copied from the reference:
+  </p>
+  <pre><code>OPENSEARCH_HOST=http://opensearch:9200
+OPENSEARCH__HOST=http://opensearch:9200
+OPENSEARCH__INDEX_NAME=arxiv-papers
+OPENSEARCH__CHUNK_INDEX_SUFFIX=chunks</code></pre>
+  <p>Then install the Python client (you'll use it tomorrow):</p>
+  <pre><code>uv add opensearch-py</code></pre>
+
+  <p class="file"><b>tests/unit/test_opensearch_settings.py</b></p>
+  <pre><code>from src.config import OpenSearchSettings
+
+
+def test_opensearch_settings_defaults(monkeypatch):
+    monkeypatch.delenv("OPENSEARCH__HOST", raising=False)
+    settings = OpenSearchSettings(_env_file=None)
+    assert settings.host == "http://localhost:9200"
+    assert settings.index_name == "arxiv-papers"
+    assert settings.chunk_index_suffix == "chunks"
+
+
+def test_opensearch_host_from_environment(monkeypatch):
+    monkeypatch.setenv("OPENSEARCH__HOST", "http://localhost:19200")
+    assert OpenSearchSettings(_env_file=None).host == "http://localhost:19200"</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>cd C:\Users\mrigsing\Downloads\production-agentic-rag-course; docker compose stop
+cd C:\Users\mrigsing\Downloads\my-paper-curator
+docker compose up -d opensearch opensearch-dashboards
+docker compose ps
+curl.exe -s http://localhost:19200
+curl.exe -s "http://localhost:19200/_cluster/health?pretty"
+uv run pytest tests/unit/test_opensearch_settings.py -q</code></pre>
+  <p>
+    Wait for <code>curator-opensearch</code> to show <code>(healthy)</code> (up to a minute). The first <code>curl.exe</code> prints a JSON
+    greeting with <code>"number" : "2.19.0"</code>. Cluster health shows <code>"status" : "green"</code>. Tests: <code>2 passed</code>, and your full
+    <code>uv run pytest -q</code> still has no failures.
+  </p>
+  <p>
+    Now open <a href="http://localhost:15601">localhost:15601</a> (Dashboards takes another minute to start), open the menu,
+    choose <b>Dev Tools</b>, and run:
+  </p>
+  <pre><code>POST _analyze
+{
+  "tokenizer": "standard",
+  "filter": ["lowercase", "stop", "snowball"],
+  "text": "Retrieval-Augmented Generation for LLMs"
+}</code></pre>
+  <p>You should get the four tokens <code>retriev</code>, <code>augment</code>, <code>generat</code>, <code>llms</code>. Commit.</p>
+  <pre><code>git add -A
+git commit -m "Module 3 Day 1: OpenSearch and Dashboards in compose"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m3-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In Dev Tools, analyze <code>"The Transformers are learning"</code> with <code>"analyzer": "standard"</code>, then with the
+      filters above. Which words survive each? This is why the reference uses a custom analyzer for body text.</li>
+    <li><code>curl.exe -s https://localhost:19200</code>. You get a TLS error: security is disabled, so there is no HTTPS. Every client
+      in this project uses <code>http://</code> for OpenSearch.</li>
+    <li>Remove <code>DISABLE_SECURITY_PLUGIN=true</code>, run <code>docker compose up -d opensearch</code>, then
+      <code>docker compose logs opensearch</code>. With security on, recent OpenSearch versions refuse to start without an initial admin
+      password. Read the log line that says so, then put the setting back.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>The chunk index mapping and the OpenSearch client</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The mapping is a contract between everything that writes to the index (your indexer, Airflow) and everything that
+    reads it (the API, the agent). Get a field type wrong and searches silently miss, or indexing fails in the middle of
+    the night. The client class wraps every OpenSearch call the rest of the app makes, so you only have to get them right once.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <table class="plain">
+    <tr><th>Field type</th><th>Stored as</th><th>Use for</th></tr>
+    <tr><td><code>text</code></td><td>Analyzed tokens in the inverted index</td><td>Full-text search: <code>chunk_text</code>, <code>title</code>, <code>abstract</code></td></tr>
+    <tr><td><code>keyword</code></td><td>The exact string</td><td>IDs, categories, filters, sorting: <code>arxiv_id</code>, <code>categories</code></td></tr>
+    <tr><td><code>integer</code>, <code>date</code></td><td>Numbers</td><td>Ranges and sorting: <code>chunk_index</code>, <code>published_date</code></td></tr>
+    <tr><td><code>knn_vector</code></td><td>A list of numbers, in a vector search structure</td><td>Meaning-based search (Module 4)</td></tr>
+  </table>
+  <p>
+    A <b>multi-field</b> stores one value two ways: <code>title</code> as <code>text</code> for searching, and <code>title.keyword</code>
+    as <code>keyword</code> for exact matching or sorting. <b>Dynamic mapping</b> is what OpenSearch does when a document contains an
+    unknown field: by default it guesses a type and adds it. <code>"dynamic": "strict"</code> turns that off, so an unknown field is an error.
+    A <b>bulk</b> request sends many documents in one HTTP call, which is far faster than one call per document.
+    A <b>refresh</b> makes newly indexed documents visible to search; OpenSearch does it every second by default.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/opensearch/index_config_hybrid.py</b> &middot; settings part of <code>ARXIV_PAPERS_CHUNKS_MAPPING</code></p>
+  <table class="walk">
+    <tr><td><pre><code>ARXIV_PAPERS_CHUNKS_INDEX = "arxiv-papers-chunks"</code></pre></td>
+      <td>The name, also built from settings in the client. Only the settings version is used.</td></tr>
+    <tr><td><pre><code>    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,</code></pre></td>
+      <td>One piece, no copies. A replica on a one-node cluster could never be placed anywhere, so the index would stay "yellow".</td></tr>
+    <tr><td><pre><code>        "index.knn": True,
+        "index.knn.space_type": "cosinesimil",</code></pre></td>
+      <td>Turns on vector search for this index. You won't use it until Module 4, but it must be set when the index is created; you can't switch it on later.</td></tr>
+    <tr><td><pre><code>        "analysis": {
+            "analyzer": {
+                "standard_analyzer": {"type": "standard", "stopwords": "_english_"},
+                "text_analyzer": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase", "stop", "snowball"]},</code></pre></td>
+      <td>Two named analyzers. <code>standard_analyzer</code> splits and lowercases and drops English stopwords but doesn't stem: right for author names ("Park" must not become "par"). <code>text_analyzer</code> adds stemming: right for prose.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/index_config_hybrid.py</b> &middot; the fields</p>
+  <table class="walk">
+    <tr><td><pre><code>    "mappings": {
+        "dynamic": "strict",</code></pre></td>
+      <td>Unknown fields are rejected. A typo like <code>chunk_txt</code> fails loudly instead of creating a useless new field.</td></tr>
+    <tr><td><pre><code>            "chunk_id": {"type": "keyword"},
+            "arxiv_id": {"type": "keyword"},
+            "paper_id": {"type": "keyword"},
+            "chunk_index": {"type": "integer"},</code></pre></td>
+      <td>Identity. <code>arxiv_id</code> is a keyword so <code>{"term": {"arxiv_id": ...}}</code> matches exactly. <code>paper_id</code> is the Postgres UUID. <code>chunk_index</code> is the chunk's position in its paper. (<code>chunk_id</code> is declared but the indexer never fills it; the client uses OpenSearch's own <code>_id</code> instead.)</td></tr>
+    <tr><td><pre><code>            "chunk_text": {
+                "type": "text",
+                "analyzer": "text_analyzer",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+            },</code></pre></td>
+      <td>The passage itself: the most important searchable field. The <code>.keyword</code> copy is skipped for strings over 256 characters, which is nearly every chunk, so it's rarely useful here.</td></tr>
+    <tr><td><pre><code>            "chunk_word_count": {"type": "integer"},
+            "start_char": {"type": "integer"},
+            "end_char": {"type": "integer"},</code></pre></td>
+      <td>Where the chunk came from, for debugging chunking (Module 4).</td></tr>
+    <tr><td><pre><code>            "embedding": {
+                "type": "knn_vector",
+                "dimension": 1024,  # Jina v3 embeddings dimension
+                "method": {
+                    "name": "hnsw",
+                    "space_type": "cosinesimil",
+                    "engine": "nmslib",
+                    ...</code></pre></td>
+      <td>A slot for the chunk's meaning as 1024 numbers. <b>Empty in this module</b>: your stepping-stone indexer sends <code>None</code>, and OpenSearch simply stores no vector. Module 4 explains every line here and fills it.</td></tr>
+    <tr><td><pre><code>            "title": {"type": "text", "analyzer": "text_analyzer", "fields": {"keyword": ...}},
+            "authors": {"type": "text", "analyzer": "standard_analyzer", "fields": {"keyword": ...}},
+            "abstract": {"type": "text", "analyzer": "text_analyzer"},</code></pre></td>
+      <td>The paper's metadata, copied into <b>every</b> chunk. This is called <b>denormalization</b>: storing the same data in many places so a search never has to join with Postgres. Note <code>authors</code> is one text string, not a list.</td></tr>
+    <tr><td><pre><code>            "categories": {"type": "keyword"},
+            "published_date": {"type": "date"},
+            "section_title": {"type": "keyword"},
+            "embedding_model": {"type": "keyword"},
+            "created_at": {"type": "date"},
+            "updated_at": {"type": "date"},</code></pre></td>
+      <td>Filters and sorting. A keyword field accepts a list, so <code>["cs.AI", "cs.LG"]</code> is fine. There is <b>no <code>pdf_url</code></b>: with strict mapping, sending one would fail, which is why search results always show <code>"pdf_url": null</code>.</td></tr>
+  </table>
+  <p>
+    You can see this exact mapping on the reference index with <code>GET arxiv-papers-chunks/_mapping</code> in the reference
+    Dashboards (localhost:5601).
+  </p>
+
+  <p class="file"><b>src/services/opensearch/client.py</b> &middot; construction and health</p>
+  <table class="walk">
+    <tr><td><pre><code>class OpenSearchClient:
+    def __init__(self, host: str, settings: Settings):
+        self.host = host
+        self.settings = settings
+        self.index_name = f"{settings.opensearch.index_name}-{settings.opensearch.chunk_index_suffix}"</code></pre></td>
+      <td>Our wrapper. The index name comes from settings, which is how your tests will point at a throwaway index.</td></tr>
+    <tr><td><pre><code>        self.client = OpenSearch(
+            hosts=[host],
+            use_ssl=False,
+            verify_certs=False,
+            ssl_show_warn=False,
+        )</code></pre></td>
+      <td>The low-level client from <code>opensearch-py</code>. Creating it doesn't connect; the first request does. Our class keeps it in <code>self.client</code>, which is also what tests replace with a mock.</td></tr>
+    <tr><td><pre><code>    def health_check(self) -&gt; bool:
+        try:
+            health = self.client.cluster.health()
+            return health["status"] in ["green", "yellow"]
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False</code></pre></td>
+      <td>Green: all shards placed. Yellow: data is available but some replicas aren't (normal on one node). Red: some data unavailable. Any exception, including "connection refused", becomes <code>False</code>: callers get a yes/no, never a crash.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/client.py</b> &middot; creating the index</p>
+  <table class="walk">
+    <tr><td><pre><code>    def setup_indices(self, force: bool = False) -&gt; Dict[str, bool]:
+        results = {}
+        results["hybrid_index"] = self._create_hybrid_index(force)
+        results["rrf_pipeline"] = self._create_rrf_pipeline(force)
+        return results</code></pre></td>
+      <td>Called at API startup and by Airflow's setup task. Your Module 3 version has only the first line; the RRF pipeline is Module 4.</td></tr>
+    <tr><td><pre><code>            if force and self.client.indices.exists(index=self.index_name):
+                self.client.indices.delete(index=self.index_name)</code></pre></td>
+      <td><code>force=True</code> means "start over": delete, then recreate. Your tests use it; production code never should.</td></tr>
+    <tr><td><pre><code>            if not self.client.indices.exists(index=self.index_name):
+                self.client.indices.create(index=self.index_name, body=ARXIV_PAPERS_CHUNKS_MAPPING)
+                return True
+            return False</code></pre></td>
+      <td><b>Idempotent</b>: safe to call any number of times. The result is the same index, and the return value says whether this call created it.</td></tr>
+    <tr><td><pre><code>        except Exception as e:
+            # Handle race condition when multiple workers start simultaneously:
+            # all check exists() -&gt; False, all try to create, only one succeeds.
+            if "resource_already_exists_exception" in str(e):
+                return False
+            raise</code></pre></td>
+      <td>The API container runs 4 uvicorn workers (see the <code>CMD</code> in the <code>Dockerfile</code>), each running the lifespan. Between "check" and "create", another worker can win. This handles that race; any other error is re-raised.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/client.py</b> &middot; bulk indexing and deleting</p>
+  <table class="walk">
+    <tr><td><pre><code>    def bulk_index_chunks(self, chunks: List[Dict[str, Any]]) -&gt; Dict[str, int]:
+        from opensearchpy import helpers</code></pre></td>
+      <td>Input: a list of <code>{"chunk_data": {...}, "embedding": [...]}</code>. The import inside the function is unusual; a top-level import would be normal.</td></tr>
+    <tr><td><pre><code>            for chunk in chunks:
+                chunk_data = chunk["chunk_data"].copy()
+                chunk_data["embedding"] = chunk["embedding"]
+                action = {"_index": self.index_name, "_source": chunk_data}
+                actions.append(action)</code></pre></td>
+      <td>Copy first, so the caller's dictionary isn't modified. Each <b>action</b> says "put this document in this index". No <code>_id</code> is given, so OpenSearch generates a random one; indexing the same chunk twice creates a duplicate.</td></tr>
+    <tr><td><pre><code>            success, failed = helpers.bulk(self.client, actions, refresh=True)
+            return {"success": success, "failed": len(failed)}</code></pre></td>
+      <td>One HTTP request for all documents. <code>refresh=True</code> makes them searchable immediately (convenient; slower for huge batches). By default <code>helpers.bulk</code> <b>raises</b> <code>BulkIndexError</code> if any document fails, so <code>failed</code> is normally empty.</td></tr>
+    <tr><td><pre><code>    def delete_paper_chunks(self, arxiv_id: str) -&gt; bool:
+            response = self.client.delete_by_query(
+                index=self.index_name, body={"query": {"term": {"arxiv_id": arxiv_id}}}, refresh=True
+            )</code></pre></td>
+      <td>Deletes every chunk of one paper. Because of the random IDs above, "delete then re-insert" is how this project avoids duplicates.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/factory.py</b></p>
+  <pre><code>@lru_cache(maxsize=1)
+def make_opensearch_client(settings: Optional[Settings] = None) -&gt; OpenSearchClient:
+    if settings is None:
+        settings = get_settings()
+    return OpenSearchClient(host=settings.opensearch.host, settings=settings)
+
+
+def make_opensearch_client_fresh(settings: Optional[Settings] = None, host: Optional[str] = None) -&gt; OpenSearchClient:
+    ...
+    opensearch_host = host or settings.opensearch.host
+    return OpenSearchClient(host=opensearch_host, settings=settings)</code></pre>
+  <p>
+    <code>lru_cache(maxsize=1)</code> makes the first function a singleton: every call returns the same client (and its connection
+    pool). The <code>_fresh</code> version builds a new one each time, with an optional host override; Airflow's indexing task uses it in Module 4.
+    <code>__init__.py</code> re-exports <code>OpenSearchClient</code>, <code>make_opensearch_client</code>, <code>make_opensearch_client_fresh</code>, and <code>QueryBuilder</code>.
+  </p>
+
+  <h3>4. Build</h3>
+  <p>Create <code>src/services/opensearch/</code> with:</p>
+  <ol>
+    <li><code>index_config_hybrid.py</code>: <code>ARXIV_PAPERS_CHUNKS_INDEX</code> and the full <code>ARXIV_PAPERS_CHUNKS_MAPPING</code>, identical to the reference.
+      Leave out <code>HYBRID_RRF_PIPELINE</code> and the commented-out block below it (Module 4).</li>
+    <li><code>client.py</code>: <code>OpenSearchClient</code> with <code>__init__</code>, <code>health_check</code>, <code>get_index_stats</code>,
+      <code>setup_indices</code> (returning only <code>{"hybrid_index": ...}</code> for now), <code>_create_hybrid_index</code>,
+      <code>bulk_index_chunks</code>, and <code>delete_paper_chunks</code>, same signatures and behaviour as the reference. Don't import
+      <code>QueryBuilder</code> yet; tomorrow you add it together with the search methods.</li>
+    <li><code>factory.py</code> as in the reference, and an <code>__init__.py</code> exporting <code>OpenSearchClient</code>,
+      <code>make_opensearch_client</code>, and <code>make_opensearch_client_fresh</code> (add <code>QueryBuilder</code> tomorrow).</li>
+  </ol>
+  <details class="hint"><summary>Hint: get_index_stats</summary>
+    <p>If the index doesn't exist, return <code>{"index_name": ..., "exists": False, "document_count": 0}</code>. Otherwise
+      <code>self.client.indices.stats(index=...)["indices"][self.index_name]["total"]</code> has <code>["docs"]["count"]</code>,
+      <code>["docs"]["deleted"]</code>, and <code>["store"]["size_in_bytes"]</code>. Catch exceptions and add an <code>"error"</code> key.</p></details>
+
+  <h4>Unit tests: no OpenSearch needed</h4>
+  <p>
+    These replace the low-level client with a <code>MagicMock</code>: an object that accepts any method call, returns whatever you
+    configure, and records how it was called. That tests <em>your</em> logic without a server.
+  </p>
+  <p class="file"><b>tests/unit/services/conftest.py</b></p>
+  <pre><code>from unittest.mock import MagicMock
+
+import pytest
+from src.config import OpenSearchSettings, Settings
+from src.services.opensearch.client import OpenSearchClient
+
+
+@pytest.fixture
+def os_client():
+    """An OpenSearchClient whose low-level client is a MagicMock: no network."""
+    settings = Settings(opensearch=OpenSearchSettings(_env_file=None))
+    client = OpenSearchClient(host="http://localhost:9200", settings=settings)
+    client.client = MagicMock()
+    return client</code></pre>
+  <p class="file"><b>tests/unit/services/test_opensearch_client.py</b></p>
+  <pre><code>from unittest.mock import patch
+
+import pytest
+from src.services.opensearch.index_config_hybrid import ARXIV_PAPERS_CHUNKS_MAPPING
+
+
+def test_index_name_combines_name_and_suffix(os_client):
+    assert os_client.index_name == "arxiv-papers-chunks"
+
+
+@pytest.mark.parametrize("status, expected", [("green", True), ("yellow", True), ("red", False)])
+def test_health_check_reads_cluster_status(os_client, status, expected):
+    os_client.client.cluster.health.return_value = {"status": status}
+    assert os_client.health_check() is expected
+
+
+def test_health_check_is_false_when_unreachable(os_client):
+    os_client.client.cluster.health.side_effect = ConnectionError("refused")
+    assert os_client.health_check() is False
+
+
+def test_setup_creates_missing_index(os_client):
+    os_client.client.indices.exists.return_value = False
+    assert os_client.setup_indices() == {"hybrid_index": True}
+    os_client.client.indices.create.assert_called_once_with(
+        index="arxiv-papers-chunks", body=ARXIV_PAPERS_CHUNKS_MAPPING
+    )
+
+
+def test_setup_leaves_existing_index_alone(os_client):
+    os_client.client.indices.exists.return_value = True
+    assert os_client.setup_indices() == {"hybrid_index": False}
+    os_client.client.indices.create.assert_not_called()
+
+
+def test_bulk_index_builds_one_action_per_chunk(os_client):
+    chunks = [
+        {"chunk_data": {"arxiv_id": "1706.03762", "chunk_text": "a"}, "embedding": None},
+        {"chunk_data": {"arxiv_id": "1810.04805", "chunk_text": "b"}, "embedding": None},
+    ]
+    with patch("opensearchpy.helpers.bulk", return_value=(2, [])) as bulk:
+        assert os_client.bulk_index_chunks(chunks) == {"success": 2, "failed": 0}
+
+    actions = bulk.call_args.args[1]
+    assert [a["_index"] for a in actions] == ["arxiv-papers-chunks", "arxiv-papers-chunks"]
+    assert actions[0]["_source"] == {"arxiv_id": "1706.03762", "chunk_text": "a", "embedding": None}
+    assert "embedding" not in chunks[0]["chunk_data"]</code></pre>
+  <p>
+    <code>side_effect</code> makes the mock raise instead of return. <code>patch("opensearchpy.helpers.bulk", ...)</code> works because the
+    client imports <code>helpers</code> inside the function, so it looks up <code>helpers.bulk</code> at call time and finds the patched one.
+  </p>
+
+  <h4>Live tests: against your own OpenSearch</h4>
+  <p>
+    Mocks can't tell you whether the mapping is valid or the analyzer does what you think. These tests create a throwaway
+    index called <code>test-arxiv-papers-chunks</code> on your OpenSearch (port 19200), and delete it after each test, so your real index is never touched.
+  </p>
+  <p class="file"><b>tests/integration/conftest.py</b></p>
+  <pre><code>import os
+from datetime import datetime
+
+import pytest
+from src.config import OpenSearchSettings, Settings
+from src.services.opensearch.client import OpenSearchClient
+
+
+@pytest.fixture
+def live_client():
+    """A client for a throwaway index on your own OpenSearch. Deleted after each test."""
+    host = os.getenv("OPENSEARCH_TEST_HOST", "http://localhost:19200")
+    settings = Settings(opensearch=OpenSearchSettings(_env_file=None, index_name="test-arxiv-papers"))
+    client = OpenSearchClient(host=host, settings=settings)
+    client.setup_indices(force=True)
+    yield client
+    client.client.indices.delete(index=client.index_name)
+
+
+def make_chunk(arxiv_id: str, title: str, abstract: str, categories: list[str], published: str) -&gt; dict:
+    text = f"{title}\n\nAbstract: {abstract}"
+    return {
+        "chunk_data": {
+            "arxiv_id": arxiv_id,
+            "chunk_index": 0,
+            "chunk_text": text,
+            "title": title,
+            "abstract": abstract,
+            "categories": categories,
+            "published_date": datetime.fromisoformat(published),
+        },
+        "embedding": None,
+    }
+
+
+@pytest.fixture
+def sample_chunks():
+    return [
+        make_chunk(
+            "1706.03762",
+            "Attention Is All You Need",
+            "We propose the Transformer, a network architecture based solely on attention mechanisms.",
+            ["cs.CL"],
+            "2017-06-12",
+        ),
+        make_chunk(
+            "1810.04805",
+            "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+            "We introduce BERT, a new language representation model.",
+            ["cs.CL"],
+            "2018-10-11",
+        ),
+        make_chunk(
+            "2005.11401",
+            "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+            "We combine a pre-trained generator with a dense retriever over Wikipedia.",
+            ["cs.LG"],
+            "2020-05-22",
+        ),
+    ]</code></pre>
+  <p class="file"><b>tests/integration/test_opensearch_live.py</b></p>
+  <pre><code>import pytest
+from opensearchpy.helpers import BulkIndexError
+
+
+def test_index_has_strict_mapping(live_client):
+    mapping = live_client.client.indices.get_mapping(index=live_client.index_name)
+    mappings = mapping[live_client.index_name]["mappings"]
+    assert mappings["dynamic"] == "strict"
+    assert mappings["properties"]["embedding"]["type"] == "knn_vector"
+    assert mappings["properties"]["embedding"]["dimension"] == 1024
+
+
+def test_text_analyzer_lowercases_stems_and_drops_stopwords(live_client):
+    response = live_client.client.indices.analyze(
+        index=live_client.index_name,
+        body={"analyzer": "text_analyzer", "text": "The Transformers are learning"},
+    )
+    assert [t["token"] for t in response["tokens"]] == ["transform", "learn"]
+
+
+def test_bulk_index_then_count(live_client, sample_chunks):
+    assert live_client.bulk_index_chunks(sample_chunks) == {"success": 3, "failed": 0}
+    assert live_client.client.count(index=live_client.index_name)["count"] == 3
+
+
+def test_strict_mapping_rejects_unknown_field(live_client, sample_chunks):
+    sample_chunks[0]["chunk_data"]["pdf_url"] = "https://arxiv.org/pdf/1706.03762"
+    with pytest.raises(BulkIndexError):
+        live_client.bulk_index_chunks(sample_chunks[:1])</code></pre>
+  <p>
+    <code>yield</code> in a fixture splits it into setup (before) and teardown (after the test), the same idea as a context manager from Module 0.
+    <code>OPENSEARCH_TEST_HOST</code> lets you point the tests elsewhere without editing them; you won't need it.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>docker compose up -d opensearch
+uv run pytest tests/unit/services/test_opensearch_client.py tests/integration -q
+curl.exe -s "http://localhost:19200/_cat/indices?v"</code></pre>
+  <p>
+    Expect <code>12 passed</code> (8 unit, 4 live). The index list must <b>not</b> contain <code>test-arxiv-papers-chunks</code>: the fixture
+    cleaned up. Run the full suite once (<code>uv run pytest -q</code>) to confirm nothing else broke, then commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m3-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Run <code>test_strict_mapping_rejects_unknown_field</code> with <code>-s</code> and print the exception's <code>errors</code>. You'll see
+      <code>strict_dynamic_mapping_exception</code> and the field name <code>pdf_url</code>. Now change <code>"dynamic": "strict"</code> to
+      <code>True</code> in the mapping and rerun: the test fails because OpenSearch happily invents a <code>pdf_url</code> field. Put it back.</li>
+    <li>Stop OpenSearch (<code>docker compose stop opensearch</code>) and run the live tests. The error is a
+      <code>ConnectionError</code> from <code>setup_indices</code>: the fixture raises before any test runs. Compare with
+      <code>health_check</code>, which swallows the same error and returns <code>False</code>. Two different policies: which fits which caller?</li>
+    <li>Temporarily remove the <code>if not ... exists</code> check in <code>_create_hybrid_index</code> and call
+      <code>setup_indices()</code> twice in <code>uv run python</code> (use <code>host="http://localhost:19200"</code>). The second call hits
+      <code>resource_already_exists_exception</code> and returns <code>False</code> through the race-condition branch. That branch is doing real work.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>BM25 and the query builder</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    "Why did this passage rank first?" is a question you'll be asked about your own system, by users and by interviewers.
+    Today you learn the formula OpenSearch uses, read its real calculation for one of your indexed chunks, and build the
+    query that the API sends.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>From counting words to BM25</h4>
+  <ol>
+    <li><b>Term frequency (TF)</b>: a chunk that says "retrieval" 16 times is probably more about retrieval than one that says it once.</li>
+    <li><b>Inverse document frequency (IDF)</b>: a word that appears in every chunk ("model") tells you little; a rare word ("homomorphic") tells you a lot.
+      IDF is high for rare words, low for common ones. TF &times; IDF is the classic <b>TF-IDF</b> score.</li>
+    <li><b>BM25</b> ("Best Matching 25") fixes two weaknesses of TF-IDF. <b>Saturation</b>: the 16th "retrieval" should add much less than the 2nd;
+      parameter <code>k1</code> (default 1.2) controls how fast TF levels off. <b>Length normalisation</b>: a long chunk mentions everything
+      more often just by being long; parameter <code>b</code> (default 0.75) scales TF down for chunks longer than average.</li>
+  </ol>
+  <p>For one query word in one document, OpenSearch computes:</p>
+  <pre><code>score = boost &times; idf &times; tf
+idf   = log(1 + (N - n + 0.5) / (n + 0.5))           N = documents, n = documents containing the word
+tf    = freq / (freq + k1 &times; (1 - b + b &times; dl / avgdl))   dl = this field's length, avgdl = average length</code></pre>
+  <p>A multi-word query adds up the scores of its words. Here is OpenSearch's own explanation for one chunk in the <b>reference</b> index, for the word "retrieval":</p>
+  <pre><code>3.5411  weight(chunk_text:retriev in 235), result of:
+  3.5411  score(freq=16.0), computed as boost * idf * tf from:
+    2.2     boost
+    1.7003  idf, computed as log(1 + (N - n + 0.5) / (n + 0.5)) from:
+      236     n, number of documents containing term
+      1294    N, total number of documents with field
+    0.9466  tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl)) from:
+      16.0    freq, occurrences of term within document
+      1.2     k1, term saturation parameter
+      0.75    b, length normalization parameter
+      280.0   dl, length of field (approximate)
+      418.5958 avgdl, average length of field</code></pre>
+  <p>
+    Read it top-down: the stem is <code>retriev</code> (the analyzer ran). 236 of 1,294 chunks contain it, so the IDF is moderate. The chunk says it 16 times
+    and is shorter than average, so TF is close to its ceiling of 1. The boost of 2.2 is <code>k1 + 1</code>, a constant Lucene (the library inside
+    OpenSearch) folds in. Scores are only comparable <b>within one query</b>; a BM25 score of 25 isn't "better" than 5 from a different query.
+  </p>
+
+  <h4>Query vocabulary</h4>
+  <table class="plain">
+    <tr><th>Piece</th><th>Meaning</th></tr>
+    <tr><td><code>multi_match</code></td><td>Run one text query against several fields. <code>"title^2"</code> means matches in <code>title</code> count double.</td></tr>
+    <tr><td><code>best_fields</code></td><td>A document's score is its best-matching field's score, not the sum.</td></tr>
+    <tr><td><code>operator: or</code></td><td>A document needs <em>any</em> query word, not all. More results; ranking sorts them.</td></tr>
+    <tr><td><code>fuzziness: AUTO</code></td><td>Tolerate typos: 0 edits for words of 1&ndash;2 characters, 1 for 3&ndash;5, 2 for longer. <code>prefix_length: 2</code> means the first 2 characters must be right, which keeps it fast.</td></tr>
+    <tr><td><code>bool</code> with <code>must</code> / <code>filter</code></td><td><code>must</code> clauses affect the score. <code>filter</code> clauses only include or exclude, don't score, and are cached. Categories are a filter.</td></tr>
+    <tr><td><code>from</code> / <code>size</code></td><td>Pagination: skip <code>from</code> results, return <code>size</code>.</td></tr>
+    <tr><td><code>highlight</code></td><td>Return snippets with the matched words wrapped in tags, here <code>&lt;mark&gt;...&lt;/mark&gt;</code>.</td></tr>
+  </table>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/opensearch/query_builder.py</b> &middot; <code>QueryBuilder.__init__</code></p>
+  <table class="walk">
+    <tr><td><pre><code>    def __init__(
+        self,
+        query: str,
+        size: int = 10,
+        from_: int = 0,
+        fields: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        track_total_hits: bool = True,
+        latest_papers: bool = False,
+        search_chunks: bool = False,
+    ):</code></pre></td>
+      <td>Every knob of a search, as constructor arguments. <code>from_</code> has an underscore because <code>from</code> is a Python keyword.</td></tr>
+    <tr><td><pre><code>        if fields is None:
+            if search_chunks:
+                self.fields = ["chunk_text^3", "title^2", "abstract^1"]
+            else:
+                self.fields = ["title^3", "abstract^2", "authors^1"]</code></pre></td>
+      <td>Two modes. Paper mode dates from an earlier version of the course that indexed whole papers. This project always uses <b>chunk mode</b>: the passage text counts most, then the title.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/query_builder.py</b> &middot; <code>build</code> and its helpers</p>
+  <table class="walk">
+    <tr><td><pre><code>        query_body = {
+            "query": self._build_query(),
+            "size": self.size,
+            "from": self.from_,
+            "track_total_hits": self.track_total_hits,
+            "_source": self._build_source_fields(),
+            "highlight": self._build_highlight(),
+        }
+        sort = self._build_sort()
+        if sort:
+            query_body["sort"] = sort</code></pre></td>
+      <td>The complete request body. <code>track_total_hits: True</code> counts every match exactly (by default OpenSearch stops counting at 10,000).</td></tr>
+    <tr><td><pre><code>        if self.query.strip():
+            must_clauses.append(self._build_text_query())
+        ...
+        if must_clauses:
+            bool_query["must"] = must_clauses
+        else:
+            bool_query["must"] = [{"match_all": {}}]
+        if filter_clauses:
+            bool_query["filter"] = filter_clauses</code></pre></td>
+      <td>A blank query becomes "match everything". Categories go in <code>filter</code>, so they narrow results without changing scores.</td></tr>
+    <tr><td><pre><code>            "multi_match": {
+                "query": self.query,
+                "fields": self.fields,
+                "type": "best_fields",
+                "operator": "or",
+                "fuzziness": "AUTO",
+                "prefix_length": 2,
+            }</code></pre></td>
+      <td>The text query, using the vocabulary above.</td></tr>
+    <tr><td><pre><code>        if self.categories:
+            filters.append({"terms": {"categories": self.categories}})</code></pre></td>
+      <td><code>terms</code> (plural) matches a keyword field against any of several exact values: "in cs.AI or cs.LG".</td></tr>
+    <tr><td><pre><code>        if self.search_chunks:
+            return {"excludes": ["embedding"]}</code></pre></td>
+      <td>Return every stored field except the 1024-number vector, which would make each hit about 20 KB of JSON nobody reads.</td></tr>
+    <tr><td><pre><code>                    "chunk_text": {
+                        "fragment_size": 150,
+                        "number_of_fragments": 2,
+                        "pre_tags": ["&lt;mark&gt;"],
+                        "post_tags": ["&lt;/mark&gt;"],
+                    },
+                    "title": {"fragment_size": 0, "number_of_fragments": 0, ...},
+                ...
+                "require_field_match": False,</code></pre></td>
+      <td>Up to two 150-character snippets from the chunk. <code>fragment_size: 0</code> means "the whole field", right for a title. <code>require_field_match: False</code> highlights query words in a field even if that field didn't cause the match.</td></tr>
+    <tr><td><pre><code>        if self.latest_papers:
+            return [{"published_date": {"order": "desc"}}, "_score"]
+        if self.query.strip():
+            return None
+        return [{"published_date": {"order": "desc"}}, "_score"]</code></pre></td>
+      <td>Newest first when asked, or when there is no query (nothing to rank by). Otherwise no <code>sort</code> key, which means OpenSearch sorts by score.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/opensearch/client.py</b> &middot; <code>search_unified</code> and the BM25 path</p>
+  <table class="walk">
+    <tr><td><pre><code>    def search_unified(
+        self,
+        query: str,
+        query_embedding: Optional[List[float]] = None,
+        size: int = 10,
+        from_: int = 0,
+        categories: Optional[List[str]] = None,
+        latest: bool = False,
+        use_hybrid: bool = True,
+        min_score: float = 0.0,
+    ) -&gt; Dict[str, Any]:</code></pre></td>
+      <td>The one search method the API, <code>/ask</code>, and the agent all call. The signature already has the vector arguments, which you'll use in Module 4.</td></tr>
+    <tr><td><pre><code>        try:
+            if not query_embedding or not use_hybrid:
+                return self._search_bm25_only(query=query, size=size, from_=from_, categories=categories, latest=latest)
+            return self._search_hybrid_native(...)
+        except Exception as e:
+            logger.error(f"Unified search error: {e}")
+            return {"total": 0, "hits": []}</code></pre></td>
+      <td>No vector, or hybrid switched off: BM25. Any error becomes an empty result. Friendly to callers, but it means "index doesn't exist" and "no matches" look the same from outside; the log is the only clue.</td></tr>
+    <tr><td><pre><code>        builder = QueryBuilder(
+            query=query, size=size, from_=from_, categories=categories,
+            latest_papers=latest,
+            search_chunks=True,  # Enable chunk search mode
+        )
+        search_body = builder.build()
+        response = self.client.search(index=self.index_name, body=search_body)</code></pre></td>
+      <td>Inside <code>_search_bm25_only</code>: build the body in chunk mode and send it.</td></tr>
+    <tr><td><pre><code>        results = {"total": response["hits"]["total"]["value"], "hits": []}
+        for hit in response["hits"]["hits"]:
+            chunk = hit["_source"]
+            chunk["score"] = hit["_score"]
+            chunk["chunk_id"] = hit["_id"]
+            if "highlight" in hit:
+                chunk["highlights"] = hit["highlight"]
+            results["hits"].append(chunk)</code></pre></td>
+      <td>Flatten OpenSearch's nested response into simple dictionaries: the stored fields plus score, ID, and highlights. Every caller works with this shape.</td></tr>
+  </table>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>src/services/opensearch/query_builder.py</code>: <code>QueryBuilder</code>, identical to the reference (both modes).
+      Add <code>QueryBuilder</code> to the package <code>__init__.py</code>.</li>
+    <li>In <code>client.py</code>: import <code>QueryBuilder</code>; add <code>search_unified</code> with the full reference signature, whose
+      body for now always calls <code>_search_bm25_only</code> (inside the same <code>try</code>/<code>except</code>); and
+      <code>_search_bm25_only</code> as in the reference. Module 4 adds the hybrid branch.</li>
+  </ol>
+  <details class="hint"><summary>Hint: why keep arguments you don't use yet?</summary>
+    <p>The router you write tomorrow calls <code>search_unified(query_embedding=..., use_hybrid=..., min_score=...)</code>. Keeping the
+      final signature now means Module 4 only changes the method's body, not every caller.</p></details>
+
+  <p class="file"><b>tests/unit/services/test_opensearch_query_builder.py</b></p>
+  <pre><code>from src.services.opensearch.query_builder import QueryBuilder
+
+
+def test_paper_mode_fields_and_paging():
+    query = QueryBuilder(query="machine learning", size=5, from_=10).build()
+    assert query["size"] == 5
+    assert query["from"] == 10
+    assert query["track_total_hits"] is True
+    multi_match = query["query"]["bool"]["must"][0]["multi_match"]
+    assert multi_match["query"] == "machine learning"
+    assert multi_match["fields"] == ["title^3", "abstract^2", "authors^1"]
+
+
+def test_chunk_mode_fields_source_and_highlight():
+    query = QueryBuilder(query="attention", search_chunks=True).build()
+    multi_match = query["query"]["bool"]["must"][0]["multi_match"]
+    assert multi_match["fields"] == ["chunk_text^3", "title^2", "abstract^1"]
+    assert query["_source"] == {"excludes": ["embedding"]}
+    assert "chunk_text" in query["highlight"]["fields"]
+
+
+def test_fuzzy_or_matching():
+    multi_match = QueryBuilder(query="tranformer").build()["query"]["bool"]["must"][0]["multi_match"]
+    assert multi_match["operator"] == "or"
+    assert multi_match["fuzziness"] == "AUTO"
+    assert multi_match["prefix_length"] == 2
+
+
+def test_categories_become_a_filter():
+    bool_query = QueryBuilder(query="deep learning", categories=["cs.AI", "cs.LG"]).build()["query"]["bool"]
+    assert bool_query["filter"] == [{"terms": {"categories": ["cs.AI", "cs.LG"]}}]
+
+
+def test_no_filter_without_categories():
+    assert "filter" not in QueryBuilder(query="deep learning").build()["query"]["bool"]
+
+
+def test_relevance_order_by_default():
+    assert "sort" not in QueryBuilder(query="transformers").build()
+
+
+def test_latest_papers_sorts_by_date_then_score():
+    query = QueryBuilder(query="transformers", latest_papers=True).build()
+    assert query["sort"] == [{"published_date": {"order": "desc"}}, "_score"]
+
+
+def test_empty_query_matches_all_newest_first():
+    query = QueryBuilder(query="   ").build()
+    assert query["query"]["bool"]["must"] == [{"match_all": {}}]
+    assert query["sort"][0] == {"published_date": {"order": "desc"}}</code></pre>
+
+  <p class="file"><b>tests/unit/services/test_opensearch_client.py</b> (append)</p>
+  <pre><code>def test_search_unified_maps_hits(os_client):
+    os_client.client.search.return_value = {
+        "hits": {
+            "total": {"value": 1},
+            "hits": [
+                {
+                    "_id": "abc123",
+                    "_score": 4.2,
+                    "_source": {"arxiv_id": "1706.03762", "title": "Attention Is All You Need"},
+                    "highlight": {"chunk_text": ["&lt;mark&gt;attention&lt;/mark&gt;"]},
+                }
+            ],
+        }
+    }
+
+    results = os_client.search_unified(query="attention", use_hybrid=False)
+
+    assert results["total"] == 1
+    hit = results["hits"][0]
+    assert hit["score"] == 4.2
+    assert hit["chunk_id"] == "abc123"
+    assert hit["highlights"] == {"chunk_text": ["&lt;mark&gt;attention&lt;/mark&gt;"]}
+    body = os_client.client.search.call_args.kwargs["body"]
+    assert body["query"]["bool"]["must"][0]["multi_match"]["query"] == "attention"
+
+
+def test_search_unified_returns_empty_result_on_error(os_client):
+    os_client.client.search.side_effect = RuntimeError("index_not_found_exception")
+    assert os_client.search_unified(query="attention") == {"total": 0, "hits": []}</code></pre>
+
+  <p class="file"><b>tests/integration/test_opensearch_live.py</b> (append)</p>
+  <pre><code>def test_bm25_ranks_best_match_first(live_client, sample_chunks):
+    live_client.bulk_index_chunks(sample_chunks)
+    results = live_client.search_unified(query="transformer attention", use_hybrid=False)
+    assert results["hits"][0]["arxiv_id"] == "1706.03762"
+    assert "2005.11401" not in [hit["arxiv_id"] for hit in results["hits"]]
+
+
+def test_fuzzy_matching_forgives_a_typo(live_client, sample_chunks):
+    live_client.bulk_index_chunks(sample_chunks)
+    results = live_client.search_unified(query="retreival", use_hybrid=False)
+    assert [hit["arxiv_id"] for hit in results["hits"]] == ["2005.11401"]
+
+
+def test_category_filter(live_client, sample_chunks):
+    live_client.bulk_index_chunks(sample_chunks)
+    results = live_client.search_unified(query="language", categories=["cs.LG"], use_hybrid=False)
+    assert results["total"] == 0
+    results = live_client.search_unified(query="language", categories=["cs.CL"], use_hybrid=False)
+    assert [hit["arxiv_id"] for hit in results["hits"]] == ["1810.04805"]
+
+
+def test_highlights_mark_matched_words(live_client, sample_chunks):
+    live_client.bulk_index_chunks(sample_chunks)
+    hit = live_client.search_unified(query="attention", use_hybrid=False)["hits"][0]
+    assert any("&lt;mark&gt;" in fragment for fragment in hit["highlights"]["chunk_text"])</code></pre>
+  <p>
+    Why does BERT rank second for "transformer attention" and RAG not at all? BERT's title contains "Transformers", which stems to
+    <code>transform</code>; the RAG paper has neither word. With <code>operator: or</code>, one matching word is enough to be included.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services tests/integration -q</code></pre>
+  <p>
+    Expect <code>26 passed</code> (8 query builder + 10 client + 8 live). Then compare with the real thing: stop your OpenSearch, start the
+    reference one (<code>docker compose start opensearch opensearch-dashboards</code> in the reference folder), and in the reference
+    Dashboards (localhost:5601) Dev Tools run:
+  </p>
+  <pre><code>GET arxiv-papers-chunks/_search
+{
+  "size": 3,
+  "query": { "match": { "chunk_text": "retrieval" } },
+  "_source": ["arxiv_id", "title", "section_title"],
+  "explain": true
+}</code></pre>
+  <p>
+    Find the <code>idf</code> and <code>tf</code> numbers for the top hit and recompute its score by hand with a calculator. Stop the
+    reference OpenSearch again and restart yours. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m3-day3" /><span>Day 3 checkpoint passed, one BM25 score recomputed by hand, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In <code>QueryBuilder</code>, change <code>"fuzziness": "AUTO"</code> to <code>0</code>. <code>test_fuzzy_matching_forgives_a_typo</code> now finds nothing.
+      Real users type "retreival". Put it back.</li>
+    <li>Change <code>"operator": "or"</code> to <code>"and"</code>. Which live test fails, and why does BERT disappear from "transformer attention"?</li>
+    <li>Change the chunk-mode fields to <code>["chunk_text.keyword"]</code> and search "attention" in <code>uv run python</code>. Zero hits: a
+      keyword field only matches the entire exact string. That's the text/keyword difference in one experiment.</li>
+    <li>Pass <code>categories=["cs.ai"]</code> (lower case) in the category test. Zero hits: keyword fields are case-sensitive, and
+      nothing analyzes filter values.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>The search endpoint and a stepping-stone indexer</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A client class nobody can call is useless. Today you wire search into the API: startup creates the index, a dependency
+    hands the client to the endpoint, the health check reports it, and a request model validates what users send. Then you
+    fill the index with your own papers so the endpoint returns something real.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <ul>
+    <li><b>Field alias</b>: JSON uses <code>"from"</code>, Python can't (keyword), so the model field is <code>from_</code> with
+      <code>alias="from"</code>. <code>populate_by_name = True</code> lets Python code also pass <code>from_=</code>.</li>
+    <li><b>503 vs 500</b>: 503 Service Unavailable means "a dependency is down, try later"; 500 means "our code broke".</li>
+    <li><b>Stepping stone</b>: a temporary piece of code that lets you test the next layer before the real version exists.
+      The real indexer needs chunking and embeddings (Module 4). Today's script indexes <b>one chunk per paper: title plus abstract</b>. It is yours only;
+      the reference repo has no such file, and Module 4 deletes it.</li>
+  </ul>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/schemas/api/search.py</b> &middot; <code>HybridSearchRequest</code></p>
+  <table class="walk">
+    <tr><td><pre><code>    query: str = Field(..., description="Search query text", min_length=1, max_length=500)
+    size: int = Field(10, description="Number of results to return", ge=1, le=100)
+    from_: int = Field(0, description="Offset for pagination", ge=0, alias="from")</code></pre></td>
+      <td>Required query, 1 to 100 results, offset 0 or more, read from the JSON key <code>"from"</code>.</td></tr>
+    <tr><td><pre><code>    categories: Optional[List[str]] = Field(None, ...)
+    latest_papers: bool = Field(False, ...)
+    use_hybrid: bool = Field(True, ...)
+    min_score: float = Field(0.0, ..., ge=0.0)</code></pre></td>
+      <td>The same knobs <code>search_unified</code> takes. <code>use_hybrid</code> defaults to <code>True</code>; this module sends <code>false</code> explicitly.</td></tr>
+    <tr><td><pre><code>    class Config:
+        populate_by_name = True</code></pre></td>
+      <td>Accept <code>from_=</code> as well as <code>"from"</code>. The older <code>SearchRequest</code> in the same file lacks this line, which has a surprising effect you'll test.</td></tr>
+  </table>
+  <p class="file"><b>src/schemas/api/search.py</b> &middot; <code>SearchHit</code> and <code>SearchResponse</code></p>
+  <pre><code>class SearchHit(BaseModel):
+    arxiv_id: str
+    title: str
+    authors: Optional[str]
+    abstract: Optional[str]
+    published_date: Optional[str]
+    pdf_url: Optional[str]
+    score: float
+    highlights: Optional[dict] = None
+    chunk_text: Optional[str] = Field(None, ...)
+    chunk_id: Optional[str] = Field(None, ...)
+    section_name: Optional[str] = Field(None, ...)
+
+
+class SearchResponse(BaseModel):
+    query: str
+    total: int
+    hits: List[SearchHit]
+    size: int = Field(...)
+    from_: int = Field(alias="from", ...)
+    search_mode: Optional[str] = Field(None, ...)
+    error: Optional[str] = None</code></pre>
+  <p>
+    In Pydantic v2, <code>Optional[str]</code> <b>without a default</b> is still required: you must pass it, even if the value is <code>None</code>.
+    Two mismatches with the index to notice: <code>pdf_url</code> isn't in the mapping, and the index field is <code>section_title</code> while the
+    hit reads <code>section_name</code>. So both are always <code>null</code> in responses. That's the reference's behaviour; keep it and know why.
+  </p>
+
+  <p class="file"><b>src/routers/hybrid_search.py</b> &middot; the reference endpoint (Module 4 version)</p>
+  <table class="walk">
+    <tr><td><pre><code>router = APIRouter(prefix="/hybrid-search", tags=["hybrid-search"])
+
+@router.post("/", response_model=SearchResponse)
+async def hybrid_search(
+    request: HybridSearchRequest, opensearch_client: OpenSearchDep, embeddings_service: EmbeddingsDep
+) -&gt; SearchResponse:</code></pre></td>
+      <td>With the <code>/api/v1</code> prefix from <code>main.py</code>, the URL is <code>/api/v1/hybrid-search/</code> (trailing slash included). The client arrives by dependency injection.</td></tr>
+    <tr><td><pre><code>        if not opensearch_client.health_check():
+            raise HTTPException(status_code=503, detail="Search service is currently unavailable")</code></pre></td>
+      <td>Check first, fail with a clear status.</td></tr>
+    <tr><td><pre><code>        query_embedding = None
+        if request.use_hybrid:
+            try:
+                query_embedding = await embeddings_service.embed_query(request.query)
+            ...</code></pre></td>
+      <td><b>Module 4.</b> Your version today has no embeddings dependency and always passes <code>query_embedding=None</code>.</td></tr>
+    <tr><td><pre><code>        results = opensearch_client.search_unified(
+            query=request.query,
+            query_embedding=query_embedding,
+            size=request.size,
+            from_=request.from_,
+            categories=request.categories,
+            latest=request.latest_papers,
+            use_hybrid=request.use_hybrid,
+            min_score=request.min_score,
+        )</code></pre></td>
+      <td>Pass every request field through. Note <code>latest_papers</code> is renamed <code>latest</code> here.</td></tr>
+    <tr><td><pre><code>        for hit in results.get("hits", []):
+            hits.append(
+                SearchHit(
+                    arxiv_id=hit.get("arxiv_id", ""),
+                    title=hit.get("title", ""),
+                    authors=hit.get("authors"),
+                    ...
+                    section_name=hit.get("section_name"),
+                )
+            )</code></pre></td>
+      <td>Convert each result dictionary into a validated <code>SearchHit</code>. <code>.get</code> gives <code>None</code> for missing fields.</td></tr>
+    <tr><td><pre><code>        search_response = SearchResponse(
+            query=request.query,
+            total=results.get("total", 0),
+            hits=hits,
+            size=request.size,
+            **{"from": request.from_},
+            search_mode="hybrid" if (request.use_hybrid and query_embedding) else "bm25",
+        )</code></pre></td>
+      <td><code>**{"from": ...}</code> is the only way to pass a keyword argument named after a Python keyword: build a dictionary and unpack it. Your version sets <code>search_mode="bm25"</code>.</td></tr>
+    <tr><td><pre><code>    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")</code></pre></td>
+      <td>Re-raise our own 503 untouched; wrap anything unexpected as a 500. Without the first <code>except</code>, the 503 would be caught by the second and turned into a 500.</td></tr>
+  </table>
+
+  <p class="file"><b>src/main.py</b> &middot; the OpenSearch part of <code>lifespan</code></p>
+  <pre><code>    opensearch_client = make_opensearch_client()
+    app.state.opensearch_client = opensearch_client
+
+    if opensearch_client.health_check():
+        logger.info("OpenSearch connected successfully")
+        setup_results = opensearch_client.setup_indices(force=False)
+        if setup_results.get("hybrid_index"):
+            logger.info("Hybrid index created")
+        else:
+            logger.info("Hybrid index already exists")
+        try:
+            stats = opensearch_client.client.count(index=opensearch_client.index_name)
+            logger.info(f"OpenSearch ready: {stats['count']} documents indexed")
+        except Exception:
+            logger.info("OpenSearch index ready (stats unavailable)")
+    else:
+        logger.warning("OpenSearch connection failed - search features will be limited")</code></pre>
+  <p>
+    Startup never crashes because OpenSearch is down: the API starts, and the search endpoint returns 503 until it's back.
+    The client goes on <code>app.state</code>, and <code>src/dependencies.py</code> reads it back per request:
+  </p>
+  <p class="file"><b>src/dependencies.py</b></p>
+  <pre><code>def get_opensearch_client(request: Request) -&gt; OpenSearchClient:
+    """Get OpenSearch client from the request state."""
+    return request.app.state.opensearch_client
+...
+OpenSearchDep = Annotated[OpenSearchClient, Depends(get_opensearch_client)]</code></pre>
+  <p class="file"><b>src/routers/ping.py</b> &middot; the OpenSearch health check</p>
+  <pre><code>    def _check_opensearch():
+        if not opensearch_client.health_check():
+            return ServiceStatus(status="unhealthy", message="Not responding")
+        stats = opensearch_client.get_index_stats()
+        return ServiceStatus(
+            status="healthy",
+            message=f"Index '{stats.get('index_name', 'unknown')}' with {stats.get('document_count', 0)} documents",
+        )
+    ...
+    _check_service("opensearch", _check_opensearch)</code></pre>
+
+  <h3>4. Build</h3>
+  <h4>Step A: the API</h4>
+  <ol>
+    <li><code>src/schemas/api/search.py</code>: all four classes (<code>SearchRequest</code>, <code>HybridSearchRequest</code>, <code>SearchHit</code>,
+      <code>SearchResponse</code>) identical to the reference.</li>
+    <li><code>src/dependencies.py</code>: add <code>get_opensearch_client</code> and <code>OpenSearchDep</code>.</li>
+    <li><code>src/routers/hybrid_search.py</code>: <b>simplified Module 3 version</b>. Same router, path, and response model, but the
+      function is <code>hybrid_search(request: HybridSearchRequest, opensearch_client: OpenSearchDep)</code> (no embeddings), calls
+      <code>search_unified(..., query_embedding=None, ...)</code> with all other request fields, and sets <code>search_mode="bm25"</code>.
+      Keep the 503 check and both <code>except</code> blocks.</li>
+    <li><code>src/main.py</code>: add the OpenSearch block to <code>lifespan</code>, and
+      <code>app.include_router(hybrid_search.router, prefix="/api/v1")</code>. Add <code>hybrid_search</code> to <code>src/routers/__init__.py</code> if you import routers from there.</li>
+    <li><code>src/routers/ping.py</code>: add an <code>opensearch_client: OpenSearchDep</code> parameter and the <code>_check_opensearch</code> check.</li>
+  </ol>
+
+  <h4>Step B: the stepping-stone indexer</h4>
+  <p>Write <code>scripts/index_papers_bm25.py</code>:</p>
+  <ul>
+    <li><code>paper_to_chunk(paper) -&gt; dict</code>: takes a <code>Paper</code> row (or anything with the same attributes) and returns the
+      document for the index: <code>arxiv_id</code>, <code>paper_id</code> (<code>str(paper.id)</code>), <code>chunk_index</code> 0,
+      <code>chunk_text</code> = <code>f"{paper.title}\n\nAbstract: {paper.abstract}"</code>, <code>chunk_word_count</code> (words in that text),
+      <code>start_char</code> 0, <code>end_char</code> (its length), <code>section_title</code> <code>"Abstract"</code>, <code>title</code>,
+      <code>authors</code> joined with <code>", "</code>, <code>abstract</code>, <code>categories</code>, <code>published_date</code>. These are the same
+      field names the real indexer uses in Module 4.</li>
+    <li><code>main()</code>: <code>make_database()</code>, <code>make_opensearch_client()</code>, <code>setup_indices()</code>; read all papers with
+      <code>PaperRepository(session).get_all(limit=1000)</code> and build <code>{"chunk_data": paper_to_chunk(p), "embedding": None}</code> for each
+      <b>inside</b> the session block; call <code>delete_paper_chunks</code> for each paper (so reruns don't duplicate), then
+      <code>bulk_index_chunks</code>; print <code>Indexed X of Y papers (Z failed)</code>.</li>
+  </ul>
+  <details class="hint"><summary>Hint: running a script that imports <code>src</code></summary>
+    <p>Run it as a module from the project root: <code>uv run python -m scripts.index_papers_bm25</code>. Running
+      <code>python scripts\index_papers_bm25.py</code> puts <code>scripts\</code> on the import path instead of the root, and
+      <code>import src</code> fails.</p></details>
+
+  <h4>Step C: tests</h4>
+  <p class="file"><b>tests/unit/schemas/test_search.py</b></p>
+  <pre><code>import pytest
+from pydantic import ValidationError
+from src.schemas.api.search import HybridSearchRequest, SearchHit, SearchRequest, SearchResponse
+
+
+def test_hybrid_request_defaults():
+    request = HybridSearchRequest(query="rag")
+    assert request.size == 10
+    assert request.from_ == 0
+    assert request.use_hybrid is True
+    assert request.latest_papers is False
+    assert request.min_score == 0.0
+
+
+def test_hybrid_request_reads_the_from_alias():
+    assert HybridSearchRequest(**{"query": "rag", "from": 20}).from_ == 20
+
+
+def test_hybrid_request_also_accepts_field_name():
+    assert HybridSearchRequest(query="rag", from_=20).from_ == 20
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"query": ""},
+        {"query": "x" * 501},
+        {"query": "rag", "size": 0},
+        {"query": "rag", "size": 101},
+        {"query": "rag", "from": -1},
+    ],
+)
+def test_hybrid_request_rejects(bad):
+    with pytest.raises(ValidationError):
+        HybridSearchRequest(**bad)
+
+
+def test_search_request_silently_ignores_from_underscore():
+    # No populate_by_name here, so from_= is an unknown keyword and is dropped.
+    assert SearchRequest(query="rag", from_=-1).from_ == 0
+
+
+def test_search_response_serialises_from_alias():
+    hit = SearchHit(
+        arxiv_id="1706.03762",
+        title="Attention Is All You Need",
+        authors=None,
+        abstract=None,
+        published_date=None,
+        pdf_url=None,
+        score=1.0,
+    )
+    response = SearchResponse(query="rag", total=1, hits=[hit], size=10, **{"from": 0})
+    assert response.model_dump(by_alias=True)["from"] == 0
+    assert response.search_mode is None</code></pre>
+  <div class="callout info"><b>A wrong comment in the reference tests</b>
+    The reference <code>tests/unit/schemas/test_search.py</code> has <code>SearchRequest(query="test", from_=-1)</code> with the comment
+    "Pydantic coerces negative values to minimum". That's not what happens: <code>SearchRequest</code> has no <code>populate_by_name</code>, so
+    <code>from_=</code> is ignored as an unknown argument and the default 0 is used. Pydantic never "coerces to minimum"; it rejects, as
+    <code>test_hybrid_request_rejects</code> shows. Tests can pass for the wrong reason.</div>
+
+  <p>
+    The endpoint tests replace the real OpenSearch client with a fake using <code>app.dependency_overrides</code>, as in Module 1.
+    They use <code>TestClient(app)</code> <b>without</b> <code>with</code>, so the lifespan doesn't run and nothing tries to reach Postgres or OpenSearch.
+    Fixture names are specific (<code>search_api</code>, not <code>client</code>) so they can't clash with fixtures from Module 1.
+  </p>
+  <p class="file"><b>tests/api/routers/conftest.py</b> (if the file exists, add to it)</p>
+  <pre><code>import pytest
+from fastapi.testclient import TestClient
+from src.dependencies import get_opensearch_client
+from src.main import app
+
+
+class FakeOpenSearch:
+    """Stands in for OpenSearchClient and records how it was called."""
+
+    def __init__(self):
+        self.healthy = True
+        self.calls = []
+        self.results = {
+            "total": 1,
+            "hits": [
+                {
+                    "arxiv_id": "1706.03762",
+                    "title": "Attention Is All You Need",
+                    "authors": "Ashish Vaswani, Noam Shazeer",
+                    "abstract": "We propose the Transformer.",
+                    "published_date": "2017-06-12T00:00:00",
+                    "chunk_text": "Attention Is All You Need ...",
+                    "chunk_id": "abc123",
+                    "score": 2.5,
+                }
+            ],
+        }
+
+    def health_check(self):
+        return self.healthy
+
+    def search_unified(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.results
+
+
+@pytest.fixture
+def fake_opensearch():
+    return FakeOpenSearch()
+
+
+@pytest.fixture
+def search_api(fake_opensearch):
+    app.dependency_overrides[get_opensearch_client] = lambda: fake_opensearch
+    yield TestClient(app)
+    app.dependency_overrides.clear()</code></pre>
+  <p class="file"><b>tests/api/routers/test_hybrid_search.py</b></p>
+  <pre><code>import pytest
+
+URL = "/api/v1/hybrid-search/"
+
+
+def test_bm25_search_returns_hits(search_api):
+    response = search_api.post(URL, json={"query": "attention", "use_hybrid": False})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["search_mode"] == "bm25"
+    assert data["total"] == 1
+    assert data["from"] == 0
+    assert data["hits"][0]["arxiv_id"] == "1706.03762"
+    assert data["hits"][0]["chunk_id"] == "abc123"
+
+
+def test_request_fields_reach_the_client(search_api, fake_opensearch):
+    body = {"query": "rag", "size": 3, "from": 6, "categories": ["cs.AI"], "latest_papers": True, "use_hybrid": False}
+    search_api.post(URL, json=body)
+    call = fake_opensearch.calls[0]
+    assert call["query"] == "rag"
+    assert call["size"] == 3
+    assert call["from_"] == 6
+    assert call["categories"] == ["cs.AI"]
+    assert call["latest"] is True
+    assert call["query_embedding"] is None
+
+
+@pytest.mark.parametrize("body", [{"query": ""}, {"query": "rag", "size": 0}, {"size": 10}])
+def test_invalid_body_is_422(search_api, body):
+    assert search_api.post(URL, json=body).status_code == 422
+
+
+def test_opensearch_down_is_503(search_api, fake_opensearch):
+    fake_opensearch.healthy = False
+    response = search_api.post(URL, json={"query": "rag"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Search service is currently unavailable"</code></pre>
+  <p class="file"><b>tests/unit/scripts/test_index_papers_bm25.py</b></p>
+  <pre><code>import uuid
+from datetime import datetime
+from types import SimpleNamespace
+
+from scripts.index_papers_bm25 import paper_to_chunk
+from src.services.opensearch.index_config_hybrid import ARXIV_PAPERS_CHUNKS_MAPPING
+
+PAPER = SimpleNamespace(
+    id=uuid.UUID("12345678-1234-5678-1234-567812345678"),
+    arxiv_id="1706.03762",
+    title="Attention Is All You Need",
+    abstract="We propose the Transformer.",
+    authors=["Ashish Vaswani", "Noam Shazeer"],
+    categories=["cs.CL"],
+    published_date=datetime(2017, 6, 12),
+)
+
+
+def test_paper_to_chunk():
+    chunk = paper_to_chunk(PAPER)
+    assert chunk["chunk_text"] == "Attention Is All You Need\n\nAbstract: We propose the Transformer."
+    assert chunk["chunk_index"] == 0
+    assert chunk["paper_id"] == "12345678-1234-5678-1234-567812345678"
+    assert chunk["authors"] == "Ashish Vaswani, Noam Shazeer"
+    assert chunk["chunk_word_count"] == 10
+
+
+def test_paper_to_chunk_only_uses_mapped_fields():
+    allowed = set(ARXIV_PAPERS_CHUNKS_MAPPING["mappings"]["properties"])
+    assert set(paper_to_chunk(PAPER)) &lt;= allowed</code></pre>
+  <p>
+    <code>SimpleNamespace</code> is a quick object with whatever attributes you give it: a stand-in for a database row, no Postgres needed.
+    The second test catches the strict-mapping failure before you ever send a document. <code>&lt;=</code> on sets means "is a subset of".
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <p>Tests first:</p>
+  <pre><code>uv run pytest tests/unit/schemas/test_search.py tests/api/routers/test_hybrid_search.py tests/unit/scripts -q
+uv run pytest -q</code></pre>
+  <p>
+    The first line: <code>18 passed</code> (10 + 6 + 2). The full suite: everything passes, including this module's 46 new tests.
+    Then rebuild the API, because <code>pyproject.toml</code> gained <code>opensearch-py</code> and the image installs dependencies at build time:
+  </p>
+  <pre><code>docker compose up -d --build
+docker compose ps
+curl.exe -s http://localhost:18000/api/v1/health</code></pre>
+  <div class="callout story"><b>Expect a slow build</b>
+    Changing <code>pyproject.toml</code> invalidates the dependency layer of the image. With Docker's build cache near its 30 GB limit, that
+    layer may be rebuilt from scratch through the proxy; this week that took about 30 minutes. Start it and do the reading for tomorrow.</div>
+  <p>
+    Health should list <code>"opensearch": {"status": "healthy", "message": "Index 'arxiv-papers-chunks' with 0 documents"}</code>. The API's
+    startup created the empty index. Now fill it. The script runs on your laptop, not in Docker, so the hostnames in <code>.env</code>
+    (<code>postgres</code>, <code>opensearch</code>) don't exist here; override them for this PowerShell session with your published ports. Use the
+    same user, password, and database name as in your <code>POSTGRES_DATABASE_URL</code>; only the host and port change.
+  </p>
+  <pre><code>$env:POSTGRES_DATABASE_URL="postgresql+psycopg2://rag_user:rag_password@localhost:15432/rag_db"
+$env:OPENSEARCH__HOST="http://localhost:19200"
+uv run python -m scripts.index_papers_bm25
+uv run python -m scripts.index_papers_bm25
+curl.exe -s "http://localhost:19200/arxiv-papers-chunks/_count"</code></pre>
+  <p>
+    Each run ends with <code>Indexed N of N papers (0 failed)</code>, where N is the number of papers in your Postgres. After the
+    <b>second</b> run, <code>_count</code> is still N: delete-then-insert kept it idempotent. (Environment variables beat <code>.env</code>
+    values in pydantic-settings; close the terminal to drop the overrides.) Now the module's goal:
+  </p>
+  <pre><code>'{"query": "retrieval augmented generation", "size": 3, "use_hybrid": false}' | Out-File -Encoding ascii search.json
+curl.exe -s -X POST http://localhost:18000/api/v1/hybrid-search/ -H "Content-Type: application/json" --data-binary "@search.json"
+Remove-Item search.json</code></pre>
+  <p>
+    You get <code>"search_mode": "bm25"</code>, a <code>total</code>, and up to three hits from <em>your</em> papers, each with a BM25
+    <code>score</code> (numbers like 2 to 10; they depend on your data), <code>chunk_text</code> starting with the title, <code>highlights</code> containing
+    <code>&lt;mark&gt;</code>, and <code>"pdf_url": null</code>. Health now reports N documents. Try it in
+    <a href="http://localhost:18000/docs">localhost:18000/docs</a> too. Commit (not <code>search.json</code>).
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m3-day4" /><span>Day 4 checkpoint passed: BM25 results from my own API, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Open a new terminal (no overrides) and run the script. It fails with a <code>psycopg2.OperationalError</code> mentioning
+      <code>could not translate host name "postgres"</code>. It's the same cause as the reference's 13 failing API tests
+      (<code>Error 11001 connecting to redis:6379</code>): a Docker-network hostname used from the laptop.</li>
+    <li><code>docker compose stop opensearch</code>, then search. You get <b>503</b>, and <code>/health</code> says <code>"status": "degraded"</code> with
+      opensearch unhealthy. The API itself keeps running. Start it again.</li>
+    <li>Send the same search with <code>"use_hybrid": true</code>. Still <code>"search_mode": "bm25"</code>: with no embedding, <code>search_unified</code>
+      has only one path. Module 4 changes that.</li>
+    <li>Delete the index (<code>curl.exe -s -X DELETE http://localhost:19200/arxiv-papers-chunks</code>) and search. You get <b>200</b> with
+      <code>"total": 0</code>, not an error, because <code>search_unified</code> turns the <code>index_not_found_exception</code> into an empty result.
+      Find the real error in <code>docker compose logs api</code>. Restart the API (it recreates the index) and rerun the script.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 3" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. What is an inverted index, and why is it faster than <code>LIKE '%word%'</code>?</summary>
+    <div class="answer">A map from each term to the list of documents containing it, built at indexing time. A query looks up a few lists and
+      intersects or merges them, instead of scanning every row's text. <code>LIKE</code> with a leading wildcard can't use a normal database index, so it reads everything,
+      and it has no notion of relevance or word forms.</div></details>
+
+  <details class="drill"><summary>2. What does an analyzer do? Why are there two in this project?</summary>
+    <div class="answer">It turns text into terms: tokenize, lowercase, remove stopwords, stem. It runs on documents at index time and on queries at search time,
+      so both sides match. <code>text_analyzer</code> stems, for prose (<code>retrieval</code> and <code>retrieving</code> both become <code>retriev</code>).
+      <code>standard_analyzer</code> doesn't stem, for author names, where stemming would mangle them.</div></details>
+
+  <details class="drill"><summary>3. <code>text</code> vs <code>keyword</code>: which for <code>arxiv_id</code>, <code>categories</code>, <code>chunk_text</code>, and why?</summary>
+    <div class="answer"><code>keyword</code> stores the exact string: IDs and categories, used in exact filters (<code>term</code>, <code>terms</code>) and sorting.
+      <code>text</code> is analyzed for full-text search: <code>chunk_text</code>. A keyword filter is case-sensitive and matches only the whole value.</div></details>
+
+  <details class="drill"><summary>4. Explain BM25 without the formula, then name its two parameters.</summary>
+    <div class="answer">A document scores higher when it contains the query's words, especially rare ones (IDF), and more often (TF), but repeated
+      occurrences add less and less (saturation, <code>k1</code> = 1.2), and long documents are penalised for mentioning things just by being long
+      (length normalisation, <code>b</code> = 0.75). Scores for multiple words add up. I read a real explanation in our index: idf 1.70 for "retrieval" (236 of 1,294 chunks), tf 0.95.</div></details>
+
+  <details class="drill"><summary>5. Why is the mapping <code>"dynamic": "strict"</code>? What's the cost?</summary>
+    <div class="answer">Unknown fields fail loudly instead of silently creating new, possibly wrongly typed fields; a typo can't pollute the index. The cost:
+      every writer must match the schema exactly, and adding a field means changing the mapping. For example, a <code>pdf_url</code> field is rejected, which is why hits have <code>pdf_url: null</code>.</div></details>
+
+  <details class="drill"><summary>6. Why does every chunk store the paper's title, authors, and abstract?</summary>
+    <div class="answer">Denormalization. A search engine has no joins, so to filter by category, show the title, or boost title matches without a second
+      lookup in Postgres, each chunk carries the paper's metadata. Trade-off: more storage, and updating a paper means reindexing all its chunks.</div></details>
+
+  <details class="drill"><summary>7. <code>must</code> vs <code>filter</code> in a <code>bool</code> query?</summary>
+    <div class="answer">Both must match. <code>must</code> contributes to the score; <code>filter</code> only includes or excludes, doesn't score, and can be cached.
+      Categories are a filter because "is it cs.AI" shouldn't change how relevant a passage is.</div></details>
+
+  <details class="drill"><summary>8. What do <code>operator: or</code> and <code>fuzziness: AUTO</code> trade off?</summary>
+    <div class="answer">Recall (finding everything relevant) against precision (only relevant things). <code>or</code> returns documents matching any word, relying on
+      ranking to put the best first. Fuzziness tolerates typos (1&ndash;2 edits by word length) at some cost in speed and occasional false matches;
+      <code>prefix_length: 2</code> limits the cost.</div></details>
+
+  <details class="drill"><summary>9. How does the API behave when OpenSearch is down at startup, and during a request?</summary>
+    <div class="answer">At startup, <code>health_check</code> returns False, the lifespan logs a warning and skips index setup; the API still starts. During a request
+      the endpoint checks health first and returns 503. <code>/health</code> reports "degraded". One gap: if the index is missing,
+      <code>search_unified</code> swallows the error and returns zero results with status 200.</div></details>
+
+  <details class="drill"><summary>10. Why does index creation handle <code>resource_already_exists_exception</code>?</summary>
+    <div class="answer">The API runs 4 uvicorn workers, each running the lifespan. All can see "index doesn't exist" and try to create it; only one wins.
+      A check-then-act race. Treating "already exists" as success makes setup safe to run concurrently.</div></details>
+
+  <details class="drill"><summary>11. How would you make re-indexing a paper idempotent? What does this project do?</summary>
+    <div class="answer">Either give each chunk a deterministic <code>_id</code> (e.g. <code>{arxiv_id}-{chunk_index}</code>) so re-indexing overwrites,
+      or delete the paper's chunks before inserting. The project uses random IDs plus <code>delete_by_query</code> on <code>arxiv_id</code>. Deterministic IDs
+      would be cheaper, but wouldn't remove leftover chunks if a paper now produces fewer chunks.</div></details>
+
+  <details class="drill"><summary>12. Where would pure keyword search fail for this app?</summary>
+    <div class="answer">Synonyms and paraphrases: a question about "LLMs making things up" won't match a passage that says "hallucination".
+      It's also blind to meaning and word order. It's strong for exact terms, names, and acronyms. That's the motivation for vector search and hybrid search in Module 4.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m3-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 4</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m3-tests" /><span><code>uv run pytest -q</code> passes, including this module's 46 tests, with your OpenSearch running</span></li>
+    <li><input type="checkbox" data-id="m3-e2e" /><span><code>POST /api/v1/hybrid-search/</code> on port 18000 with <code>"use_hybrid": false</code> returns BM25 hits from your papers</span></li>
+    <li><input type="checkbox" data-id="m3-explain" /><span>You can explain every field in the mapping and every key in the query body without looking</span></li>
+    <li><input type="checkbox" data-id="m3-stone" /><span>You know that <code>scripts/index_papers_bm25.py</code> is temporary and why</span></li>
+  </ul>
+  <p>
+    Then send me "Module 3 passed". Module 4 replaces the stepping stone: it splits papers into real chunks, turns each
+    into a vector with Jina, and combines keyword and vector results with RRF.
+  </p>
+  <p><a href="module-04-hybrid-search.html">Next: Module 4 &mdash; Chunking and hybrid search &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

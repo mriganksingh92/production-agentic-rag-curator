@@ -1,0 +1,1514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 5 — RAG with a local LLM</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 5 &middot; 4 days</p>
+    <h1><span class="grad">RAG with a local LLM</span>: from retrieved passages to a written answer</h1>
+    <p class="lede">
+      Module 4 left you with a search engine that finds the right passages. This module adds the "G" in RAG: a
+      language model running on your own laptop reads those passages and writes an answer. By the end you'll have
+      <code>/api/v1/ask</code>, a streaming <code>/api/v1/stream</code>, and a Gradio chat page, and you'll
+      know exactly why a 60-second timeout broke the chat page this week.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: LLMs and Ollama</span>
+      <span class="pill">Day 2: the Ollama client</span>
+      <span class="pill">Day 3: prompts and RAG answers</span>
+      <span class="pill">Day 4: /ask, /stream, Gradio</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 5</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: What an LLM is, and running one with Ollama</a></li>
+      <li><a href="#day2">Day 2: The Ollama client</a></li>
+      <li><a href="#day3">Day 3: Prompts and RAG answers</a></li>
+      <li><a href="#day4">Day 4: The /ask and /stream endpoints, and the Gradio chat UI</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 6</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>Which version of the code this page teaches</b>
+    Modules 5&ndash;7 teach the <b>original course code</b>. Some files you'll study were changed today in the
+    reference repo (hallucination hardening, a Gradio timeout fix, a LangChain helper). For those files, this page quotes the
+    original with <code>git -C C:\Users\mrigsing\Downloads\production-agentic-rag-course show HEAD:&lt;path&gt;</code>.
+    Run that command yourself when you want to see the whole original file. Module 8 teaches what changed and why.
+  </div>
+
+  <div class="callout warn">
+    <b>RAM: stop the reference stack while you work</b>
+    Your stack now runs Postgres, Redis, OpenSearch, the API, and (from today) an LLM. Before starting yours, run
+    <code>docker compose stop</code> in the reference folder. Start it again only when you want to compare.
+    Day 1 shows an option that <em>reuses</em> the reference Ollama instead of running a second one.
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>What an LLM is, and running one with Ollama</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Search returns passages; a user wants an answer. A <b>large language model</b> (LLM) can turn five passages into
+    three readable sentences. The course runs the model locally with <b>Ollama</b> instead of calling a paid API: no
+    key, no per-question cost, and no data leaves your laptop. The price is speed. On your CPU, one answer takes
+    minutes, and that single fact explains several bugs you'll meet in this module and the next.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>What an LLM does</h4>
+  <p>
+    An LLM does one thing: given some text, it predicts a likely next piece of text, adds it, and repeats. Everything
+    else (answering, summarising, "reasoning") is that loop, steered by what you put in front of it. The words you
+    need:
+  </p>
+  <table class="plain">
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td>Token</td><td>The unit the model reads and writes: a word, part of a word, or punctuation. Roughly 3/4 of an English word on average. Speed and limits are measured in tokens.</td></tr>
+    <tr><td>Prompt</td><td>All the text you send: instructions, the retrieved passages, and the question. The model only knows what is in the prompt plus what it memorised in training.</td></tr>
+    <tr><td>Context window</td><td>The maximum number of tokens the model can look at at once (prompt plus answer). Too many passages and the oldest text is cut off.</td></tr>
+    <tr><td>Temperature</td><td>How random the choice of the next token is. 0 = always the most likely token (repeatable). Higher = more varied, more creative, more likely to invent things.</td></tr>
+    <tr><td>top_p</td><td>Another randomness control: only sample from the smallest set of tokens whose probabilities add up to <code>p</code>.</td></tr>
+    <tr><td>Prompt evaluation vs. generation</td><td>First the model reads the whole prompt (prompt evaluation), then writes the answer one token at a time (generation). Both cost time.</td></tr>
+    <tr><td>Hallucination</td><td>Confident text that isn't supported by anything: invented facts, invented paper IDs, invented authors. RAG reduces it; it does not remove it (Module 8).</td></tr>
+  </table>
+
+  <h4>RAG in one picture</h4>
+  <div class="flow">
+    <span class="node">Question</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Search</b> (Module 4)</span><span class="arrow">&rarr;</span>
+    <span class="node">Top passages</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>Prompt</b> = rules + passages + question</span><span class="arrow">&rarr;</span>
+    <span class="node"><b>LLM</b></span><span class="arrow">&rarr;</span>
+    <span class="node">Answer + sources</span>
+  </div>
+
+  <h4>Ollama</h4>
+  <p>
+    Ollama is a server program that downloads open models and runs them, answering over HTTP on port 11434. The
+    endpoints this project uses:
+  </p>
+  <table class="plain">
+    <tr><th>Endpoint</th><th>What it does</th></tr>
+    <tr><td><code>GET /api/version</code></td><td>Returns <code>{"version": "0.11.2"}</code>. Used as a health check.</td></tr>
+    <tr><td><code>GET /api/tags</code></td><td>Lists the models you've pulled.</td></tr>
+    <tr><td><code>POST /api/generate</code></td><td>Body <code>{"model", "prompt", "stream"}</code>. With <code>"stream": false</code>, one JSON reply. With <code>"stream": true</code>, one JSON object <b>per line</b> as tokens are produced (called NDJSON, newline-delimited JSON).</td></tr>
+  </table>
+  <p>
+    The model is <code>llama3.2:1b</code>: Meta's Llama 3.2 with 1.2 billion parameters, about 1.3 GB on disk. That
+    is tiny for an LLM, which is why it fits on a laptop, and also why it makes more mistakes than big hosted models.
+  </p>
+
+  <div class="callout story">
+    <b>Real numbers from your laptop this week</b>
+    One call to the reference Ollama with a 37-token prompt took 46 seconds: 17.6 s loading the model into memory,
+    5.1 s reading the prompt (about 7 tokens per second), and 23.2 s writing 56 tokens (about 2.4 tokens per second).
+    A RAG prompt with three passages is a few thousand tokens, so the model can spend <b>minutes</b> just reading
+    before it writes its first word. That's why a real <code>/ask</code> takes 2&ndash;4 minutes here. A GPU would
+    make both phases 10&ndash;100&times; faster.
+  </div>
+
+  <h3>3. Walkthrough: real code</h3>
+
+  <p class="file"><b>ollama/Dockerfile</b> &middot; you saw this in Module 0; now you'll use it</p>
+  <pre><code>FROM ollama/ollama:0.11.2
+
+# The corporate proxy on this network terminates TLS, so registry.ollama.ai
+# presents a re-signed certificate that the base image does not trust.
+COPY certs/corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt
+RUN update-ca-certificates</code></pre>
+  <p>
+    <code>ollama pull</code> downloads the model over HTTPS from <code>registry.ollama.ai</code>. Your office proxy
+    re-signs that traffic, so without the corporate root certificate the pull fails with a certificate error. This
+    file is new in the working tree (the original course used the plain image directly); it's one of this week's
+    proxy workarounds.
+  </p>
+
+  <p class="file"><b>compose.yml</b> &middot; the <code>ollama</code> service (working tree)</p>
+  <table class="walk">
+    <tr><td><pre><code>  ollama:
+    build:
+      context: .
+      dockerfile: ollama/Dockerfile</code></pre></td>
+      <td>Build the image from the Dockerfile above. The <b>context</b> is the project root, so <code>COPY certs/corp-ca.crt</code> finds the certificate. The original course had <code>image: ollama/ollama:0.11.2</code> here.</td></tr>
+    <tr><td><pre><code>    container_name: rag-ollama
+    ports:
+      - "11434:11434"</code></pre></td>
+      <td>Yours will be <code>curator-ollama</code> and <code>"21434:11434"</code>, following the +10000 convention.</td></tr>
+    <tr><td><pre><code>    volumes:
+      - ollama_data:/root/.ollama</code></pre></td>
+      <td>Downloaded models live in <code>/root/.ollama</code>. A named volume means you pull the 1.3 GB model once, not after every restart.</td></tr>
+    <tr><td><pre><code>    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s</code></pre></td>
+      <td><code>ollama list</code> only succeeds when the server is answering, so it doubles as a health check.</td></tr>
+  </table>
+  <p>The API container reaches it by service name. In the reference <code>compose.yml</code>, under <code>api:</code>:</p>
+  <pre><code>    environment:
+      ...
+      - OLLAMA_HOST=http://ollama:11434</code></pre>
+
+  <p class="file"><b>src/config.py</b> &middot; the three Ollama settings, on the top-level <code>Settings</code></p>
+  <pre><code>    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "llama3.2:1b"
+    ollama_timeout: int = 300</code></pre>
+  <p>
+    These sit on <code>Settings</code> itself, not on a nested class with a prefix, so the environment variable names
+    are simply <code>OLLAMA_HOST</code>, <code>OLLAMA_MODEL</code>, <code>OLLAMA_TIMEOUT</code>, exactly as in the
+    reference <code>.env</code>. The timeout is in seconds: five minutes, because CPU answers are slow.
+  </p>
+
+  <p class="file"><b>src/exceptions.py</b> &middot; a small exception family</p>
+  <pre><code>class LLMException(Exception):
+    """Base exception for LLM-related errors."""
+
+
+class OllamaException(LLMException):
+    """Exception raised for Ollama service errors."""
+
+
+class OllamaConnectionError(OllamaException):
+    """Exception raised when cannot connect to Ollama service."""
+
+
+class OllamaTimeoutError(OllamaException):
+    """Exception raised when Ollama service times out."""</code></pre>
+  <p>
+    A hierarchy lets callers choose how specific to be: <code>except OllamaTimeoutError</code> catches only timeouts,
+    <code>except OllamaException</code> catches every Ollama problem. The client you write tomorrow translates
+    <code>httpx</code>'s errors into these, so the rest of the app never needs to know Ollama is reached over HTTP.
+  </p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: the Ollama service</h4>
+  <ol>
+    <li>Copy <code>ollama/Dockerfile</code> from the reference repo into your project (same path). You already have
+      <code>certs/corp-ca.crt</code> from Module 1.</li>
+    <li>Add a service <code>ollama</code> to your <code>compose.yml</code>: built from <code>ollama/Dockerfile</code>
+      with the project root as context, <code>container_name: curator-ollama</code>, port <code>"21434:11434"</code>,
+      volume <code>curator_ollama_data:/root/.ollama</code> (declare it under the top-level <code>volumes:</code>), the
+      <code>ollama list</code> healthcheck, network <code>curator-network</code>.</li>
+    <li>In the <code>api</code> service's <code>environment:</code>, add <code>OLLAMA_HOST=http://ollama:11434</code>.</li>
+    <li>Add to your <code>.env</code>, mirroring the reference: <code>OLLAMA_HOST=http://ollama:11434</code>,
+      <code>OLLAMA_MODEL=llama3.2:1b</code>, <code>OLLAMA_TIMEOUT=300</code>.</li>
+  </ol>
+  <pre><code>docker compose up -d --build ollama
+docker compose ps
+docker exec curator-ollama ollama pull llama3.2:1b
+docker exec curator-ollama ollama list</code></pre>
+  <p>The pull downloads about 1.3 GB through the proxy; give it a few minutes.</p>
+
+  <div class="callout tip">
+    <b>Option: reuse the reference Ollama instead (saves 1.3 GB of disk and several GB of RAM)</b>
+    Skip the <code>ollama</code> service entirely. Keep only the reference <code>rag-ollama</code> container running
+    (<code>docker compose start ollama</code> in the reference folder), and point your API at it. From inside a container, your
+    laptop is reachable as <code>host.docker.internal</code> (a name Docker Desktop provides), so set
+    <code>OLLAMA_HOST=http://host.docker.internal:11434</code> in your <code>api</code> service's environment.
+    From your laptop (tests, curl), use <code>http://localhost:11434</code>. Everywhere this page says 21434, use 11434.
+  </div>
+
+  <h4>Step B: settings and exceptions</h4>
+  <p>
+    Add <code>ollama_host</code>, <code>ollama_model</code>, <code>ollama_timeout</code> to your <code>Settings</code> with the
+    defaults above. Add the four exception classes to <code>src/exceptions.py</code>. Then add these tests to
+    <code>tests/unit/test_config.py</code> (create it if you don't have it):
+  </p>
+  <p class="file"><b>tests/unit/test_config.py</b> (add)</p>
+  <pre><code>from src.config import Settings
+
+
+def test_ollama_settings_defaults(monkeypatch):
+    for name in ("OLLAMA_HOST", "OLLAMA_MODEL", "OLLAMA_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.ollama_host == "http://localhost:11434"
+    assert settings.ollama_model == "llama3.2:1b"
+    assert settings.ollama_timeout == 300
+
+
+def test_ollama_settings_from_environment(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://ollama:11434")
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "600")
+    settings = Settings(_env_file=None)
+    assert settings.ollama_host == "http://ollama:11434"
+    assert settings.ollama_timeout == 600</code></pre>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>curl.exe -s http://localhost:21434/api/version
+curl.exe -s http://localhost:21434/api/tags
+'{"model": "llama3.2:1b", "prompt": "In one sentence, what is retrieval-augmented generation?", "stream": false}' | Out-File -Encoding ascii gen.json
+Measure-Command { curl.exe -s http://localhost:21434/api/generate --data-binary "@gen.json" -o gen_out.json }
+Get-Content gen_out.json
+uv run pytest tests/unit/test_config.py -q</code></pre>
+  <p>
+    Expect <code>{"version":"0.11.2"}</code>, a tags list containing <code>llama3.2:1b</code>, and after 30&ndash;90 seconds a JSON
+    reply with a <code>"response"</code> sentence plus timing fields (<code>load_duration</code>,
+    <code>prompt_eval_count</code>, <code>eval_count</code>, <code>total_duration</code>, all durations in <b>nanoseconds</b>).
+    Work out your own tokens-per-second from <code>eval_count</code> and <code>eval_duration</code>. The two new config tests pass.
+    Delete <code>gen.json</code> and <code>gen_out.json</code>, then commit.
+  </p>
+  <div class="callout warn"><b>What I could not check for you</b>
+    I didn't build your Ollama image, because running <code>docker build</code> was off-limits while I wrote this page. The Dockerfile and service
+    mirror the reference, which builds and runs on this machine. If the pull fails with <code>x509: certificate signed by unknown authority</code>,
+    the certificate didn't get into the image: check the <code>COPY</code> path and that the build context is the project root.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m5-day1" /><span>Day 1: Ollama answers on 21434 (or you reuse 11434), config tests pass, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Ask for a model you haven't pulled: change <code>"llama3.2:1b"</code> to <code>"llama3.2:3b"</code> in <code>gen.json</code>. Ollama
+      replies <b>404</b> with <code>model "llama3.2:3b" not found, try pulling it first</code>. Remember that 404; tomorrow your client turns it into an exception.</li>
+    <li>Send the same request twice in a row and compare <code>load_duration</code>. The second is near zero: the model stays loaded
+      in memory for a few minutes after use. The first question after a pause is always slowest.</li>
+    <li>Set <code>"stream": true</code> and run it with <code>curl.exe -N</code> (<code>-N</code> turns off buffering). You get one JSON
+      object per line, each with a small <code>"response"</code> piece, and a last one with <code>"done": true</code>. That's NDJSON, and it's what
+      <code>generate_stream</code> will read.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>The Ollama client</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The rest of the app should call <code>await ollama_client.generate(...)</code> and never deal with URLs, JSON
+    bodies, status codes, or <code>httpx</code> exceptions. <code>OllamaClient</code> is that wrapper. It's also the
+    single place where the timeout lives, so it's where the slowness of CPU inference turns into errors, or doesn't.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <ul>
+    <li><b>Client wrapper:</b> a class that hides a remote service behind ordinary methods. The OpenSearch and Jina clients from
+      Modules 3&ndash;4 follow the same pattern.</li>
+    <li><b>Exception translation:</b> catch low-level errors (<code>httpx.ConnectError</code>, <code>httpx.TimeoutException</code>) and
+      raise your own (<code>OllamaConnectionError</code>, <code>OllamaTimeoutError</code>).</li>
+    <li><b>httpx timeouts are per step, not per request.</b> <code>httpx.Timeout(300.0)</code> sets four limits of 300 s each: connect,
+      write, pool, and <b>read</b>. The read limit is the longest wait for the <em>next</em> piece of data. A
+      streaming reply that sends a token every few seconds can run for ten minutes without timing out; a
+      reply that stays silent for 301 seconds fails.</li>
+    <li><b>Async generator</b> (Module 0, Day 2): <code>generate_stream</code> <code>yield</code>s each parsed line as it arrives.</li>
+    <li><b>Mocking HTTP in tests:</b> <code>httpx.MockTransport(handler)</code> makes a client call your function instead of the network.
+      Your tests will swap it in for every <code>httpx.AsyncClient</code> the code creates.</li>
+  </ul>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/ollama/client.py</b> &middot; original version (<code>git show HEAD:src/services/ollama/client.py</code>)</p>
+  <table class="walk">
+    <tr><td><pre><code>class OllamaClient:
+    def __init__(self, settings: Settings):
+        self.base_url = settings.ollama_host
+        self.timeout = httpx.Timeout(float(settings.ollama_timeout))
+        self.prompt_builder = RAGPromptBuilder()
+        self.response_parser = ResponseParser()</code></pre></td>
+      <td>Stores the URL and a 300-second timeout from settings, plus two helpers you'll write tomorrow. The working-tree version also stores <code>default_model</code> and adds <code>get_langchain_model</code>; that's Module 7.</td></tr>
+    <tr><td><pre><code>    async def health_check(self) -&gt; Dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f"{self.base_url}/api/version")</code></pre></td>
+      <td>A new <code>AsyncClient</code> per call, closed by the <code>async with</code>. Simple, slightly wasteful (no connection reuse), and easy to mock.</td></tr>
+    <tr><td><pre><code>                if response.status_code == 200:
+                    version_data = response.json()
+                    return {
+                        "status": "healthy",
+                        "message": "Ollama service is running",
+                        "version": version_data.get("version", "unknown"),
+                    }
+                else:
+                    raise OllamaException(f"Ollama returned status {response.status_code}")</code></pre></td>
+      <td>Success returns a small dictionary that the <code>/health</code> endpoint displays.</td></tr>
+    <tr><td><pre><code>        except httpx.ConnectError as e:
+            raise OllamaConnectionError(f"Cannot connect to Ollama service: {e}")
+        except httpx.TimeoutException as e:
+            raise OllamaTimeoutError(f"Ollama service timeout: {e}")
+        except OllamaException:
+            raise
+        except Exception as e:
+            raise OllamaException(f"Ollama health check failed: {str(e)}")</code></pre></td>
+      <td>The translation ladder, repeated in every method. Order matters: Python uses the first matching <code>except</code>. <code>except OllamaException: raise</code> lets the exception raised a few lines up pass through unchanged; without it, the final catch-all would wrap it a second time.</td></tr>
+  </table>
+  <p><code>list_models</code> is the same shape: <code>GET /api/tags</code>, return <code>data.get("models", [])</code>.</p>
+
+  <p class="file"><b>src/services/ollama/client.py</b> &middot; <code>generate</code></p>
+  <table class="walk">
+    <tr><td><pre><code>    async def generate(self, model: str, prompt: str, stream: bool = False, **kwargs) -&gt; Optional[Dict[str, Any]]:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                data = {"model": model, "prompt": prompt, "stream": stream, **kwargs}</code></pre></td>
+      <td><code>**kwargs</code> collects any extra keyword arguments (like <code>temperature=0.7</code>) and <code>**kwargs</code> inside the dict spreads them in as <b>top-level</b> keys of the JSON body. Keep that in mind for "Break it".</td></tr>
+    <tr><td><pre><code>                response = await client.post(f"{self.base_url}/api/generate", json=data)
+
+                if response.status_code == 200:
+                    result = response.json()
+                    usage_metadata = {}
+                    if "prompt_eval_count" in result:
+                        usage_metadata["prompt_tokens"] = result.get("prompt_eval_count", 0)
+                    if "eval_count" in result:
+                        usage_metadata["completion_tokens"] = result.get("eval_count", 0)</code></pre></td>
+      <td>Ollama reports token counts under its own names. The client renames them to the common vocabulary (prompt tokens, completion tokens) that tracing tools like Langfuse expect (Module 6).</td></tr>
+    <tr><td><pre><code>                    if usage_metadata:
+                        usage_metadata["total_tokens"] = (
+                            usage_metadata.get("prompt_tokens", 0) +
+                            usage_metadata.get("completion_tokens", 0)
+                        )
+                    if "total_duration" in result:
+                        usage_metadata["latency_ms"] = round(result["total_duration"] / 1_000_000, 2)</code></pre></td>
+      <td>Ollama's durations are in nanoseconds; dividing by one million gives milliseconds. (The real file also converts <code>prompt_eval_duration</code> and <code>eval_duration</code> the same way; add them if you like.)</td></tr>
+    <tr><td><pre><code>                    result["usage_metadata"] = usage_metadata
+                    return result
+                else:
+                    raise OllamaException(f"Generation failed: {response.status_code}")</code></pre></td>
+      <td>Returns Ollama's full reply plus the added field. The generated text is in <code>result["response"]</code>. Then the same four-step <code>except</code> ladder.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/ollama/client.py</b> &middot; <code>generate_stream</code></p>
+  <pre><code>    async def generate_stream(self, model: str, prompt: str, **kwargs):
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                data = {"model": model, "prompt": prompt, "stream": True, **kwargs}
+                ...
+                async with client.stream("POST", f"{self.base_url}/api/generate", json=data) as response:
+                    if response.status_code != 200:
+                        raise OllamaException(f"Streaming generation failed: {response.status_code}")
+
+                    async for line in response.aiter_lines():
+                        if line.strip():
+                            try:
+                                chunk = json.loads(line)
+                                yield chunk
+                            except json.JSONDecodeError:
+                                logger.warning(f"Failed to parse streaming chunk: {line}")
+                                continue
+        except httpx.ConnectError as e:
+            ...</code></pre>
+  <p>
+    <code>client.stream(...)</code> opens the request without reading the whole body. <code>aiter_lines()</code> hands over one NDJSON
+    line at a time, as Ollama writes it. Blank lines are skipped and broken lines are logged and skipped, so one bad
+    line doesn't kill a four-minute answer. Each parsed dictionary is <code>yield</code>ed to whoever is looping over
+    <code>generate_stream</code>.
+  </p>
+
+  <p class="file"><b>src/services/ollama/factory.py</b></p>
+  <pre><code>@lru_cache(maxsize=1)
+def make_ollama_client() -&gt; OllamaClient:
+    settings = get_settings()
+    return OllamaClient(settings)</code></pre>
+  <p><code>lru_cache(maxsize=1)</code> turns the factory into a singleton: the first call builds the client, later calls return the same object.</p>
+
+  <p class="file"><b>src/routers/ping.py</b> &middot; Ollama joins the health check</p>
+  <pre><code>    # Handle Ollama async check separately
+    try:
+        ollama_client = OllamaClient(settings)
+        ollama_health = await ollama_client.health_check()
+        services["ollama"] = ServiceStatus(status=ollama_health["status"], message=ollama_health["message"])
+        if ollama_health["status"] != "healthy":
+            overall_status = "degraded"
+    except Exception as e:
+        services["ollama"] = ServiceStatus(status="unhealthy", message=str(e))
+        overall_status = "degraded"</code></pre>
+  <p>
+    It's handled apart from the synchronous database and OpenSearch checks because <code>health_check</code> is async and must be
+    awaited. Note it builds a fresh <code>OllamaClient</code> instead of using the one on <code>app.state</code>; that works, but the
+    dependency-injected client would be more consistent.
+  </p>
+
+  <h3>4. Build</h3>
+  <p>Write <code>src/services/ollama/__init__.py</code> (exporting <code>OllamaClient</code>), <code>src/services/ollama/factory.py</code>, and
+    <code>src/services/ollama/client.py</code> with:</p>
+  <ul>
+    <li><code>OllamaClient.__init__(self, settings: Settings)</code> as above. For today, leave out the two helper lines; you'll add
+      <code>prompt_builder</code> and <code>response_parser</code> tomorrow.</li>
+    <li><code>async health_check() -&gt; Dict[str, Any]</code>, <code>async list_models() -&gt; List[Dict[str, Any]]</code>,
+      <code>async generate(model, prompt, stream=False, **kwargs)</code>, <code>async generate_stream(model, prompt, **kwargs)</code>,
+      each with the full exception ladder.</li>
+  </ul>
+  <p>Then add Ollama to your <code>/health</code> endpoint the same way as the reference.</p>
+  <details class="hint"><summary>Hint: <code>httpx.TimeoutException</code></summary>
+    <p>It's the parent of <code>ConnectTimeout</code>, <code>ReadTimeout</code>, <code>WriteTimeout</code> and <code>PoolTimeout</code>, so one
+      <code>except</code> catches them all. Note that <code>ConnectTimeout</code> is <em>not</em> a <code>ConnectError</code>.</p></details>
+
+  <p>Add two fixtures to your top-level conftest (create <code>tests/conftest.py</code> if it doesn't exist; keep anything already in it):</p>
+  <p class="file"><b>tests/conftest.py</b> (add)</p>
+  <pre><code>import httpx
+import pytest
+from src.config import Settings
+from src.services.ollama.client import OllamaClient
+
+
+@pytest.fixture
+def mock_http(monkeypatch):
+    """Send every httpx.AsyncClient created during the test to a fake handler instead of the network."""
+    real_async_client = httpx.AsyncClient
+
+    def install(handler):
+        created = []
+
+        def fake_async_client(*args, **kwargs):
+            created.append(kwargs)
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return real_async_client(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", fake_async_client)
+        return created
+
+    return install
+
+
+@pytest.fixture
+def ollama_client():
+    return OllamaClient(Settings(ollama_host="http://ollama-test:11434"))</code></pre>
+  <p>
+    <code>mock_http</code> is a fixture that returns a function. The test calls <code>mock_http(handler)</code>; from then on, every
+    <code>httpx.AsyncClient(...)</code> the code creates gets a <code>MockTransport</code>, so requests go to <code>handler</code>, which returns a
+    fake <code>httpx.Response</code> or raises an error. <code>monkeypatch</code> undoes the swap after the test. The returned
+    <code>created</code> list records the arguments each client was built with; you'll use it on Day 4 to check a timeout.
+  </p>
+
+  <p class="file"><b>tests/unit/services/test_ollama_client.py</b></p>
+  <pre><code>import json
+
+import httpx
+import pytest
+from src.exceptions import OllamaConnectionError, OllamaException, OllamaTimeoutError
+
+
+async def test_health_check_reports_version(ollama_client, mock_http):
+    def handler(request):
+        assert request.url == "http://ollama-test:11434/api/version"
+        return httpx.Response(200, json={"version": "0.11.2"})
+
+    mock_http(handler)
+    health = await ollama_client.health_check()
+    assert health == {"status": "healthy", "message": "Ollama service is running", "version": "0.11.2"}
+
+
+async def test_health_check_connection_refused(ollama_client, mock_http):
+    def handler(request):
+        raise httpx.ConnectError("connection refused")
+
+    mock_http(handler)
+    with pytest.raises(OllamaConnectionError):
+        await ollama_client.health_check()
+
+
+async def test_list_models(ollama_client, mock_http):
+    mock_http(lambda request: httpx.Response(200, json={"models": [{"name": "llama3.2:1b"}]}))
+    models = await ollama_client.list_models()
+    assert [model["name"] for model in models] == ["llama3.2:1b"]
+
+
+async def test_generate_sends_body_and_adds_usage_metadata(ollama_client, mock_http):
+    sent = {}
+
+    def handler(request):
+        sent.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "response": "Hello",
+                "done": True,
+                "prompt_eval_count": 37,
+                "eval_count": 56,
+                "total_duration": 46_003_600_826,
+            },
+        )
+
+    mock_http(handler)
+    result = await ollama_client.generate(model="llama3.2:1b", prompt="Hi", temperature=0.7)
+
+    assert sent == {"model": "llama3.2:1b", "prompt": "Hi", "stream": False, "temperature": 0.7}
+    assert result["response"] == "Hello"
+    assert result["usage_metadata"] == {
+        "prompt_tokens": 37,
+        "completion_tokens": 56,
+        "total_tokens": 93,
+        "latency_ms": 46003.6,
+    }
+
+
+async def test_generate_non_200_raises(ollama_client, mock_http):
+    mock_http(lambda request: httpx.Response(404, json={"error": "model 'llama9' not found"}))
+    with pytest.raises(OllamaException, match="404"):
+        await ollama_client.generate(model="llama9", prompt="Hi")
+
+
+async def test_generate_timeout(ollama_client, mock_http):
+    def handler(request):
+        raise httpx.ReadTimeout("timed out")
+
+    mock_http(handler)
+    with pytest.raises(OllamaTimeoutError):
+        await ollama_client.generate(model="llama3.2:1b", prompt="Hi")
+
+
+async def test_generate_stream_yields_parsed_lines(ollama_client, mock_http):
+    body = b'{"response": "Hel", "done": false}\n\nnot json\n{"response": "lo", "done": true}\n'
+    mock_http(lambda request: httpx.Response(200, content=body))
+    chunks = [chunk async for chunk in ollama_client.generate_stream(model="llama3.2:1b", prompt="Hi")]
+    assert chunks == [{"response": "Hel", "done": False}, {"response": "lo", "done": True}]</code></pre>
+  <p>
+    The numbers in the usage test are the real ones from the Day 1 story. The streaming test deliberately includes a blank
+    line and a broken line, to prove both are skipped.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/test_ollama_client.py -q
+uv run pytest -q
+docker compose up -d --build api
+curl.exe -s http://localhost:18000/api/v1/health</code></pre>
+  <p>
+    <code>7 passed</code> for the new file, and the rest of your suite still passes. The health reply now includes
+    <code>"ollama":{"status":"healthy","message":"Ollama service is running"}</code>. Commit.
+  </p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m5-day2" /><span>Day 2: 7 client tests pass, /health shows Ollama healthy, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Delete the <code>except OllamaException: raise</code> line from <code>generate</code> and rerun. Tests still pass, but print the error from
+      <code>test_generate_non_200_raises</code>: it now reads <code>Error generating with Ollama: Generation failed: 404</code>, wrapped twice.
+      Put the line back.</li>
+    <li>Swap the order so <code>except Exception</code> comes first. Now <code>test_health_check_connection_refused</code> fails: the catch-all grabs the
+      <code>ConnectError</code> before the specific handler can.</li>
+    <li><code>docker compose stop ollama</code>, then check <code>/health</code>: status <code>"degraded"</code>, Ollama <code>"unhealthy"</code>
+      with a "Cannot connect" message. The API itself stays up. Start Ollama again.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>Prompts and RAG answers</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    The prompt is the only steering wheel you have. The same model with the same passages gives a grounded answer
+    or an invented one depending on how the instructions and passages are laid out. Today you'll build the prompt
+    exactly as the course does, and see its weak spots, which Module 8 fixes.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <ul>
+    <li><b>System prompt:</b> fixed instructions at the top (role, rules, length). Kept in a text file so you can edit it without touching code.</li>
+    <li><b>Grounding:</b> telling the model to answer <em>only</em> from the supplied passages, and labelling each passage with an ID it can cite.</li>
+    <li><b>Structured output:</b> asking the model for JSON matching a schema. Ollama supports a <code>format</code> field holding a JSON Schema.
+      Pydantic can generate that schema with <code>Model.model_json_schema()</code>.</li>
+    <li><b>Defensive parsing:</b> small models often wrap JSON in chatter ("Here's the JSON: {...}"). The parser tries strict JSON, then
+      a regular expression that pulls out the first <code>{...}</code>, then gives up and treats the whole reply as plain text.</li>
+  </ul>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/ollama/prompts/rag_system.txt</b> &middot; excerpt</p>
+  <pre><code>You are an AI assistant specialized in answering questions about academic papers from arXiv. Your task is to provide accurate, helpful answers based ONLY on the provided paper excerpts.
+...
+Instructions:
+1. Base your answer STRICTLY on the provided paper excerpts
+2. If the excerpts don't contain enough information to answer the question, say so clearly
+3. Cite the specific papers (by title or arXiv ID) when providing information
+4. Be concise but comprehensive in your response - LIMIT YOUR RESPONSE TO 300 WORDS MAXIMUM
+...
+9. Keep it less than 200 words
+...
+- NEVER add introductory phrases or explanations before your JSON response</code></pre>
+  <p>
+    Read the whole file. Notice two inconsistencies a reviewer would flag: rule 4 says 300 words and rule 9 says 200,
+    and the last line mentions a "JSON response" although the default path asks for plain text. Contradictory
+    instructions confuse small models.
+  </p>
+
+  <p class="file"><b>src/services/ollama/prompts.py</b> &middot; <code>RAGPromptBuilder</code></p>
+  <table class="walk">
+    <tr><td><pre><code>    def __init__(self):
+        self.prompts_dir = Path(__file__).parent / "prompts"
+        self.system_prompt = self._load_system_prompt()</code></pre></td>
+      <td><code>Path(__file__).parent</code> is the folder this .py file sits in, so the text file is found no matter which folder you run from.</td></tr>
+    <tr><td><pre><code>        prompt_file = self.prompts_dir / "rag_system.txt"
+        if not prompt_file.exists():
+            # Fallback to default prompt if file doesn't exist
+            return (
+                "You are an AI assistant specialized in answering questions about "
+                ...
+            )
+        return prompt_file.read_text().strip()</code></pre></td>
+      <td>A built-in fallback if the file is missing. (That fallback can hide a packaging mistake: the app keeps working with a weaker prompt and nobody notices.)</td></tr>
+    <tr><td><pre><code>    def create_rag_prompt(self, query: str, chunks: List[Dict[str, Any]]) -&gt; str:
+        prompt = f"{self.system_prompt}\n\n"
+        prompt += "### Context from Papers:\n\n"</code></pre></td>
+      <td>Builds one long string. Markdown-style headings separate the sections so the model can tell rules, passages and question apart.</td></tr>
+    <tr><td><pre><code>        for i, chunk in enumerate(chunks, 1):
+            chunk_text = chunk.get("chunk_text", chunk.get("content", ""))
+            arxiv_id = chunk.get("arxiv_id", "")
+            prompt += f"[{i}. arXiv:{arxiv_id}]\n"
+            prompt += f"{chunk_text}\n\n"</code></pre></td>
+      <td>Each passage gets a label like <code>[1. arXiv:2609.30227]</code>. <code>enumerate(chunks, 1)</code> counts from 1. The nested <code>.get</code> accepts either key name.</td></tr>
+    <tr><td><pre><code>        prompt += f"### Question:\n{query}\n\n"
+        prompt += (
+            "### Answer:\nProvide a natural, conversational response (not JSON) and cite sources using [arXiv:id] format.\n\n"
+        )</code></pre></td>
+      <td>The question goes last, closest to where the model starts writing. The final instruction asks for <code>[arXiv:id]</code> citations, but nothing afterwards <em>checks</em> them. That gap produced this week's invented citations (Module 8).</td></tr>
+    <tr><td><pre><code>    def create_structured_prompt(self, query, chunks):
+        prompt_text = self.create_rag_prompt(query, chunks)
+        return {
+            "prompt": prompt_text,
+            "format": RAGResponse.model_json_schema(),
+        }</code></pre></td>
+      <td>Same prompt, plus a JSON Schema generated from a Pydantic model, for Ollama's <code>format</code> field.</td></tr>
+  </table>
+
+  <p class="file"><b>src/schemas/ollama.py</b></p>
+  <pre><code>class RAGResponse(BaseModel):
+    """Structured response model for RAG queries."""
+
+    answer: str = Field(description="Comprehensive answer based on the provided paper excerpts")
+    sources: List[str] = Field(
+        default_factory=list,
+        description="List of PDF URLs from papers used in the answer",
+    )
+    confidence: Optional[str] = Field(
+        default=None,
+        description="Confidence level: high, medium, or low based on excerpt relevance",
+    )
+    citations: Optional[List[str]] = Field(
+        default=None,
+        description="Specific arXiv IDs or paper titles referenced in the answer",
+    )</code></pre>
+
+  <p class="file"><b>src/services/ollama/prompts.py</b> &middot; <code>ResponseParser</code>, three levels of fallback</p>
+  <pre><code>    @staticmethod
+    def parse_structured_response(response: str) -&gt; Dict[str, Any]:
+        try:
+            parsed_json = json.loads(response)
+            validated_response = RAGResponse(**parsed_json)
+            return validated_response.model_dump()
+        except (json.JSONDecodeError, ValidationError):
+            return ResponseParser._extract_json_fallback(response)
+
+    @staticmethod
+    def _extract_json_fallback(response: str) -&gt; Dict[str, Any]:
+        json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group())
+                validated = RAGResponse(**parsed)
+                return validated.model_dump()
+            except (json.JSONDecodeError, ValidationError):
+                pass
+
+        return {
+            "answer": response,
+            "sources": [],
+            "confidence": "low",
+            "citations": [],
+        }</code></pre>
+  <p>
+    <code>@staticmethod</code> means the method doesn't need <code>self</code>; you call it on the class. <code>re.DOTALL</code> lets
+    <code>.</code> match newlines, so a JSON object spread over several lines is still found. Whatever happens, the caller gets a
+    dictionary with an <code>"answer"</code>.
+  </p>
+
+  <p class="file"><b>src/services/ollama/client.py</b> &middot; <code>generate_rag_answer</code>, the default (plain text) path</p>
+  <table class="walk">
+    <tr><td><pre><code>    async def generate_rag_answer(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        model: str = "llama3.2",
+        use_structured_output: bool = False,
+    ) -&gt; Dict[str, Any]:</code></pre></td>
+      <td>Structured output is off by default, and the <code>/ask</code> endpoint never turns it on. The default model name <code>"llama3.2"</code> doesn't match the pulled <code>llama3.2:1b</code>; it only works because callers always pass <code>model=</code>.</td></tr>
+    <tr><td><pre><code>            else:
+                prompt = self.prompt_builder.create_rag_prompt(query, chunks)
+                response = await self.generate(
+                    model=model,
+                    prompt=prompt,
+                    temperature=0.7,
+                    top_p=0.9,
+                )</code></pre></td>
+      <td>Builds the prompt and generates. <code>temperature=0.7</code> is fairly creative for a task that should stick to facts, and (see "Break it") Ollama ignores it anyway because of where it ends up in the JSON.</td></tr>
+    <tr><td><pre><code>                    sources = []
+                    seen_urls = set()
+                    for chunk in chunks:
+                        arxiv_id = chunk.get("arxiv_id")
+                        if arxiv_id:
+                            arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
+                            pdf_url = f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf"
+                            if pdf_url not in seen_urls:
+                                sources.append(pdf_url)
+                                seen_urls.add(pdf_url)</code></pre></td>
+      <td>Turns every <em>retrieved</em> chunk's ID into a PDF link, removing the version suffix (<code>2609.30558v2</code> becomes <code>2609.30558</code>) and duplicates while keeping order.</td></tr>
+    <tr><td><pre><code>                    citations = list(set(chunk.get("arxiv_id") for chunk in chunks if chunk.get("arxiv_id")))
+
+                    return {
+                        "answer": answer_text,
+                        "sources": sources,
+                        "confidence": "medium",
+                        "citations": citations[:5],
+                    }</code></pre></td>
+      <td>Look closely: <code>citations</code> are the retrieved IDs, <b>not</b> what the answer actually cites, and <code>confidence</code> is hard-coded. If the model writes <code>[arXiv:2304.06476]</code> for a paper that was never retrieved, nothing here notices. Module 8 adds exactly that check.</td></tr>
+    <tr><td><pre><code>        except Exception as e:
+            logger.error(f"Error generating RAG answer: {e}")
+            raise OllamaException(f"Failed to generate RAG answer: {e}")</code></pre></td>
+      <td>Any failure comes out as one <code>OllamaException</code> with a clear prefix.</td></tr>
+  </table>
+  <p class="file"><b>src/services/ollama/client.py</b> &middot; <code>generate_rag_answer_stream</code></p>
+  <pre><code>        try:
+            prompt = self.prompt_builder.create_rag_prompt(query, chunks)
+
+            async for chunk in self.generate_stream(
+                model=model,
+                prompt=prompt,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Error generating streaming RAG answer: {e}")
+            raise OllamaException(f"Failed to generate streaming RAG answer: {e}")</code></pre>
+  <p>A thin async generator: build the prompt, then pass Ollama's chunks straight through.</p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Copy <code>src/services/ollama/prompts/rag_system.txt</code> from the reference (it's text, not code; read every line as you copy).</li>
+    <li>Write <code>src/schemas/ollama.py</code> (<code>RAGResponse</code>) and <code>src/services/ollama/prompts.py</code> (<code>RAGPromptBuilder</code> with
+      <code>_load_system_prompt</code>, <code>create_rag_prompt</code>, <code>create_structured_prompt</code>; <code>ResponseParser</code> with
+      <code>parse_structured_response</code> and <code>_extract_json_fallback</code>).</li>
+    <li>In <code>OllamaClient.__init__</code>, add <code>self.prompt_builder = RAGPromptBuilder()</code> and <code>self.response_parser = ResponseParser()</code>.</li>
+    <li>Add <code>generate_rag_answer(query, chunks, model="llama3.2", use_structured_output=False)</code> and
+      <code>generate_rag_answer_stream(query, chunks, model="llama3.2")</code>, matching the reference. The structured branch calls
+      <code>generate(..., format=prompt_data["format"])</code> and parses with <code>self.response_parser</code>.</li>
+  </ol>
+  <p class="file"><b>tests/unit/services/test_ollama_prompts.py</b></p>
+  <pre><code>from src.services.ollama.prompts import RAGPromptBuilder, ResponseParser
+
+CHUNKS = [
+    {"arxiv_id": "2609.30227", "chunk_text": "RAG retrieves passages before generating."},
+    {"arxiv_id": "2609.30558", "content": "Hybrid search mixes BM25 and vectors."},
+]
+
+
+def test_system_prompt_is_loaded_from_the_text_file():
+    builder = RAGPromptBuilder()
+    assert builder.system_prompt.startswith("You are an AI assistant specialized in answering questions about academic papers")
+    assert builder.system_prompt.endswith("before your JSON response")
+
+
+def test_rag_prompt_layout():
+    prompt = RAGPromptBuilder().create_rag_prompt("What is RAG?", CHUNKS)
+
+    assert "[1. arXiv:2609.30227]\nRAG retrieves passages before generating.\n\n" in prompt
+    assert "[2. arXiv:2609.30558]\nHybrid search mixes BM25 and vectors.\n\n" in prompt
+    assert prompt.index("### Context from Papers:") &lt; prompt.index("### Question:\nWhat is RAG?") &lt; prompt.index("### Answer:")
+
+
+def test_structured_prompt_adds_a_json_schema():
+    data = RAGPromptBuilder().create_structured_prompt("What is RAG?", CHUNKS)
+    assert data["prompt"] == RAGPromptBuilder().create_rag_prompt("What is RAG?", CHUNKS)
+    assert data["format"]["required"] == ["answer"]
+    assert set(data["format"]["properties"]) == {"answer", "sources", "confidence", "citations"}
+
+
+def test_parse_valid_json():
+    parsed = ResponseParser.parse_structured_response('{"answer": "RAG retrieves first.", "confidence": "high"}')
+    assert parsed == {"answer": "RAG retrieves first.", "sources": [], "confidence": "high", "citations": None}
+
+
+def test_parse_json_wrapped_in_chatter():
+    parsed = ResponseParser.parse_structured_response('Here is the JSON: {"answer": "Yes."} Hope it helps!')
+    assert parsed["answer"] == "Yes."
+
+
+def test_parse_plain_text_falls_back():
+    parsed = ResponseParser.parse_structured_response("RAG means retrieval-augmented generation.")
+    assert parsed == {
+        "answer": "RAG means retrieval-augmented generation.",
+        "sources": [],
+        "confidence": "low",
+        "citations": [],
+    }</code></pre>
+
+  <p class="file"><b>tests/unit/services/test_ollama_client.py</b> (add at the end)</p>
+  <pre><code>async def test_generate_rag_answer_builds_sources_from_chunks(ollama_client, monkeypatch):
+    captured = {}
+
+    async def fake_generate(model, prompt, stream=False, **kwargs):
+        captured.update(model=model, prompt=prompt, **kwargs)
+        return {"response": "RAG retrieves first [arXiv:2609.30227]."}
+
+    monkeypatch.setattr(ollama_client, "generate", fake_generate)
+    chunks = [
+        {"arxiv_id": "2609.30227", "chunk_text": "a"},
+        {"arxiv_id": "2609.30227", "chunk_text": "b"},
+        {"arxiv_id": "2609.30558v2", "chunk_text": "c"},
+    ]
+    result = await ollama_client.generate_rag_answer(query="What is RAG?", chunks=chunks, model="llama3.2:1b")
+
+    assert result["answer"] == "RAG retrieves first [arXiv:2609.30227]."
+    assert result["sources"] == ["https://arxiv.org/pdf/2609.30227.pdf", "https://arxiv.org/pdf/2609.30558.pdf"]
+    assert sorted(result["citations"]) == ["2609.30227", "2609.30558v2"]
+    assert result["confidence"] == "medium"
+    assert captured["temperature"] == 0.7
+    assert captured["top_p"] == 0.9
+    assert "### Question:\nWhat is RAG?" in captured["prompt"]
+
+
+async def test_generate_rag_answer_wraps_errors(ollama_client, monkeypatch):
+    async def broken_generate(**kwargs):
+        raise OllamaConnectionError("down")
+
+    monkeypatch.setattr(ollama_client, "generate", broken_generate)
+    with pytest.raises(OllamaException, match="Failed to generate RAG answer"):
+        await ollama_client.generate_rag_answer(query="q", chunks=[])
+
+
+async def test_generate_rag_answer_stream_passes_chunks_through(ollama_client, monkeypatch):
+    async def fake_stream(model, prompt, **kwargs):
+        yield {"response": "Hel", "done": False}
+        yield {"response": "lo", "done": True}
+
+    monkeypatch.setattr(ollama_client, "generate_stream", fake_stream)
+    chunks = [
+        chunk
+        async for chunk in ollama_client.generate_rag_answer_stream(
+            query="q", chunks=[{"arxiv_id": "2609.30227", "chunk_text": "t"}]
+        )
+    ]
+    assert [chunk["response"] for chunk in chunks] == ["Hel", "lo"]</code></pre>
+  <p>
+    <code>monkeypatch.setattr(ollama_client, "generate", fake_generate)</code> replaces one method on one object for one test, so
+    you test the RAG logic without any HTTP at all. Notice what the first test pins down: <code>citations</code> contains
+    <code>2609.30558v2</code> even though the answer never cited it.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services -q</code></pre>
+  <p>The two Ollama files give <code>16 passed</code> (10 client + 6 prompt tests), alongside whatever service tests you already have. Now try it for real:</p>
+  <pre><code>uv run python -c "import asyncio; from src.config import Settings; from src.services.ollama.client import OllamaClient; c = OllamaClient(Settings(ollama_host='http://localhost:21434')); print(asyncio.run(c.generate_rag_answer('What is RAG?', [{'arxiv_id': '2005.11401', 'chunk_text': 'We combine a retriever with a seq2seq generator.'}], model='llama3.2:1b')))"</code></pre>
+  <p>After a minute or two you get a dictionary with an answer, one source URL, and <code>"confidence": "medium"</code>. Commit.</p>
+  <ul class="checklist"><li><input type="checkbox" data-id="m5-day3" /><span>Day 3: prompt and RAG tests pass, a real RAG answer came back, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li><b>The temperature that does nothing.</b> Ollama reads sampling settings from an <code>"options"</code> object, but
+      <code>generate</code> spreads <code>temperature=0.7</code> into the <em>top level</em> of the JSON body, where Ollama silently ignores it.
+      Check it yourself: send <code>"Invent a name for a cat. Reply with the name only."</code> three times with top-level
+      <code>"temperature": 0</code>, then three times with <code>"options": {"temperature": 0}</code>. When I did this against the reference
+      Ollama, the top-level runs gave <i>Zephyrine, Lumina, Luminia</i> and the options runs gave <i>Lumina</i> three times.
+      So the reference answers really run at Ollama's default temperature. Don't fix it in your code yet (keep matching the
+      reference), but remember it for the interview.</li>
+    <li>Rename <code>rag_system.txt</code> and run the prompt tests. <code>test_system_prompt_is_loaded_from_the_text_file</code> fails, but the
+      app would keep working with the short fallback prompt. Silent fallbacks hide bugs. Rename it back.</li>
+    <li>Call <code>ResponseParser.parse_structured_response('{"sources": []}')</code>. Valid JSON, but <code>answer</code> is missing, so validation fails at every level
+      and you get the plain-text fallback with the raw JSON string as the "answer". Why is that better than crashing?</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>The /ask and /stream endpoints, and the Gradio chat UI</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Today everything joins up: search, prompt, model, HTTP. You'll also meet the most user-visible design question
+    in a slow system: do you make the user stare at a spinner for three minutes, or show the answer word by word
+    as it's written? The course offers both, and the chat UI uses the streaming one.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <ul>
+    <li><b>Server-Sent Events (SSE):</b> a simple text format for pushing messages over one long HTTP response. Each message is a line
+      <code>data: &lt;text&gt;</code> followed by a blank line. Here the text is JSON.</li>
+    <li><b><code>StreamingResponse</code>:</b> FastAPI's response type that takes a generator and sends each yielded string immediately.</li>
+    <li><b>An error mid-stream can't change the status code.</b> The <code>200 OK</code> goes out with the first byte. If something fails later, the
+      only way to tell the client is <em>inside</em> the stream, which is what the <code>{"error": ...}</code> event is for.</li>
+    <li><b>Graceful degradation:</b> if the embedding service fails, fall back to keyword-only search instead of failing the whole request.</li>
+    <li><b>Gradio:</b> a Python library that builds a web UI from a few components (text box, button, markdown area) and calls your Python
+      function when the user submits. If the function is a generator, the UI updates on every <code>yield</code>.</li>
+  </ul>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/schemas/api/ask.py</b> &middot; original version</p>
+  <p>
+    You walked through <code>AskRequest</code> line by line in Module 0 (query 1&ndash;1000 characters, <code>top_k</code> 1&ndash;10 default 3,
+    <code>use_hybrid</code> default true, <code>model</code> default <code>"llama3.2:1b"</code>, optional <code>categories</code>). The reply:
+  </p>
+  <pre><code>class AskResponse(BaseModel):
+    """Response model for RAG question answering."""
+
+    query: str = Field(..., description="Original user question")
+    answer: str = Field(..., description="Generated answer from LLM")
+    sources: List[str] = Field(..., description="PDF URLs of source papers")
+    chunks_used: int = Field(..., description="Number of chunks used for generation")
+    search_mode: str = Field(..., description="Search mode used: bm25 or hybrid")</code></pre>
+  <p>
+    The original file also defines <code>AgenticAskResponse</code>, <code>FeedbackRequest</code> and <code>FeedbackResponse</code>; those belong to
+    Module 7, so leave them out for now. Module 8 adds fields such as <code>removed_citations</code>.
+  </p>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; original version, the retrieval helper (tracing lines elided with <code>...</code>)</p>
+  <table class="walk">
+    <tr><td><pre><code>ask_router = APIRouter(tags=["ask"])
+stream_router = APIRouter(tags=["stream"])</code></pre></td>
+      <td>Two routers, so <code>main.py</code> can mount them separately. Tags group endpoints on <code>/docs</code>.</td></tr>
+    <tr><td><pre><code>async def _prepare_chunks_and_sources(
+    request: AskRequest,
+    opensearch_client,
+    embeddings_service,
+    rag_tracer: RAGTracer,
+    trace=None,
+) -&gt; tuple[List[Dict], List[str], List[str]]:</code></pre></td>
+      <td>Shared by both endpoints. Returns three things: chunks for the LLM, source URLs, and arXiv IDs. Your version today has only the first three parameters; Module 6 adds <code>rag_tracer</code> and <code>trace</code>.</td></tr>
+    <tr><td><pre><code>    query_embedding = None
+    if request.use_hybrid:
+        ...
+            try:
+                query_embedding = await embeddings_service.embed_query(request.query)
+                logger.info("Generated query embedding for hybrid search")
+            except Exception as e:
+                logger.warning(f"Failed to generate embeddings, falling back to BM25: {e}")</code></pre></td>
+      <td>Embeds the question with Jina (Module 4). If Jina fails, log a warning and carry on without a vector.</td></tr>
+    <tr><td><pre><code>        search_results = opensearch_client.search_unified(
+            query=request.query,
+            query_embedding=query_embedding,
+            size=request.top_k,
+            from_=0,
+            categories=request.categories,
+            use_hybrid=request.use_hybrid and query_embedding is not None,
+            min_score=0.0,
+        )</code></pre></td>
+      <td>The same <code>search_unified</code> you built in Module 4. Hybrid only if it was requested <b>and</b> an embedding exists; otherwise BM25. <code>top_k</code> passages become the LLM's context.</td></tr>
+    <tr><td><pre><code>        for hit in search_results.get("hits", []):
+            arxiv_id = hit.get("arxiv_id", "")
+            chunks.append(
+                {
+                    "arxiv_id": arxiv_id,
+                    "chunk_text": hit.get("chunk_text", hit.get("abstract", "")),
+                }
+            )</code></pre></td>
+      <td>Keeps only what the prompt needs: ID and text. Less text means a shorter prompt, and on a CPU a shorter prompt is a faster answer.</td></tr>
+    <tr><td><pre><code>            if arxiv_id:
+                arxiv_ids.append(arxiv_id)
+                arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
+                sources_set.add(f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf")
+    ...
+    return chunks, list(sources_set), arxiv_ids</code></pre></td>
+      <td>A set removes duplicate URLs, but it has no order, so the order of <code>sources</code> can vary between calls. The tests sort before comparing for that reason.</td></tr>
+  </table>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; the <code>/ask</code> endpoint, core lines</p>
+  <pre><code>@ask_router.post("/ask", response_model=AskResponse)
+async def ask_question(
+    request: AskRequest,
+    opensearch_client: OpenSearchDep,
+    embeddings_service: EmbeddingsDep,
+    ollama_client: OllamaDep,
+    langfuse_tracer: LangfuseDep,
+    cache_client: CacheDep,
+) -&gt; AskResponse:
+        ...
+            if not chunks:
+                response = AskResponse(
+                    query=request.query,
+                    answer="I couldn't find any relevant information in the papers to answer your question.",
+                    sources=[],
+                    chunks_used=0,
+                    search_mode="bm25" if not request.use_hybrid else "hybrid",
+                )
+                ...
+                return response
+            ...
+                rag_response = await ollama_client.generate_rag_answer(query=request.query, chunks=chunks, model=request.model)
+                answer = rag_response.get("answer", "Unable to generate answer")
+            ...
+            response = AskResponse(
+                query=request.query,
+                answer=answer,
+                sources=sources,
+                chunks_used=len(chunks),
+                search_mode="bm25" if not request.use_hybrid else "hybrid",
+            )
+            ...
+            return response
+
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            raise HTTPException(status_code=500, detail=str(e))</code></pre>
+  <p>
+    Three things to notice. No passages means no LLM call at all: cheap and honest. Any exception becomes a 500 with the
+    error text in <code>detail</code>. And <code>search_mode</code> is computed from what was <em>requested</em>, so when Jina fails and
+    the search silently falls back to BM25, the response still says <code>"hybrid"</code>. The elided lines are the cache
+    (<code>cache_client</code>) and tracing (<code>langfuse_tracer</code>, <code>rag_tracer</code>), which are Module 6. The original also builds a
+    prompt inside <code>/ask</code> only to record it in the trace; <code>generate_rag_answer</code> builds its own, so you skip that today.
+  </p>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; the <code>/stream</code> endpoint, core lines</p>
+  <table class="walk">
+    <tr><td><pre><code>@stream_router.post("/stream")
+async def ask_question_stream(...) -&gt; StreamingResponse:
+    async def generate_stream():</code></pre></td>
+      <td>An async generator defined <em>inside</em> the endpoint, so it can use <code>request</code> and the clients. The endpoint itself returns straight away with a <code>StreamingResponse</code> wrapping it.</td></tr>
+    <tr><td><pre><code>                if not chunks:
+                    yield f"data: {json.dumps({'answer': 'No relevant information found.', 'sources': [], 'done': True})}\n\n"
+                    return</code></pre></td>
+      <td>Nothing found: one final event and stop. <code>return</code> in a generator ends it.</td></tr>
+    <tr><td><pre><code>                search_mode = "bm25" if not request.use_hybrid else "hybrid"
+                metadata_response = {"sources": sources, "chunks_used": len(chunks), "search_mode": search_mode}
+                yield f"data: {json.dumps(metadata_response)}\n\n"</code></pre></td>
+      <td>First event: metadata, sent <em>before</em> the slow LLM starts, so the UI can show sources early.</td></tr>
+    <tr><td><pre><code>                    full_response = ""
+                    async for chunk in ollama_client.generate_rag_answer_stream(
+                        query=request.query, chunks=chunks, model=request.model
+                    ):
+                        if chunk.get("response"):
+                            text_chunk = chunk["response"]
+                            full_response += text_chunk
+                            yield f"data: {json.dumps({'chunk': text_chunk})}\n\n"</code></pre></td>
+      <td>Every piece of text from Ollama becomes one <code>{"chunk": ...}</code> event, and is also collected into <code>full_response</code>.</td></tr>
+    <tr><td><pre><code>                        if chunk.get("done", False):
+                            ...
+                            yield f"data: {json.dumps({'answer': full_response, 'done': True})}\n\n"
+                            break</code></pre></td>
+      <td>Last event: the full answer with <code>"done": true</code>.</td></tr>
+    <tr><td><pre><code>            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate_stream(), media_type="text/plain", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )</code></pre></td>
+      <td>Errors become an event, because the 200 is already sent. The media type is <code>text/plain</code>, not the standard <code>text/event-stream</code>; the Gradio client doesn't care, but a browser's <code>EventSource</code> would.</td></tr>
+  </table>
+
+  <p class="file"><b>src/main.py</b> and <b>src/dependencies.py</b> &middot; wiring</p>
+  <pre><code># dependencies.py
+def get_ollama_client(request: Request) -&gt; OllamaClient:
+    """Get Ollama client from the request state."""
+    return request.app.state.ollama_client
+...
+OllamaDep = Annotated[OllamaClient, Depends(get_ollama_client)]
+
+# main.py, inside lifespan
+    app.state.ollama_client = make_ollama_client()
+
+# main.py, after creating the app
+app.include_router(ask_router, prefix="/api/v1")  # RAG question answering with LLM
+app.include_router(stream_router, prefix="/api/v1")  # Streaming RAG responses</code></pre>
+
+  <p class="file"><b>src/gradio_app.py</b> &middot; original version, the streaming client</p>
+  <table class="walk">
+    <tr><td><pre><code>API_BASE_URL = "http://localhost:8000/api/v1"
+DEFAULT_MODEL = "llama3.2:1b"</code></pre></td>
+      <td>Gradio runs on your laptop, not in Docker, so it calls the API through the published port. Yours: <code>http://localhost:18000/api/v1</code>.</td></tr>
+    <tr><td><pre><code>    category_list = [cat.strip() for cat in categories.split(",") if cat.strip()] if categories else None
+    payload = {"query": query, "top_k": top_k, "use_hybrid": use_hybrid, "model": model, "categories": category_list}</code></pre></td>
+      <td>Turns <code>"cs.AI, cs.LG"</code> into <code>["cs.AI", "cs.LG"]</code> and builds the same body as an <code>/ask</code> call.</td></tr>
+    <tr><td><pre><code>        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, json=payload, headers={"Accept": "text/plain"}) as response:</code></pre></td>
+      <td><b>The bug.</b> A 60-second read timeout: if no byte arrives for 60 s, <code>httpx</code> gives up.</td></tr>
+    <tr><td><pre><code>                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix</code></pre></td>
+      <td>Reads the SSE lines and strips the 6-character prefix.</td></tr>
+    <tr><td><pre><code>                            if "sources" in data:
+                                sources = data["sources"]
+                                ...
+                                continue
+                            if "chunk" in data:
+                                current_answer += data["chunk"]
+                                ...
+                                yield formatted_response</code></pre></td>
+      <td>Metadata is remembered; each chunk extends the answer, and the <em>whole</em> answer so far (plus a "Search Info" block) is yielded. Gradio replaces the displayed text on each yield, which looks like typing.</td></tr>
+    <tr><td><pre><code>    except httpx.RequestError as e:
+        yield f"Connection error: {str(e)}\nMake sure the API server is running at {API_BASE_URL}"</code></pre></td>
+      <td><code>httpx.ReadTimeout</code> is a subclass of <code>httpx.RequestError</code>, so a <em>slow</em> server lands here, and the message blames a server that's actually fine.</td></tr>
+  </table>
+  <p>
+    The rest of the file is layout: <code>gr.Blocks</code>, a text box, a button, an "Advanced Options" accordion (slider for
+    <code>top_k</code>, hybrid checkbox, model dropdown, categories box), a <code>gr.Markdown</code> output, examples, and
+    <code>submit_btn.click(fn=stream_response, ...)</code>. <code>main()</code> calls <code>interface.launch(server_name="0.0.0.0", server_port=7861, ...)</code>.
+    <code>gradio_launcher.py</code> in the project root just imports and runs <code>main()</code>.
+  </p>
+
+  <div class="callout story">
+    <b>What happened here this week: the 60-second timeout</b>
+    The chat page kept answering "Connection error ... Make sure the API server is running" while <code>/health</code> said
+    everything was fine. The cause: after <code>/stream</code> sent its metadata event, Ollama spent well over a minute
+    <em>reading the prompt</em> before producing its first token (remember: about 7 tokens per second on this CPU, and a
+    prompt of a few thousand tokens). No bytes for 60 seconds meant <code>httpx.ReadTimeout</code>, caught by the handler
+    with the misleading message. The fix in the working tree is one argument:
+    <code>httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))</code>: wait up to 10 minutes for data, but only 10
+    seconds to connect, so a server that's really down is still reported quickly.
+  </div>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>src/schemas/api/ask.py</code>: <code>AskRequest</code> and <code>AskResponse</code> exactly as the original.</li>
+    <li><code>src/dependencies.py</code>: add <code>get_ollama_client</code> and <code>OllamaDep</code>.</li>
+    <li><code>src/routers/ask.py</code>: <code>ask_router</code>, <code>stream_router</code>,
+      <code>_prepare_chunks_and_sources(request, opensearch_client, embeddings_service)</code>, <code>ask_question</code> (POST <code>/ask</code>,
+      <code>response_model=AskResponse</code>) and <code>ask_question_stream</code> (POST <code>/stream</code>). Same behaviour as the original with every
+      cache and tracing line removed. <b>This is a deliberate simplification</b>; Module 6 adds those lines back so your file matches the reference.</li>
+    <li><code>src/main.py</code>: create the Ollama client in the lifespan and include both routers under <code>/api/v1</code>.</li>
+    <li><code>uv add gradio</code>, then write <code>src/gradio_app.py</code> (with <code>API_BASE_URL = "http://localhost:18000/api/v1"</code> and
+      <code>server_port=17861</code>) and <code>gradio_launcher.py</code>. Type the original <code>timeout=60.0</code> first; one of today's tests fails
+      until you apply the fix.</li>
+  </ol>
+  <details class="hint"><summary>Hint: the shape of the Module 5 <code>/ask</code></summary>
+    <p><code>try:</code> get chunks; if none, return the "couldn't find" response; otherwise call <code>generate_rag_answer</code>, take
+      <code>.get("answer", "Unable to generate answer")</code>, return an <code>AskResponse</code>. <code>except Exception</code>: log, raise
+      <code>HTTPException(status_code=500, detail=str(e))</code>.</p></details>
+  <div class="callout info"><b>Gradio version</b>
+    <code>uv add gradio</code> installs Gradio 6 (the reference is pinned to 5.45, which needs an older pydantic than yours). The original file
+    works unchanged; it only prints a warning that <code>theme</code> has moved from <code>gr.Blocks(...)</code> to <code>launch()</code>. You can move it or ignore it.
+    If you ever run the launcher with its output piped and it crashes with <code>UnicodeEncodeError</code> on the emoji in <code>print</code>, set
+    <code>$env:PYTHONUTF8=1</code> first.</div>
+
+  <p>
+    For the endpoint tests you'll build a tiny FastAPI app containing only the two routers, and replace the real clients
+    with fakes via <code>app.dependency_overrides</code>. That avoids starting your real lifespan (which would connect to
+    Postgres and OpenSearch) and takes milliseconds instead of minutes. Add these fixtures to <code>tests/api/conftest.py</code>
+    (create it if needed; keep existing fixtures; the names are chosen not to clash with a <code>client</code> fixture from Module 1):
+  </p>
+  <p class="file"><b>tests/api/conftest.py</b> (add)</p>
+  <pre><code>from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from src.dependencies import get_embeddings_service, get_ollama_client, get_opensearch_client
+from src.routers.ask import ask_router, stream_router
+
+HITS = [
+    {"arxiv_id": "2609.30227", "chunk_text": "RAG retrieves passages first."},
+    {"arxiv_id": "2609.30227", "chunk_text": "Then it generates an answer."},
+    {"arxiv_id": "2609.30558v2", "chunk_text": "Hybrid search mixes BM25 and vectors."},
+]
+
+
+@pytest.fixture
+def fake_opensearch():
+    client = MagicMock()
+    client.search_unified.return_value = {"total": 3, "hits": HITS}
+    return client
+
+
+@pytest.fixture
+def fake_embeddings():
+    service = MagicMock()
+    service.embed_query = AsyncMock(return_value=[0.1] * 1024)
+    return service
+
+
+@pytest.fixture
+def fake_ollama():
+    client = MagicMock()
+    client.generate_rag_answer = AsyncMock(return_value={"answer": "RAG retrieves, then generates."})
+
+    async def stream(**kwargs):
+        for piece in ["RAG ", "retrieves."]:
+            yield {"response": piece, "done": False}
+        yield {"response": "", "done": True}
+
+    client.generate_rag_answer_stream = stream
+    return client
+
+
+@pytest.fixture
+def ask_client(fake_opensearch, fake_embeddings, fake_ollama):
+    app = FastAPI()
+    app.include_router(ask_router, prefix="/api/v1")
+    app.include_router(stream_router, prefix="/api/v1")
+    app.dependency_overrides[get_opensearch_client] = lambda: fake_opensearch
+    app.dependency_overrides[get_embeddings_service] = lambda: fake_embeddings
+    app.dependency_overrides[get_ollama_client] = lambda: fake_ollama
+    with TestClient(app) as client:
+        yield client</code></pre>
+  <p>
+    <code>MagicMock</code> accepts any method call and records it; <code>AsyncMock</code> does the same for methods that are awaited.
+    Tests then ask the mocks what happened, e.g. <code>assert_awaited_once_with(...)</code> or <code>call_args.kwargs</code>.
+  </p>
+
+  <p class="file"><b>tests/api/routers/test_ask.py</b></p>
+  <pre><code>import json
+
+
+def _events(response):
+    return [json.loads(line[len("data: "):]) for line in response.text.splitlines() if line.startswith("data: ")]
+
+
+def test_ask_answers_from_retrieved_chunks(ask_client, fake_opensearch, fake_embeddings, fake_ollama):
+    response = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"] == "RAG retrieves, then generates."
+    assert sorted(data["sources"]) == ["https://arxiv.org/pdf/2609.30227.pdf", "https://arxiv.org/pdf/2609.30558.pdf"]
+    assert data["chunks_used"] == 3
+    assert data["search_mode"] == "hybrid"
+    fake_embeddings.embed_query.assert_awaited_once_with("What is RAG?")
+    search_kwargs = fake_opensearch.search_unified.call_args.kwargs
+    assert search_kwargs["use_hybrid"] is True
+    assert search_kwargs["size"] == 3
+    llm_chunks = fake_ollama.generate_rag_answer.call_args.kwargs["chunks"]
+    assert llm_chunks[2] == {"arxiv_id": "2609.30558v2", "chunk_text": "Hybrid search mixes BM25 and vectors."}
+
+
+def test_ask_bm25_mode_skips_embedding(ask_client, fake_opensearch, fake_embeddings):
+    response = ask_client.post("/api/v1/ask", json={"query": "What is RAG?", "use_hybrid": False})
+    assert response.json()["search_mode"] == "bm25"
+    fake_embeddings.embed_query.assert_not_awaited()
+    assert fake_opensearch.search_unified.call_args.kwargs["use_hybrid"] is False
+
+
+def test_ask_falls_back_to_bm25_when_embedding_fails(ask_client, fake_opensearch, fake_embeddings):
+    fake_embeddings.embed_query.side_effect = RuntimeError("Jina is down")
+    response = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+    assert response.status_code == 200
+    assert fake_opensearch.search_unified.call_args.kwargs["use_hybrid"] is False
+    assert response.json()["search_mode"] == "hybrid"  # reports what was asked for, not what ran
+
+
+def test_ask_with_no_hits_skips_the_llm(ask_client, fake_opensearch, fake_ollama):
+    fake_opensearch.search_unified.return_value = {"total": 0, "hits": []}
+    data = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"}).json()
+    assert data["chunks_used"] == 0
+    assert data["answer"].startswith("I couldn't find any relevant information")
+    fake_ollama.generate_rag_answer.assert_not_awaited()
+
+
+def test_ask_llm_failure_returns_500(ask_client, fake_ollama):
+    fake_ollama.generate_rag_answer.side_effect = RuntimeError("Ollama timeout")
+    response = ask_client.post("/api/v1/ask", json={"query": "What is RAG?"})
+    assert response.status_code == 500
+    assert "Ollama timeout" in response.json()["detail"]
+
+
+def test_ask_validation(ask_client):
+    assert ask_client.post("/api/v1/ask", json={"query": ""}).status_code == 422
+    assert ask_client.post("/api/v1/ask", json={"query": "x", "top_k": 11}).status_code == 422
+
+
+def test_stream_sends_metadata_then_chunks_then_done(ask_client):
+    response = ask_client.post("/api/v1/stream", json={"query": "What is RAG?"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    events = _events(response)
+    assert events[0]["chunks_used"] == 3
+    assert events[0]["search_mode"] == "hybrid"
+    assert [event["chunk"] for event in events if "chunk" in event] == ["RAG ", "retrieves."]
+    assert events[-1] == {"answer": "RAG retrieves.", "done": True}
+
+
+def test_stream_reports_errors_inside_the_stream(ask_client, fake_ollama):
+    async def broken(**kwargs):
+        raise RuntimeError("Ollama timeout")
+        yield  # never reached, but makes this an async generator
+
+    fake_ollama.generate_rag_answer_stream = broken
+    response = ask_client.post("/api/v1/stream", json={"query": "What is RAG?"})
+    assert response.status_code == 200
+    assert _events(response)[-1] == {"error": "Ollama timeout"}</code></pre>
+  <div class="callout warn"><b>If your Module 1 <code>tests/api/routers/test_ask.py</code> exists</b>
+    Replace it with this file. The reference's own <code>test_ask.py</code> accepts status 200, 500 <em>or</em> 503 for real questions,
+    which means it passes even when the endpoint is broken; yours checks behaviour.</div>
+
+  <p class="file"><b>tests/unit/test_gradio_app.py</b></p>
+  <pre><code>import httpx
+from src.gradio_app import stream_response
+
+SSE = (
+    'data: {"sources": ["https://arxiv.org/pdf/2609.30227.pdf"], "chunks_used": 3, "search_mode": "hybrid"}\n\n'
+    'data: {"chunk": "RAG "}\n\n'
+    'data: {"chunk": "retrieves."}\n\n'
+    'data: {"answer": "RAG retrieves.", "done": true}\n\n'
+)
+
+
+async def collect(**kwargs):
+    return [update async for update in stream_response(**kwargs)]
+
+
+async def test_empty_question_never_calls_the_api():
+    assert await collect(query="   ") == ["Please enter a question."]
+
+
+async def test_stream_builds_the_answer_and_search_info(mock_http):
+    mock_http(lambda request: httpx.Response(200, text=SSE))
+    updates = await collect(query="What is RAG?")
+    assert updates[0].startswith("RAG \n\n**Search Info:**")
+    assert updates[-1].startswith("RAG retrieves.")
+    assert "- Mode: hybrid" in updates[-1]
+    assert "- Chunks used: 3" in updates[-1]
+    assert "[2609.30227.pdf](https://arxiv.org/pdf/2609.30227.pdf)" in updates[-1]
+
+
+async def test_a_slow_api_is_misreported_as_a_connection_error(mock_http):
+    def handler(request):
+        raise httpx.ReadTimeout("timed out")
+
+    mock_http(handler)
+    updates = await collect(query="What is RAG?")
+    assert updates[-1].startswith("Connection error: timed out")
+    assert "Make sure the API server is running" in updates[-1]
+
+
+async def test_client_waits_long_enough_for_cpu_inference(mock_http):
+    created = mock_http(lambda request: httpx.Response(200, text=SSE))
+    await collect(query="What is RAG?")
+    timeout = httpx.Timeout(created[0]["timeout"])
+    assert timeout.read &gt;= 600
+    assert timeout.connect == 10</code></pre>
+  <p>
+    With the original <code>timeout=60.0</code>, the last test fails with <code>assert 60.0 &gt;= 600</code>. That's the incident, caught by a
+    test. Apply the fix and it passes. The third test documents the misleading message on purpose: it's still there in the
+    working tree, and a better one would say "the API didn't respond in time".
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/api/routers/test_ask.py tests/unit/test_gradio_app.py -q
+uv run pytest -q
+docker compose up -d --build api</code></pre>
+  <p>Expect <code>12 passed</code> for the two new files (8 + 4), and the full suite green. Then the real thing, which takes 2&ndash;4 minutes:</p>
+  <pre><code>'{"query": "What is retrieval-augmented generation?", "top_k": 3}' | Out-File -Encoding ascii ask.json
+Measure-Command { curl.exe -s -X POST http://localhost:18000/api/v1/ask -H "Content-Type: application/json" --data-binary "@ask.json" -o ask_out.json }
+Get-Content ask_out.json
+curl.exe -N -s -X POST http://localhost:18000/api/v1/stream -H "Content-Type: application/json" --data-binary "@ask.json"</code></pre>
+  <p>
+    <code>/ask</code> returns JSON with an answer, up to three PDF URLs, <code>"chunks_used":3</code> and <code>"search_mode":"hybrid"</code>.
+    <code>/stream</code> prints a metadata line immediately, then nothing for a while (Ollama reading the prompt), then
+    <code>data: {"chunk": ...}</code> lines trickling in, and finally <code>"done": true</code>. Now the UI:
+  </p>
+  <pre><code>uv run python gradio_launcher.py</code></pre>
+  <p>
+    Open <a href="http://localhost:17861">localhost:17861</a>, ask a question, and watch the answer type itself out. Delete
+    <code>ask.json</code> and <code>ask_out.json</code>. Commit.
+  </p>
+  <div class="callout warn"><b>What I checked and what I couldn't</b>
+    I ran all the tests on this page against a copy of the reference code (30 passing, including the timeout test failing before the fix and passing after it), and
+    built the Gradio interface on Gradio 6. I didn't run a full <code>/ask</code> through a stack like yours, because building your
+    images was off-limits; the reference stack answers the same request in 2&ndash;4 minutes on this laptop.</div>
+  <ul class="checklist"><li><input type="checkbox" data-id="m5-day4" /><span>Day 4: tests pass, a real /ask and /stream answered, Gradio works on 17861, committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Put <code>timeout=60.0</code> back in <code>gradio_app.py</code>, restart Gradio, and ask a question with <code>top_k</code> at 10. Watch
+      the "Make sure the API server is running" message appear after about a minute while <code>docker compose logs -f api</code>
+      shows the API still happily working. You've reproduced the incident. Restore the fix.</li>
+    <li>Stop Ollama (<code>docker compose stop ollama</code>) and call <code>/ask</code>: a 500 whose <code>detail</code> starts with
+      <code>Failed to generate RAG answer: Cannot connect to Ollama service</code>. Call <code>/stream</code>: status 200, then a
+      <code>data: {"error": ...}</code> line. Same failure, two very different-looking responses.</li>
+    <li>Ask for <code>"model": "llama3.2:3b"</code>, which you haven't pulled. Follow the 404 from Ollama up through your exception ladder
+      to the final HTTP response. Which layer adds which part of the message?</li>
+    <li>Set <code>JINA_API_KEY</code> to something invalid in <code>.env</code> and rebuild the API. <code>/ask</code> still answers, the log shows
+      "falling back to BM25", and the response still says <code>"search_mode": "hybrid"</code>. Put the key back.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 5" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. Explain RAG in two sentences, and why you'd use it instead of just asking the LLM.</summary>
+    <div class="answer">Retrieve the passages most relevant to the question, put them in the prompt, and have the model answer from them.
+      It gives the model facts it never saw in training (papers from this week), lets you show sources, and reduces invented answers,
+      without retraining the model.</div></details>
+
+  <details class="drill"><summary>2. What are tokens and the context window, and why do they matter for top_k?</summary>
+    <div class="answer">Tokens are the word-pieces a model reads and writes; the context window is the maximum it can consider at once.
+      Each extra passage adds hundreds of tokens: more context, but a slower answer on CPU (prompt reading here is about 7 tokens per second)
+      and eventually truncation. <code>top_k=3</code> is a speed/recall trade-off.</div></details>
+
+  <details class="drill"><summary>3. Why does one answer take 2&ndash;4 minutes on this laptop? What would you change in production?</summary>
+    <div class="answer">A CPU runs the 1.2-billion-parameter model slowly: we measured 17.6 s to load it, about 7 tokens/s reading the prompt, and about
+      2.4 tokens/s writing. A RAG prompt is thousands of tokens. In production: a GPU, or a hosted model, a smaller prompt (fewer and shorter chunks), keeping
+      the model loaded, streaming so users see progress, and caching repeat questions (Module 6).</div></details>
+
+  <details class="drill"><summary>4. Walk through what happens when <code>/ask</code> receives a question.</summary>
+    <div class="answer">Pydantic validates the body (422 if invalid). If hybrid, the question is embedded with Jina; on failure it falls back to BM25.
+      <code>search_unified</code> returns the top_k chunks. If none, a fixed "couldn't find" answer, with no LLM call. Otherwise the prompt builder puts the system
+      prompt, labelled chunks, and question into one string; Ollama generates; the client adds source URLs derived from the chunks; the router returns
+      an <code>AskResponse</code>. Any exception becomes a 500.</div></details>
+
+  <details class="drill"><summary>5. How does streaming work end to end, and why send metadata first?</summary>
+    <div class="answer">Ollama streams NDJSON lines; <code>generate_stream</code> yields each parsed line; the endpoint's async generator turns each into an SSE
+      <code>data: {...}</code> event; <code>StreamingResponse</code> sends each immediately; Gradio reads lines with <code>aiter_lines</code> and re-renders on every yield.
+      Metadata goes first because retrieval is fast and generation is slow: the user sees sources while waiting.</div></details>
+
+  <details class="drill"><summary>6. If the LLM fails halfway through a stream, what status code does the client get? Why?</summary>
+    <div class="answer">200. The status line goes out with the first byte, before the failure. The only way to report it is inside the stream, so the endpoint
+      yields <code>{"error": ...}</code> and the client has to check for it. Monitoring that only looks at status codes will miss these failures.</div></details>
+
+  <details class="drill"><summary>7. Tell me about a production bug you debugged in this project. (The Gradio timeout.)</summary>
+    <div class="answer">The chat UI said "make sure the API server is running" while health checks were green. I read the actual exception: an
+      <code>httpx.ReadTimeout</code>. The client had a 60 s timeout, and on CPU Ollama took over a minute reading the prompt before the first token, so no bytes
+      arrived for 60 s. The handler caught every <code>RequestError</code> and printed a misleading message. The fix was <code>httpx.Timeout(600.0, connect=10.0)</code>:
+      long read timeout, short connect timeout. Lessons: httpx timeouts are per operation, not total; and error messages should not guess the cause.</div></details>
+
+  <details class="drill"><summary>8. What's the difference between the read timeout and the connect timeout, and why set them differently?</summary>
+    <div class="answer">Connect: how long to wait to establish the TCP connection. If the server is down, that fails fast. Read: the longest gap between received
+      bytes. A slow but healthy LLM needs a long read timeout; a dead server should be detected in seconds, hence 10 s connect, 600 s read.</div></details>
+
+  <details class="drill"><summary>9. Does the response's <code>citations</code> field tell you which papers the answer used?</summary>
+    <div class="answer">No. It's the list of retrieved chunk IDs, whatever the answer says, and <code>confidence</code> is hard-coded to "medium". The model can cite
+      a paper that was never retrieved and nothing notices. That's exactly how this week's fabricated citations got through, and what Module 8's deterministic
+      citation check fixes.</div></details>
+
+  <details class="drill"><summary>10. The client passes <code>temperature=0.7</code>. What temperature does Ollama actually use?</summary>
+    <div class="answer">Its default. <code>generate</code> spreads extra arguments into the top level of the JSON body, but Ollama reads sampling parameters from
+      <code>"options"</code> and ignores unknown top-level fields. I verified it: with top-level <code>temperature: 0</code> three runs gave three different outputs;
+      with <code>options.temperature: 0</code> they were identical. Fix: send <code>{"options": {"temperature": ..., "top_p": ...}}</code>. For grounded QA I'd use a low
+      temperature.</div></details>
+
+  <details class="drill"><summary>11. Why does <code>search_mode</code> sometimes lie?</summary>
+    <div class="answer">It's computed from <code>request.use_hybrid</code>, not from what ran. If embedding fails, the search falls back to BM25 but the response still says
+      "hybrid". The fix is to return <code>"hybrid" if query_embedding is not None else "bm25"</code>. Small, but it misleads anyone debugging answer quality.</div></details>
+
+  <details class="drill"><summary>12. Why test the endpoints with a small app and <code>dependency_overrides</code> instead of the real app?</summary>
+    <div class="answer">The real app's lifespan connects to Postgres, OpenSearch, and Ollama; tests would be slow, flaky, and need Docker. Overriding the dependency
+      functions swaps in mocks, so each test controls exactly what search and the LLM return, including failures, and runs in milliseconds. The reference's own
+      tests accept 200/500/503 for the same call, so they can't catch a broken endpoint.</div></details>
+
+  <details class="drill"><summary>13. Local LLM versus a hosted API like OpenAI: trade-offs?</summary>
+    <div class="answer">Local: no per-call cost, no data leaves the machine, works offline, full control of the model version; but slow without a GPU, smaller models,
+      and you operate it. Hosted: much faster and more capable, no infrastructure; but cost per token, data leaves your network, rate limits, and model versions
+      can change under you.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m5-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 6</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m5-tests" /><span><code>uv run pytest -q</code> is green, including the 30 tests from this module</span></li>
+    <li><input type="checkbox" data-id="m5-e2e" /><span>A real <code>/api/v1/ask</code> on port 18000 answered, and you noted how long it took (you'll compare it with the cache in Module 6)</span></li>
+    <li><input type="checkbox" data-id="m5-gradio" /><span>The Gradio chat on 17861 streams an answer</span></li>
+    <li><input type="checkbox" data-id="m5-break" /><span>You can explain the 60-second timeout bug, and the ignored temperature, without notes</span></li>
+  </ul>
+  <p>
+    Then send me "Module 5 passed". Module 6 makes repeat questions instant with a Redis cache, and lets you see inside
+    every request with Langfuse tracing.
+  </p>
+  <p><a href="module-06-caching-tracing.html">Next: Module 6 &mdash; Caching and tracing &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>

@@ -1,0 +1,1381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Module 8 — Hallucination hardening</title>
+<link rel="stylesheet" href="assets/guide.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <p><a href="index.html">&larr; Roadmap</a></p>
+
+  <header class="hero">
+    <p class="kicker">Module 8 &middot; 4 days</p>
+    <h1><span class="grad">Hallucination hardening</span>: make the agent refuse rather than invent</h1>
+    <p class="lede">
+      Retrieval does not stop a language model from making things up. This week the reference project caught its own
+      LLM citing papers it never retrieved and authors who never wrote them. In this module you add the same safeguards
+      to your project, one at a time, each with tests that prove it works: a citation checker, per-chunk grading, an
+      answer-verification step, and an evaluation script that measures the result.
+    </p>
+    <div class="pill-row">
+      <span class="pill">Day 1: evidence, principles, citation checks</span>
+      <span class="pill">Day 2: structured tool output, per-chunk grading</span>
+      <span class="pill">Day 3: the verify_answer node and API fields</span>
+      <span class="pill">Day 4: measuring it, and the 1B-model trade-off</span>
+    </div>
+  </header>
+
+  <div class="progress"><strong>Module 8</strong><div class="bar"><span></span></div><span class="count"></span></div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#day1">Day 1: Why RAG still hallucinates, and deterministic citation checks</a></li>
+      <li><a href="#day2">Day 2: Structured tool output and per-chunk grading</a></li>
+      <li><a href="#day3">Day 3: Verifying the answer, and exposing it in the API</a></li>
+      <li><a href="#day4">Day 4: Measuring hallucination, and the price of safety</a></li>
+      <li><a href="#drill">Interview drill</a></li>
+      <li><a href="#done">Before you start Module 9</a></li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <b>How to read the reference for this module</b>
+    Modules 1&ndash;7 taught the original course code (<code>git show HEAD:&lt;path&gt;</code>). Everything on this page is the
+    <b>uncommitted</b> change set in the reference repo. To see exactly what changed in a file, run
+    <code>git -C C:\Users\mrigsing\Downloads\production-agentic-rag-course diff HEAD -- &lt;path&gt;</code>. Ignore the changes in
+    <code>src/services/agents/nodes/retrieve_node.py</code> and the file <code>src/services/on_demand_ingestion.py</code>: they belong
+    to a separate, unfinished "on-demand ingestion" feature that is not part of this course (its unit test currently fails).
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- DAY 1                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day1"><span class="day">Day 1</span>Why RAG still hallucinates, and deterministic citation checks</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    A <b>hallucination</b> is output that sounds confident but is not supported by any source: a made-up fact, number, or
+    reference. RAG (retrieval-augmented generation) was supposed to fix this by putting real passages in the prompt. It helps,
+    but it does not force the model to use only those passages. A small model like llama3.2:1b has read millions of papers
+    during training and will happily "remember" a citation that sounds right. For a research assistant, a fake citation is the
+    worst possible bug: it looks exactly like a real one, and a user who trusts it wastes hours or repeats it.
+  </p>
+
+  <div class="callout story">
+    <b>What actually happened in this project this week</b>
+    <ul>
+      <li>Plain <code>/ask</code> retrieved chunks from only <code>2609.30227</code> and <code>2609.30558</code>, yet the answer cited
+        <code>2304.06476</code> and <code>2305.08659</code>. Neither was in the prompt. After the first fix, a later run caught and removed
+        <code>2204.12176</code>.</li>
+      <li>The first version of the hardened answer prompt said "cite papers like <code>[arXiv:2301.00001]</code>". The 1B model copied the
+        example and cited <code>2301.00001</code>, <code>2301.00002</code>, and so on. The example was removed from the prompt.</li>
+      <li>With fake IDs gone, the model switched to author-style citations: "Park", "Rasmussen", "Yan et al.", none of whom wrote the
+        retrieved papers. The LLM groundedness check (Day 3) <b>passed</b> an answer like that. An LLM judge is itself an LLM, and can be
+        fooled by the same fluency that fooled the user.</li>
+      <li>An answer with hallucinated citations had been cached in Redis before the fix, so the same question kept returning it until the
+        cache was flushed. (Module 6 covered that incident.)</li>
+    </ul>
+  </div>
+
+  <h3>2. Concepts</h3>
+  <h4>Where hallucinations sneak in</h4>
+  <table class="plain">
+    <tr><th>Stage</th><th>Failure seen in this project</th><th>Safeguard you'll build</th></tr>
+    <tr><td>Grading</td><td>All chunks were graded as one blob; one relevant chunk admitted the irrelevant ones too</td><td>Grade each chunk separately (Day 2)</td></tr>
+    <tr><td>Generation</td><td>The model saw every retrieved chunk, relevant or not</td><td>Generate from relevant chunks only (Day 2)</td></tr>
+    <tr><td>Citations</td><td>Fake arXiv IDs, fake author names</td><td><code>strip_unverified_citations</code>, <code>unverified_author_citations</code> (Day 1)</td></tr>
+    <tr><td>Claims</td><td>Unsupported facts in fluent prose</td><td>The <code>verify_answer</code> node with an LLM groundedness check (Day 3)</td></tr>
+  </table>
+
+  <h4>Three design principles</h4>
+  <ol>
+    <li><b>Deterministic checks before LLM judges.</b> A <i>deterministic</i> check is ordinary code that always gives the same answer
+      for the same input, like "is this arXiv ID in the list of retrieved IDs?". It is instant, free, and cannot be talked out of its
+      answer. An <i>LLM judge</i> is a second model call that asks "is this answer supported?". It catches subtler problems but is slow,
+      costs a call, and can be wrong. So run the cheap exact checks first, and use the LLM only for what code cannot check.</li>
+    <li><b>Fail closed.</b> When a safety step itself breaks (the grader throws an exception, the guardrail returns nothing), treat it as
+      "not safe": exclude the chunk, withhold the answer, reject the question. The opposite, <i>fail open</i>, lets everything through when
+      the check breaks, which is exactly when you most need it. The original course code failed open in two places; you'll fix both.</li>
+    <li><b>Measure.</b> "It feels better" is not evidence. You'll write a script that runs a fixed set of questions against both endpoints and
+      counts answers, refusals, and removed citations (Day 4).</li>
+  </ol>
+
+  <h4>Regular expressions, the minimum you need</h4>
+  <p>
+    A <b>regular expression</b> (regex) is a pattern for matching text. Python's <code>re</code> module uses them.
+    <code>\d{4}</code> means exactly four digits; <code>\d{4,5}</code> four or five; <code>(?:...)</code> is a group that is not captured;
+    <code>(...)</code> is a captured group you can read back with <code>match.group(1)</code>; <code>?</code> after something makes it optional;
+    <code>\s*</code> is any amount of whitespace; <code>\b</code> is a word boundary. <code>pattern.sub(func, text)</code> replaces every match with
+    whatever <code>func(match)</code> returns, so returning <code>""</code> deletes the match and returning <code>match.group(0)</code> keeps it.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/citations.py</b> &middot; new file, no LLM involved</p>
+  <table class="walk">
+    <tr><td><pre><code>_CITED_ID = re.compile(r"(?:arXiv:\s*)?(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)</code></pre></td>
+      <td>Matches an arXiv ID with an optional <code>arXiv:</code> prefix and optional version suffix. Group 1 is the bare ID, e.g.
+        <code>2304.06476</code>. Compiling once at import time avoids re-parsing the pattern on every call.</td></tr>
+    <tr><td><pre><code>_AUTHOR_CITATION = re.compile(r"\b([A-Z][A-Za-z'\-]+)\s+et\s+al\b")</code></pre></td>
+      <td>Matches "Surname et al". Group 1 is the capitalised surname, e.g. <code>Rasmussen</code>.</td></tr>
+    <tr><td><pre><code>_EMPTY_BRACKETS = re.compile(r"\s*[\[(][\s,;]*[\])]")
+_DANGLING_SEPARATOR = re.compile(r"([\[(])\s*[,;]\s*|\s*[,;]\s*([\])])")</code></pre></td>
+      <td>Clean-up patterns. Deleting an ID from <code>[arXiv:2304.06476]</code> leaves <code>[]</code>; from
+        <code>[arXiv:2609.30227, arXiv:2304.06476]</code> it leaves a stray <code>, </code>. These remove the leftovers.</td></tr>
+    <tr><td><pre><code>def base_arxiv_id(arxiv_id: str) -&gt; str:
+    return re.sub(r"v\d+$", "", arxiv_id.strip())</code></pre></td>
+      <td>The function you wrote in Module 0. <code>2609.30558v2</code> and <code>2609.30558</code> are the same paper, so compare without versions.</td></tr>
+    <tr><td><pre><code>    allowed = {base_arxiv_id(i) for i in retrieved_ids if i}
+    removed = set()</code></pre></td>
+      <td>A set of the IDs the answer is allowed to cite: the ones actually retrieved. Empty strings are skipped.</td></tr>
+    <tr><td><pre><code>    def _drop_unverified(match: re.Match) -&gt; str:
+        if match.group(1) in allowed:
+            return match.group(0)
+        removed.add(match.group(1))
+        return ""</code></pre></td>
+      <td>Called once per match. Allowed IDs are kept exactly as written; any other ID is recorded and deleted. The inner function can
+        add to <code>removed</code> because it mutates the set rather than rebinding the name.</td></tr>
+    <tr><td><pre><code>    cleaned = _CITED_ID.sub(_drop_unverified, answer)
+    if removed:
+        cleaned = _DANGLING_SEPARATOR.sub(lambda m: m.group(1) or m.group(2), cleaned)
+        cleaned = _EMPTY_BRACKETS.sub("", cleaned)
+    return cleaned, sorted(removed)</code></pre></td>
+      <td>Tidy up only if something was removed, so a clean answer is returned byte-for-byte unchanged. Returns a tuple: the cleaned answer,
+        and the sorted removed IDs (sorted so tests and logs are stable).</td></tr>
+    <tr><td><pre><code>def unverified_author_citations(answer, retrieved_authors) -&gt; List[str]:
+    known = {part.lower() for name in retrieved_authors for part in name.split()}
+    return sorted({m.group(1) for m in _AUTHOR_CITATION.finditer(answer)
+                   if m.group(1).lower() not in known})</code></pre></td>
+      <td>Every word of every retrieved author's name, lower-cased, becomes "known". Any "X et al." whose X is not known is returned. It
+        does <b>not</b> edit the answer: you can't delete a sentence built around a fake author and keep it readable, so the caller decides
+        (Day 3: withhold the whole answer).</td></tr>
+  </table>
+  <div class="callout warn"><b>Know the limits</b>
+    The ID regex also matches things like version numbers <code>2023.12345</code> in prose. The author check is lenient: splitting names into
+    words means a surname matching any author's first name passes. These are deliberate trade-offs for a cheap first filter, and good interview
+    material.</div>
+
+  <p class="file"><b>src/routers/ask.py</b> &middot; the change in <code>/ask</code></p>
+  <pre><code>            chunks, sources, arxiv_ids = await _prepare_chunks_and_sources(
+                request, opensearch_client, embeddings_service, rag_tracer, trace
+            )
+...
+            answer, removed_citations = strip_unverified_citations(answer, arxiv_ids)
+
+            # Prepare response
+            response = AskResponse(
+                ...
+                removed_citations=removed_citations,
+            )</code></pre>
+  <p>
+    <code>_prepare_chunks_and_sources</code> already returned the retrieved IDs as its third value; the original code threw them away with
+    <code>_</code>. Now they are the allow-list. The cleaned answer is what gets cached, so a fake citation can never be stored in Redis again.
+  </p>
+  <p class="file"><b>src/routers/ask.py</b> &middot; the change in <code>/stream</code></p>
+  <pre><code>                        if chunk.get("done", False):
+                            rag_tracer.end_generation(gen_span, full_response, request.model)
+                            full_response, removed_citations = strip_unverified_citations(full_response, arxiv_ids)
+                            final = {"answer": full_response, "removed_citations": removed_citations, "done": True}
+                            yield f"data: {json.dumps(final)}\n\n"
+                            break</code></pre>
+  <p>
+    Streaming has a catch: each piece of text has already been sent to the client as it was generated, fake IDs included. You can only
+    check a citation once the whole answer exists. So the final <code>done</code> message carries the cleaned answer and the list of removed
+    IDs, and the cache stores the cleaned version. A client should replace what it displayed with <code>final["answer"]</code>. Be ready to
+    say this honestly in an interview: streaming and post-hoc verification pull in opposite directions.
+  </p>
+  <p class="file"><b>src/schemas/api/ask.py</b> &middot; new field on <code>AskResponse</code></p>
+  <pre><code>    removed_citations: List[str] = Field(
+        default_factory=list, description="arXiv IDs cited by the LLM that were not retrieved, removed from the answer"
+    )</code></pre>
+  <p>It has a default, so responses cached before this change (which lack the field) still load.</p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: write <code>src/services/citations.py</code></h4>
+  <ul>
+    <li><code>base_arxiv_id(arxiv_id: str) -&gt; str</code>: as in Module 0 (move or copy it here; this is the reference location).</li>
+    <li><code>strip_unverified_citations(answer: str, retrieved_ids: Iterable[str]) -&gt; Tuple[str, List[str]]</code>: remove every arXiv ID
+      (with optional <code>arXiv:</code> prefix and <code>vN</code> suffix) that is not in <code>retrieved_ids</code> (compared version-less), tidy
+      empty brackets and dangling commas, return <code>(cleaned, sorted_removed_ids)</code>. Unchanged text if nothing was removed.</li>
+    <li><code>unverified_author_citations(answer: str, retrieved_authors: Iterable[str]) -&gt; List[str]</code>: sorted surnames from
+      "Surname et al" whose surname (case-insensitive) is not any word of any retrieved author's name.</li>
+  </ul>
+  <details class="hint"><summary>Hint: the tidy-up order</summary>
+    <p>First turn <code>[, x]</code> into <code>[x]</code> and <code>[x, ]</code> into <code>[x]</code> (dangling separators), then delete brackets that
+      contain only spaces, commas, or semicolons, together with the space before them. That is why <code>"Shown in (2304.06476)."</code> becomes
+      <code>"Shown in."</code>.</p></details>
+  <details class="hint"><summary>Hint: testing a function with many cases</summary>
+    <p><code>@pytest.mark.parametrize("answer, expected, removed", [...])</code> turns one function into one test per tuple.</p></details>
+
+  <h4>Step B: type the tests</h4>
+  <p class="file"><b>tests/unit/services/test_citations.py</b></p>
+  <pre><code>import pytest
+from src.services.citations import base_arxiv_id, strip_unverified_citations, unverified_author_citations
+
+RETRIEVED = ["2609.30227", "2609.30558v2"]
+
+
+@pytest.mark.parametrize(
+    "answer, expected, removed",
+    [
+        ("Memory helps [arXiv:2609.30227].", "Memory helps [arXiv:2609.30227].", []),
+        ("Memory helps [arXiv:2609.30558].", "Memory helps [arXiv:2609.30558].", []),
+        ("Networks [arXiv:2304.06476] and models [arXiv:2305.08659], to create",
+         "Networks and models, to create", ["2304.06476", "2305.08659"]),
+        ("Shown in (2304.06476).", "Shown in.", ["2304.06476"]),
+        ("See [arXiv:2609.30227, arXiv:2304.06476].", "See [arXiv:2609.30227].", ["2304.06476"]),
+        ("See [arXiv:2304.06476, arXiv:2609.30227].", "See [arXiv:2609.30227].", ["2304.06476"]),
+        ("See [arXiv:2304.06476v3].", "See.", ["2304.06476"]),
+        ("No citations here.", "No citations here.", []),
+    ],
+)
+def test_strip_unverified_citations(answer, expected, removed):
+    assert strip_unverified_citations(answer, RETRIEVED) == (expected, removed)
+
+
+def test_nothing_retrieved_removes_every_citation():
+    assert strip_unverified_citations("Claim [arXiv:2609.30227].", []) == ("Claim.", ["2609.30227"])
+
+
+def test_unverified_author_citations():
+    authors = ["Debajyoti Mazumder", "Mamta", "Abhirama Subramanyam Penamakuri"]
+    answer = "Mazumder et al. (2026) show X, while Rasmussen et al. (2025) and Wang et al. propose Y."
+
+    assert unverified_author_citations(answer, authors) == ["Rasmussen", "Wang"]
+    assert unverified_author_citations("Mazumder et al. show X.", authors) == []
+    assert unverified_author_citations("No author citations.", []) == []
+
+
+def test_base_arxiv_id_strips_version():
+    assert base_arxiv_id("2609.30558v2") == "2609.30558"
+    assert base_arxiv_id(" 2609.30558 ") == "2609.30558"</code></pre>
+  <p>The third test case is the real incident: the two IDs the model invented are exactly the ones from the plain <code>/ask</code> answer.</p>
+
+  <h4>Step C: wire it into <code>/ask</code> and <code>/stream</code></h4>
+  <ol>
+    <li>Add <code>removed_citations</code> to <code>AskResponse</code> exactly as quoted above.</li>
+    <li>In <code>/ask</code>: keep the third return value of <code>_prepare_chunks_and_sources</code> as <code>arxiv_ids</code>, call
+      <code>strip_unverified_citations</code> after generation, and pass <code>removed_citations</code> into the response (which is then cached).</li>
+    <li>In <code>/stream</code>: initialise <code>removed_citations: List[str] = []</code> before the loop, clean <code>full_response</code> when the
+      <code>done</code> chunk arrives, send the final message with <code>answer</code>, <code>removed_citations</code>, <code>done</code>, and include
+      <code>removed_citations</code> in the cached <code>AskResponse</code>.</li>
+  </ol>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/test_citations.py -q</code></pre>
+  <p>You should see <code>11 passed</code> (8 parametrized cases + 3 tests). Then rebuild your API and flush the stale cache, because answers cached
+    before this change were never checked:</p>
+  <pre><code>docker compose up -d --build api
+docker exec curator-redis redis-cli FLUSHALL
+'{"query": "How do LLM agents manage long-term memory?", "top_k": 3}' | Out-File -Encoding ascii body.json
+curl.exe -s -X POST http://localhost:18000/api/v1/ask -H "Content-Type: application/json" --data-binary "@body.json"</code></pre>
+  <p>
+    Expect a JSON response (after 2&ndash;4 minutes on CPU) that now includes a <code>"removed_citations"</code> list. It is often
+    <code>[]</code>; when the model invents an ID you'll see it listed there and missing from the answer. Every ID left in the answer must appear in
+    <code>sources</code>. The API rebuild can take a long time if Docker has evicted its cache.
+  </p>
+  <pre><code>git add -A
+git commit -m "Module 8 day 1: strip unverified citations in /ask and /stream"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m8-day1" /><span>Day 1 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>In <code>strip_unverified_citations</code>, compare <code>match.group(1)</code> against the raw <code>retrieved_ids</code> instead of the
+      version-less set. The <code>2609.30558</code> case fails: the retrieved ID was <code>2609.30558v2</code>. Versions are a real-world detail that
+      makes naive equality wrong.</li>
+    <li>Delete the <code>_EMPTY_BRACKETS</code> line. The <code>"Shown in (2304.06476)."</code> case now returns <code>"Shown in ()."</code>. The
+      safety is still there, but users see junk, which teaches that output clean-up is part of the feature.</li>
+    <li>Remove <code>re.IGNORECASE</code> and call <code>strip_unverified_citations("See [ARXIV:2304.06476].", RETRIEVED)</code> in
+      <code>uv run python</code>. The ID is still removed, because the prefix group is optional and the bare ID matches on its own, but the
+      result is <code>"See [ARXIV:]."</code>: the upper-case prefix no longer counts as part of the match, so it is left behind. Predict the output
+      before you run it; reading regex behaviour precisely is the skill.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 2                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day2"><span class="day">Day 2</span>Structured tool output and per-chunk grading</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    In Module 7 the retriever tool returned a list of documents, LangChain turned it into one string inside a <code>ToolMessage</code>,
+    and the grading node read that string back. Two problems followed. First, once documents are flattened to text, the code can no longer
+    ask "which paper did this chunk come from?", so it could not build a sources list (the agent returned empty <code>sources</code>). Second,
+    the grader judged all chunks <i>together</i> with a single yes/no: one relevant chunk admitted the irrelevant ones, and then all of them went
+    to the answer prompt. If grading crashed, the original code fell back to "relevant if the text is longer than 50 characters", which fails open.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Content and artifact</h4>
+  <p>
+    A LangChain tool created with <code>@tool(response_format="content_and_artifact")</code> must return a tuple
+    <code>(content, artifact)</code>. The <b>content</b> is the text the LLM sees. The <b>artifact</b> is any Python object for your own code,
+    and the LLM never sees it. When <code>ToolNode</code> runs the tool, it puts both into the <code>ToolMessage</code>: <code>msg.content</code>
+    and <code>msg.artifact</code>. So the LLM gets readable excerpts, and the grading node gets real <code>Document</code> objects with metadata.
+  </p>
+  <p>
+    One subtlety: the artifact only appears when the tool is invoked with a full <b>tool call</b> (a dict with <code>name</code>, <code>args</code>,
+    <code>id</code>, <code>type: "tool_call"</code>), which is what <code>ToolNode</code> does. Calling <code>tool.ainvoke({"query": ...})</code> directly
+    returns only the content string. The tests therefore invoke the tool the way <code>ToolNode</code> does.
+  </p>
+  <h4>Concurrent grading with <code>asyncio.gather</code></h4>
+  <p>
+    <code>await asyncio.gather(a(), b(), c())</code> starts all three coroutines and waits for all of them, returning results in the same
+    order as the arguments (not completion order). That ordering lets you <code>zip</code> documents with their grades. On a single-CPU Ollama the
+    calls may still be processed one after another, so this saves waiting time, not compute.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/tools.py</b> &middot; the changed lines</p>
+  <pre><code>from .nodes.utils import format_documents
+...
+    @tool(response_format="content_and_artifact")
+    async def retrieve_papers(query: str) -&gt; tuple[str, list[Document]]:
+...
+        return format_documents(documents), documents</code></pre>
+  <p>The rest of the tool (embed the query, <code>search_unified</code>, convert hits to <code>Document</code>s with metadata) is unchanged from Module 7.</p>
+
+  <p class="file"><b>src/services/agents/nodes/utils.py</b> &middot; three new helpers</p>
+  <table class="walk">
+    <tr><td><pre><code>def get_latest_documents(messages: List) -&gt; List[Document]:
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            return list(msg.artifact or [])
+    return []</code></pre></td>
+      <td>Walks backwards to the newest tool result (after a query rewrite there can be two) and returns its documents. <code>or []</code> handles a
+        tool message with no artifact.</td></tr>
+    <tr><td><pre><code>def format_documents(documents: List[Document]) -&gt; str:
+    return "\n\n".join(
+        f"[arXiv:{doc.metadata.get('arxiv_id', 'unknown')}] {doc.metadata.get('title', '')}\n{doc.page_content}"
+        for doc in documents
+    )</code></pre></td>
+      <td>Every excerpt is labelled with its citable ID in exactly the format the citation checker understands. The answer prompt now says "cite
+        only with the exact bracketed arXiv ID shown before each excerpt", so the model has a real ID to copy instead of an example.</td></tr>
+    <tr><td><pre><code>def to_source_items(documents: List[Document]) -&gt; List[SourceItem]:
+    sources: Dict[str, SourceItem] = {}
+    for doc in documents:
+        arxiv_id = doc.metadata.get("arxiv_id", "")
+        if not arxiv_id or arxiv_id in sources:
+            continue</code></pre></td>
+      <td>One source per paper: three chunks from the same paper give one entry. A dict keeps first-seen order.</td></tr>
+    <tr><td><pre><code>        authors = doc.metadata.get("authors", [])
+        if isinstance(authors, str):
+            authors = [a.strip() for a in authors.split(",") if a.strip()]</code></pre></td>
+      <td>OpenSearch stores authors as one comma-separated string. The author check needs a list of names.</td></tr>
+    <tr><td><pre><code>        sources[arxiv_id] = SourceItem(
+            arxiv_id=arxiv_id,
+            title=doc.metadata.get("title", ""),
+            authors=authors,
+            url=doc.metadata.get("source", f"https://arxiv.org/pdf/{arxiv_id}.pdf"),
+            relevance_score=doc.metadata.get("score", 0.0),
+        )
+    return list(sources.values())</code></pre></td>
+      <td>The URL comes from the tool's <code>source</code> metadata. These URLs become the API's <code>sources</code> on Day 3.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/nodes/grade_documents_node.py</b> &middot; rewritten</p>
+  <table class="walk">
+    <tr><td><pre><code>async def _grade_document(grader, question: str, document: Document) -&gt; GradingResult:
+    document_id = document.metadata.get("arxiv_id", "unknown")
+    try:
+        grade: GradeDocuments = await grader.ainvoke(
+            GRADE_DOCUMENTS_PROMPT.format(context=document.page_content, question=question)
+        )</code></pre></td>
+      <td>Grades <b>one</b> chunk. The prompt's <code>{context}</code> is now a single excerpt.</td></tr>
+    <tr><td><pre><code>        is_relevant = grade.binary_score == "yes"
+        return GradingResult(document_id=document_id, is_relevant=is_relevant,
+                             score=1.0 if is_relevant else 0.0, reasoning=grade.reasoning)</code></pre></td>
+      <td>Records a verdict per paper ID instead of the old single <code>"retrieved_docs"</code> record.</td></tr>
+    <tr><td><pre><code>    except Exception as e:
+        logger.warning(f"Grading failed for {document_id}, excluding it: {e}")
+        return GradingResult(document_id=document_id, is_relevant=False, reasoning=f"Grading failed: {e}")</code></pre></td>
+      <td><b>Fail closed.</b> A crash, a timeout, or the model replying in the wrong shape all exclude the chunk. Compare the deleted
+        "longer than 50 characters" fallback.</td></tr>
+    <tr><td><pre><code>    documents = get_latest_documents(state["messages"])
+    if not documents:
+        return {"routing_decision": "rewrite_query", "grading_results": [], "relevant_documents": []}</code></pre></td>
+      <td>Nothing retrieved: try a rewritten query. No LLM call.</td></tr>
+    <tr><td><pre><code>    grader = runtime.context.ollama_client.get_langchain_model(
+        model=runtime.context.model_name,
+        temperature=0.0,
+    ).with_structured_output(GradeDocuments)</code></pre></td>
+      <td>Built once, reused for every chunk. Temperature 0 makes the verdict as repeatable as the model allows.</td></tr>
+    <tr><td><pre><code>    results = await asyncio.gather(*(_grade_document(grader, question, doc) for doc in documents))
+    relevant = [doc for doc, result in zip(documents, results) if result.is_relevant]
+    route = "generate_answer" if relevant else "rewrite_query"</code></pre></td>
+      <td>All chunks graded concurrently; the <code>*</code> unpacks the generator into separate arguments. Because <code>_grade_document</code> never
+        raises, one failure can't cancel the others.</td></tr>
+    <tr><td><pre><code>    return {
+        "routing_decision": route,
+        "grading_results": list(results),
+        "relevant_documents": relevant,
+        "relevant_sources": to_source_items(relevant),
+    }</code></pre></td>
+      <td>Two new state keys carry the survivors forward. Note the Langfuse span code from the original was removed along with the old logic.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/nodes/generate_answer_node.py</b> &middot; the changed part</p>
+  <pre><code>NO_CONTEXT_ANSWER = (
+    "I couldn't find passages in the indexed papers that answer this question, "
+    "so I won't guess. Try rephrasing it with more specific technical terms."
+)
+...
+    documents = state.get("relevant_documents", [])
+    sources_count = len(state.get("relevant_sources", []))
+
+    if not documents:
+        logger.warning("No relevant documents for answer generation, refusing")
+        return {"messages": [AIMessage(content=NO_CONTEXT_ANSWER)]}
+
+    context = format_documents(documents)</code></pre>
+  <p>
+    The original read the whole tool-message string and, if empty, generated anyway with the context "No relevant documents found.", which
+    invites the model to answer from memory. Now no relevant documents means a fixed refusal and <b>no LLM call at all</b>.
+  </p>
+
+  <p class="file"><b>src/services/agents/prompts.py</b> &middot; stricter grading</p>
+  <pre><code>GRADE_DOCUMENTS_PROMPT = """You are a grader assessing whether one retrieved document excerpt helps answer a user question.
+
+Document Excerpt:
+{context}
+
+User Question: {question}
+
+Grade 'yes' only if the excerpt contains information that helps answer the question.
+Sharing a keyword or a broad topic with the question is not enough.
+Give a binary score 'yes' or 'no', and brief reasoning for your decision.
+
+Respond in JSON format with 'binary_score' (yes/no) and 'reasoning' fields."""</code></pre>
+  <p>The original said "If the documents contain keywords or semantic meaning related to the question, grade them as relevant", which is almost always true for search results.</p>
+
+  <h3>4. Build</h3>
+  <h4>Step A: the conftest with <code>llm_returns</code></h4>
+  <p>
+    Node tests need a fake LLM. The reference solved this with a fixture called <code>llm_returns</code>: you pass it the responses the "LLM"
+    should give, in order, and it returns the <code>AsyncMock</code> so you can inspect calls. An exception in the list is raised instead of returned
+    (that's how <code>AsyncMock(side_effect=[...])</code> works). Replace <code>tests/unit/services/agents/conftest.py</code> with this version
+    (it keeps the fixture names from Module 7 and changes <code>sample_tool_message</code> to carry an artifact):
+  </p>
+  <p class="file"><b>tests/unit/services/agents/conftest.py</b></p>
+  <pre><code>from unittest.mock import AsyncMock, Mock
+
+import pytest
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from src.services.agents.context import Context
+from src.services.agents.nodes.utils import format_documents
+
+SEARCH_HITS = [
+    {
+        "chunk_text": "Transformers are neural network architectures based on self-attention mechanisms.",
+        "arxiv_id": "1706.03762",
+        "title": "Attention Is All You Need",
+        "authors": "Ashish Vaswani, Noam Shazeer",
+        "score": 0.95,
+        "section_name": "Introduction",
+    },
+    {
+        "chunk_text": "BERT is pre-trained with a masked language modelling objective.",
+        "arxiv_id": "1810.04805",
+        "title": "BERT: Pre-training of Deep Bidirectional Transformers",
+        "authors": "Jacob Devlin",
+        "score": 0.90,
+        "section_name": "Method",
+    },
+]
+
+
+@pytest.fixture
+def mock_opensearch_client():
+    client = Mock()
+    client.search_unified = Mock(return_value={"hits": SEARCH_HITS, "total": len(SEARCH_HITS)})
+    return client
+
+
+@pytest.fixture
+def mock_jina_embeddings_client():
+    client = Mock()
+    client.embed_query = AsyncMock(return_value=[0.1] * 1024)
+    return client
+
+
+@pytest.fixture
+def mock_ollama_client():
+    return Mock()
+
+
+@pytest.fixture
+def llm_returns(mock_ollama_client):
+    """Configure the mocked LLM's successive responses; an Exception in the list is raised instead."""
+
+    def _configure(*responses):
+        llm = mock_ollama_client.get_langchain_model.return_value
+        invoke = AsyncMock(side_effect=list(responses))
+        llm.ainvoke = invoke
+        llm.with_structured_output.return_value.ainvoke = invoke
+        return invoke
+
+    return _configure
+
+
+@pytest.fixture
+def test_context(mock_ollama_client, mock_opensearch_client, mock_jina_embeddings_client):
+    return Context(
+        ollama_client=mock_ollama_client,
+        opensearch_client=mock_opensearch_client,
+        embeddings_client=mock_jina_embeddings_client,
+        langfuse_tracer=None,
+    )
+
+
+@pytest.fixture
+def sample_documents():
+    return [
+        Document(
+            page_content=hit["chunk_text"],
+            metadata={
+                "arxiv_id": hit["arxiv_id"],
+                "title": hit["title"],
+                "authors": hit["authors"],
+                "score": hit["score"],
+                "source": f"https://arxiv.org/pdf/{hit['arxiv_id']}.pdf",
+            },
+        )
+        for hit in SEARCH_HITS
+    ]
+
+
+@pytest.fixture
+def sample_human_message():
+    return HumanMessage(content="What is machine learning?")
+
+
+@pytest.fixture
+def sample_ai_message():
+    return AIMessage(content="Machine learning is a field of AI that learns patterns from data.")
+
+
+@pytest.fixture
+def sample_tool_message(sample_documents):
+    return ToolMessage(
+        content=format_documents(sample_documents),
+        artifact=sample_documents,
+        tool_call_id="retrieve_1",
+        name="retrieve_papers",
+    )</code></pre>
+  <p>
+    Why it works: <code>Mock</code> creates attributes on demand, so <code>get_langchain_model.return_value</code> is always the same child mock
+    no matter what arguments the node passes. The fixture wires the <b>same</b> <code>invoke</code> to both <code>llm.ainvoke</code> (plain generation)
+    and <code>llm.with_structured_output(...).ainvoke</code> (grading, verification), so one list of responses covers every LLM call a node makes.
+  </p>
+  <div class="callout story"><b>22 tests that never ran</b>
+    Before this conftest existed, the reference's agent tests asked for fixtures like <code>test_context</code> that nobody defined. pytest reports
+    that as an error per test, and 22 tests had silently never run. A test suite that errors on setup protects nothing. Module 9 comes back to this.</div>
+
+  <h4>Step B: implement</h4>
+  <ol>
+    <li><code>src/services/agents/nodes/utils.py</code>: add <code>get_latest_documents</code>, <code>format_documents</code>, <code>to_source_items</code> as quoted.</li>
+    <li><code>src/services/agents/tools.py</code>: <code>@tool(response_format="content_and_artifact")</code>, return <code>(format_documents(documents), documents)</code>.
+      Import <code>format_documents</code> from <code>.nodes.utils</code>.</li>
+    <li><code>src/services/agents/state.py</code>: add <code>relevant_documents: List[Document]</code> (you'll add two more fields on Day 3).</li>
+    <li><code>grade_documents_node.py</code>: <code>_grade_document</code> plus the new <code>ainvoke_grade_documents_step</code>, returning the four keys shown.</li>
+    <li><code>generate_answer_node.py</code>: <code>NO_CONTEXT_ANSWER</code> exactly as quoted (the eval script on Day 4 detects it by the phrase
+      "so I won't guess"), generate from <code>format_documents(relevant_documents)</code> only.</li>
+    <li><code>prompts.py</code>: the new <code>GRADE_DOCUMENTS_PROMPT</code>, and in <code>GENERATE_ANSWER_PROMPT</code> replace the "Cite specific papers" line with
+      <code>- Cite papers only with the exact bracketed arXiv ID shown before each excerpt; do not cite papers by author names</code>. Do not add an example ID.</li>
+  </ol>
+  <details class="hint"><summary>Hint: <code>Document</code> in a TypedDict</summary>
+    <p><code>from langchain_core.documents import Document</code> at the top of <code>state.py</code>. The TypedDict doesn't validate anything; the annotation is for readers.</p></details>
+
+  <h4>Step C: type the tests</h4>
+  <p>Replace the tests in <code>tests/unit/services/agents/test_tools.py</code> with these (the old ones expected a plain list):</p>
+  <p class="file"><b>tests/unit/services/agents/test_tools.py</b></p>
+  <pre><code>from unittest.mock import Mock
+
+import pytest
+from langchain_core.documents import Document
+from langchain_core.messages import ToolMessage
+from src.services.agents.tools import create_retriever_tool
+
+
+async def _call(tool, query: str) -&gt; ToolMessage:
+    """Invoke the tool the way ToolNode does, so the document artifact is returned."""
+    return await tool.ainvoke({"name": tool.name, "args": {"query": query}, "id": "call_1", "type": "tool_call"})
+
+
+@pytest.mark.asyncio
+async def test_create_retriever_tool_basic(mock_opensearch_client, mock_jina_embeddings_client):
+    tool = create_retriever_tool(
+        opensearch_client=mock_opensearch_client,
+        embeddings_client=mock_jina_embeddings_client,
+        top_k=2,
+        use_hybrid=True,
+    )
+
+    assert tool.name == "retrieve_papers"
+    message = await _call(tool, "machine learning")
+
+    documents = message.artifact
+    assert len(documents) == 2
+    assert all(isinstance(doc, Document) for doc in documents)
+    assert documents[0].metadata["arxiv_id"] == "1706.03762"
+
+    # The LLM-facing content labels every excerpt with its citable arXiv ID
+    assert "[arXiv:1706.03762] Attention Is All You Need" in message.content
+    assert "[arXiv:1810.04805]" in message.content
+    mock_jina_embeddings_client.embed_query.assert_called_once_with("machine learning")
+
+
+@pytest.mark.asyncio
+async def test_retriever_tool_empty_results(mock_opensearch_client, mock_jina_embeddings_client):
+    mock_opensearch_client.search_unified = Mock(return_value={"hits": []})
+    tool = create_retriever_tool(opensearch_client=mock_opensearch_client, embeddings_client=mock_jina_embeddings_client)
+
+    message = await _call(tool, "nonexistent topic")
+
+    assert message.artifact == []
+    assert message.content == ""</code></pre>
+
+  <p>Now add to <code>tests/unit/services/agents/test_nodes.py</code>. Add these imports at the top (merge with the ones you have), then replace your
+    Module 7 <code>TestGradeDocumentsNode</code> and <code>TestGenerateAnswerNode</code> classes with these, and append the two utils tests to your
+    <code>TestNodeUtils</code> class:</p>
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> (imports)</p>
+  <pre><code>from unittest.mock import Mock
+
+import pytest
+from langgraph.runtime import Runtime
+from src.services.agents.models import GradeDocuments
+from src.services.agents.nodes import ainvoke_generate_answer_step, ainvoke_grade_documents_step
+from src.services.agents.nodes.generate_answer_node import NO_CONTEXT_ANSWER
+from src.services.agents.nodes.utils import get_latest_documents, to_source_items
+from src.services.agents.state import AgentState</code></pre>
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> (grading and generation)</p>
+  <pre><code>class TestGradeDocumentsNode:
+    """Tests for per-document grading node."""
+
+    @staticmethod
+    def _state(*messages) -&gt; AgentState:
+        return {"messages": list(messages), "retrieval_attempts": 1}
+
+    @staticmethod
+    def _runtime(test_context):
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+        return runtime
+
+    @pytest.mark.asyncio
+    async def test_keeps_only_relevant_documents(
+        self, test_context, llm_returns, sample_human_message, sample_tool_message, sample_documents
+    ):
+        llm_returns(
+            GradeDocuments(binary_score="yes", reasoning="About transformers"),
+            GradeDocuments(binary_score="no", reasoning="About BERT pre-training"),
+        )
+
+        result = await ainvoke_grade_documents_step(
+            self._state(sample_human_message, sample_tool_message), self._runtime(test_context)
+        )
+
+        assert result["routing_decision"] == "generate_answer"
+        assert [r.is_relevant for r in result["grading_results"]] == [True, False]
+        assert result["relevant_documents"] == [sample_documents[0]]
+        assert [s.arxiv_id for s in result["relevant_sources"]] == ["1706.03762"]
+
+    @pytest.mark.asyncio
+    async def test_no_relevant_documents_rewrites_query(
+        self, test_context, llm_returns, sample_human_message, sample_tool_message
+    ):
+        llm_returns(GradeDocuments(binary_score="no"), GradeDocuments(binary_score="no"))
+
+        result = await ainvoke_grade_documents_step(
+            self._state(sample_human_message, sample_tool_message), self._runtime(test_context)
+        )
+
+        assert result["routing_decision"] == "rewrite_query"
+        assert result["relevant_documents"] == []
+
+    @pytest.mark.asyncio
+    async def test_grading_failure_excludes_document(
+        self, test_context, llm_returns, sample_human_message, sample_tool_message, sample_documents
+    ):
+        """A document whose grading errors out is excluded, not admitted."""
+        llm_returns(RuntimeError("model unavailable"), GradeDocuments(binary_score="yes"))
+
+        result = await ainvoke_grade_documents_step(
+            self._state(sample_human_message, sample_tool_message), self._runtime(test_context)
+        )
+
+        assert result["relevant_documents"] == [sample_documents[1]]
+        assert "Grading failed" in result["grading_results"][0].reasoning
+
+    @pytest.mark.asyncio
+    async def test_no_documents_rewrites_query(self, test_context, sample_human_message):
+        result = await ainvoke_grade_documents_step(self._state(sample_human_message), self._runtime(test_context))
+
+        assert result["routing_decision"] == "rewrite_query"
+
+
+class TestGenerateAnswerNode:
+    """Tests for answer generation node."""
+
+    @pytest.mark.asyncio
+    async def test_generate_answer_uses_only_relevant_documents(
+        self, test_context, llm_returns, sample_human_message, sample_tool_message, sample_documents
+    ):
+        invoke = llm_returns(Mock(content="Transformers use self-attention [arXiv:1706.03762]."))
+        state: AgentState = {
+            "messages": [sample_human_message, sample_tool_message],
+            "retrieval_attempts": 1,
+            "relevant_documents": [sample_documents[0]],
+        }
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+
+        result = await ainvoke_generate_answer_step(state, runtime)
+
+        prompt = invoke.call_args.args[0]
+        assert "[arXiv:1706.03762]" in prompt
+        assert "1810.04805" not in prompt
+        assert result["messages"][0].content == "Transformers use self-attention [arXiv:1706.03762]."
+
+    @pytest.mark.asyncio
+    async def test_generate_answer_refuses_without_relevant_documents(
+        self, test_context, llm_returns, sample_human_message
+    ):
+        invoke = llm_returns()
+        state: AgentState = {"messages": [sample_human_message], "retrieval_attempts": 1, "relevant_documents": []}
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+
+        result = await ainvoke_generate_answer_step(state, runtime)
+
+        assert result["messages"][0].content == NO_CONTEXT_ANSWER
+        invoke.assert_not_called()</code></pre>
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> (append inside <code>TestNodeUtils</code>)</p>
+  <pre><code>    def test_get_latest_documents(self, sample_human_message, sample_tool_message, sample_documents):
+        assert get_latest_documents([sample_human_message, sample_tool_message]) == sample_documents
+        assert get_latest_documents([sample_human_message]) == []
+
+    def test_to_source_items_dedupes_papers_and_splits_authors(self, sample_documents):
+        sources = to_source_items([sample_documents[0], sample_documents[0], sample_documents[1]])
+
+        assert [s.arxiv_id for s in sources] == ["1706.03762", "1810.04805"]
+        assert sources[0].authors == ["Ashish Vaswani", "Noam Shazeer"]</code></pre>
+  <p>
+    Read <code>test_grading_failure_excludes_document</code> carefully: the first "LLM call" raises, the second says yes. Because <code>gather</code>
+    keeps argument order, chunk 0 (the transformers paper) is the one excluded, and only chunk 1 survives. The generation test's
+    <code>invoke.call_args.args[0]</code> is the exact prompt string the node sent, so you can assert what the model was and wasn't shown.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents/test_tools.py -q
+uv run pytest tests/unit/services/agents/test_nodes.py -q -k "GradeDocuments or GenerateAnswer or latest_documents or source_items"</code></pre>
+  <p>
+    Expect <code>2 passed</code> for the tools file and <code>8 passed</code> for the selected node tests. Then run the whole agent folder,
+    <code>uv run pytest tests/unit/services/agents -q</code>: everything should pass. If a Module 7 test fails because it expected the old
+    tool output or the old single grading result, update it to the new behaviour; that failure is the test doing its job.
+  </p>
+  <pre><code>git add -A
+git commit -m "Module 8 day 2: tool artifacts, per-chunk grading, generate from relevant chunks"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m8-day2" /><span>Day 2 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Change the decorator back to plain <code>@tool</code> but keep returning the tuple. <code>message.artifact</code> is now <code>None</code> and the
+      content is the tuple printed as text. The node sees no documents and always rewrites the query. The response format is a contract.</li>
+    <li>In <code>_grade_document</code>, change the <code>except</code> branch to <code>is_relevant=True</code>. <code>test_grading_failure_excludes_document</code>
+      fails. That one line is the difference between failing closed and failing open.</li>
+    <li>Remove the <code>try/except</code> entirely. Now the <code>RuntimeError</code> escapes <code>gather</code> and the whole node crashes: one bad chunk
+      takes down the request. (Look up <code>return_exceptions=True</code> as an alternative, and why the reference chose per-task handling instead.)</li>
+    <li>In the conftest, give <code>llm_returns</code> only one response for a two-chunk grading test. The second call raises
+      <code>StopAsyncIteration</code>, which the node catches and treats as a failed grade. Mock responses must match the number of LLM calls.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 3                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day3"><span class="day">Day 3</span>Verifying the answer, and exposing it in the API</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Grading decides what goes <i>into</i> the prompt. Nothing so far checks what comes <i>out</i>. Today you add a final graph node,
+    <code>verify_answer</code>, that inspects the draft answer before the user sees it, and you fix the gaps in the API response that Module 7
+    pointed out: empty <code>sources</code>, <code>chunks_used</code> hard-coded to <code>top_k</code>, a <code>model</code> field that was ignored, and a
+    guardrail that let questions through when it had no result.
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>Groundedness</h4>
+  <p>
+    An answer is <b>grounded</b> if every claim in it is stated in, or directly follows from, the source documents. Checking groundedness with a
+    second LLM call is the "LLM-as-a-judge" pattern. It is useful but not trustworthy on its own: this week the judge passed an answer that
+    cited invented authors. That is why the deterministic author check runs <b>first</b> and, when it fires, the judge is not even asked.
+  </p>
+  <h4>Refuse with something useful</h4>
+  <p>
+    When verification fails, the user gets a fixed refusal ("I won't guess") <b>plus the list of relevant papers with URLs</b>. The retrieval
+    was still valuable; only the generated prose is untrusted. This is a common production pattern: degrade to what you can vouch for.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>src/services/agents/models.py</b> &middot; new structured-output model</p>
+  <pre><code>class GroundednessCheck(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="Answer supported by the documents: 'yes' or 'no'")
+    reasoning: str = Field(default="", description="Explanation, naming any unsupported claim")</code></pre>
+  <p class="file"><b>src/services/agents/prompts.py</b> &middot; the judge's instructions</p>
+  <pre><code>GROUNDEDNESS_PROMPT = """You are a fact checker verifying whether an answer is supported by source documents.
+
+Source Documents:
+{context}
+
+Answer to Check:
+{answer}
+
+Grade 'yes' if the answer's claims are stated in, or directly follow from, the source documents.
+Grade 'no' if the answer includes facts, numbers, methods, or papers that do not appear in them.
+Give a binary score 'yes' or 'no', and brief reasoning that names any unsupported claim.
+
+Respond in JSON format with 'binary_score' (yes/no) and 'reasoning' fields."""</code></pre>
+
+  <p class="file"><b>src/services/agents/nodes/verify_answer_node.py</b> &middot; new node</p>
+  <table class="walk">
+    <tr><td><pre><code>UNVERIFIED_ANSWER = (
+    "I found papers related to your question, but I couldn't confirm an answer "
+    "that is fully supported by them, so I won't guess. These papers may help:"
+)</code></pre></td>
+      <td>A fixed refusal. Fixed text is easy to test and easy for the eval script to detect.</td></tr>
+    <tr><td><pre><code>    documents = state.get("relevant_documents", [])
+    if not documents:
+        return {"answer_grounded": None, "removed_citations": []}</code></pre></td>
+      <td>No relevant documents means <code>generate_answer</code> already returned <code>NO_CONTEXT_ANSWER</code> without an LLM. Leave that message alone
+        (no <code>messages</code> key) and report "never checked" as <code>None</code>, which is different from <code>False</code>.</td></tr>
+    <tr><td><pre><code>    draft = state["messages"][-1].content
+    answer, removed = strip_unverified_citations(draft, [doc.metadata.get("arxiv_id", "") for doc in documents])</code></pre></td>
+      <td>Deterministic check 1: allowed IDs are only those of the <b>relevant</b> chunks, not everything retrieved.</td></tr>
+    <tr><td><pre><code>    authors = [author for source in state.get("relevant_sources", []) for author in source.authors]
+    unknown_authors = unverified_author_citations(answer, authors)
+
+    if unknown_authors:
+        grounded = False</code></pre></td>
+      <td>Deterministic check 2: any "Surname et al." that isn't an author of a relevant paper withholds the answer outright, with no LLM call.
+        This is the check that caught "Park", "Rasmussen", "Yan et al."</td></tr>
+    <tr><td><pre><code>    else:
+        try:
+            checker = runtime.context.ollama_client.get_langchain_model(
+                model=runtime.context.model_name,
+                temperature=0.0,
+            ).with_structured_output(GroundednessCheck)
+            check: GroundednessCheck = await checker.ainvoke(
+                GROUNDEDNESS_PROMPT.format(context=format_documents(documents), answer=answer)
+            )
+            grounded = check.binary_score == "yes"</code></pre></td>
+      <td>Only if both cheap checks pass does the LLM judge run, on the already-cleaned answer.</td></tr>
+    <tr><td><pre><code>        except Exception as e:
+            logger.warning(f"Groundedness check failed, withholding answer: {e}")
+            grounded = False</code></pre></td>
+      <td>Fail closed again: if the judge can't answer, the draft is not shown.</td></tr>
+    <tr><td><pre><code>    if not grounded:
+        sources = "\n".join(f"- {s.title} ({s.url})" for s in state.get("relevant_sources", []))
+        answer = f"{UNVERIFIED_ANSWER}\n{sources}"
+
+    return {
+        "messages": [AIMessage(content=answer)],
+        "answer_grounded": grounded,
+        "removed_citations": removed,
+    }</code></pre></td>
+      <td>Appending a new <code>AIMessage</code> (via the <code>add_messages</code> reducer) makes it the last message, which is what
+        <code>_extract_answer</code> returns. The unverified draft stays in the message history for debugging, but the user never sees it.</td></tr>
+  </table>
+
+  <p class="file"><b>src/services/agents/agentic_rag.py</b> &middot; graph wiring</p>
+  <pre><code>        workflow.add_node("verify_answer", ainvoke_verify_answer_step)
+...
+        # After answer generation → verify against sources → done
+        workflow.add_edge("generate_answer", "verify_answer")
+        workflow.add_edge("verify_answer", END)</code></pre>
+  <p>Also export <code>ainvoke_verify_answer_step</code> from <code>nodes/__init__.py</code>. The initial state in <code>_run_workflow</code> gains
+    <code>"relevant_documents": []</code>, <code>"removed_citations": []</code>, <code>"answer_grounded": None</code>.</p>
+
+  <p class="file"><b>src/services/agents/nodes/guardrail_node.py</b> &middot; fail closed</p>
+  <pre><code>    guardrail_result = state.get("guardrail_result")
+    if not guardrail_result:
+        logger.warning("No guardrail result found, rejecting as out of scope")
+        return "out_of_scope"</code></pre>
+  <p>The original returned <code>"continue"</code> here: a broken guardrail let every question through.</p>
+
+  <p class="file"><b>src/services/agents/state.py</b> &middot; new fields</p>
+  <pre><code>    relevant_documents: List[Document]
+    removed_citations: List[str]
+    answer_grounded: Optional[bool]</code></pre>
+
+  <p class="file"><b>src/services/agents/agentic_rag.py</b> &middot; what <code>ask()</code> returns</p>
+  <pre><code>                "chunks_used": len(result.get("relevant_documents", [])),
+                "removed_citations": result.get("removed_citations", []),
+                "answer_grounded": result.get("answer_grounded"),
+                "rewritten_query": result.get("rewritten_query"),
+...
+    def _extract_sources(self, result: dict) -&gt; List[str]:
+        """Extract the PDF URLs of the papers that passed grading."""
+        return [source.url for source in result.get("relevant_sources", [])]</code></pre>
+  <p>
+    <code>sources</code> are now URLs of papers that passed grading (the response schema always said "PDF URLs"; the old code returned dicts, usually
+    none). <code>chunks_used</code> is the real number of chunks the answer was built from. <code>_extract_reasoning_steps</code> also gained steps
+    such as <code>"Graded 2 chunks individually (1 relevant)"</code>, <code>"Removed N citation(s) to papers that were not retrieved"</code>,
+    <code>"Verified answer is supported by the sources"</code> and <code>"Withheld answer: it could not be verified against the sources"</code>.
+  </p>
+
+  <p class="file"><b>src/schemas/api/ask.py</b> &middot; new fields on <code>AgenticAskResponse</code></p>
+  <pre><code>    rewritten_query: Optional[str] = Field(None, description="Query the agent retrieved with after rewriting, if any")
+    answer_grounded: Optional[bool] = Field(
+        None, description="Whether the answer passed the groundedness check (null if no answer was generated)"
+    )</code></pre>
+  <p>It inherits <code>removed_citations</code> from <code>AskResponse</code>.</p>
+
+  <p class="file"><b>src/routers/agentic_ask.py</b> &middot; the <code>model</code> passthrough and real values</p>
+  <pre><code>        result = await agentic_rag.ask(
+            query=request.query,
+            model=request.model,
+        )
+
+        return AgenticAskResponse(
+            ...
+            chunks_used=result.get("chunks_used", 0),
+            ...
+            removed_citations=result.get("removed_citations", []),
+            ...
+            rewritten_query=result.get("rewritten_query"),
+            answer_grounded=result.get("answer_grounded"),
+            trace_id=result.get("trace_id"),
+        )</code></pre>
+  <p>
+    <code>ask()</code> always accepted a <code>model</code> override; the router just never passed <code>request.model</code>, so asking for llama3.2:3b
+    silently used the default. Similarly the factory gained an optional <code>model</code> argument (only passed to <code>GraphConfig</code> when
+    set), and <code>get_agentic_rag_service</code> in <code>src/dependencies.py</code> passes <code>model=settings.ollama_model</code>.
+  </p>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li><code>GroundednessCheck</code> in <code>models.py</code>; <code>GROUNDEDNESS_PROMPT</code> in <code>prompts.py</code>.</li>
+    <li><code>src/services/agents/nodes/verify_answer_node.py</code> with <code>UNVERIFIED_ANSWER</code> and
+      <code>async def ainvoke_verify_answer_step(state: AgentState, runtime: Runtime[Context]) -&gt; Dict[str, object]</code>, behaving in this order:
+      no documents &rarr; <code>{"answer_grounded": None, "removed_citations": []}</code>; strip unverified IDs; unknown authors &rarr; withhold without
+      LLM; otherwise LLM check; exception &rarr; withhold; withheld answers are <code>UNVERIFIED_ANSWER</code> + one <code>"- title (url)"</code> line per source.</li>
+    <li>Export it, wire <code>generate_answer &rarr; verify_answer &rarr; END</code>, add the state fields and initial-state values.</li>
+    <li>Guardrail: missing result &rarr; <code>"out_of_scope"</code>.</li>
+    <li><code>ask()</code> result keys, <code>_extract_sources</code> as URLs, the new reasoning steps (match the strings in the test below exactly).</li>
+    <li>Schema fields, router passthrough, factory <code>model</code> argument, dependency passes <code>settings.ollama_model</code>.</li>
+  </ol>
+  <details class="hint"><summary>Hint: the reasoning steps</summary>
+    <p>Use <code>f"Graded {len(grading_results)} chunks individually ({relevant_count} relevant)"</code>; add <code>"Generated answer from relevant chunks only"</code>
+      only if <code>relevant_documents</code> is non-empty; then the removed-citations step if any; then one of the two verification steps depending on
+      <code>answer_grounded is True</code> / <code>is False</code> (nothing for <code>None</code>).</p></details>
+
+  <h4>Type the tests</h4>
+  <p>Add to the imports of <code>test_nodes.py</code>:</p>
+  <pre><code>from langchain_core.messages import AIMessage, HumanMessage
+from src.services.agents.models import GroundednessCheck
+from src.services.agents.nodes import ainvoke_verify_answer_step, continue_after_guardrail
+from src.services.agents.nodes.verify_answer_node import UNVERIFIED_ANSWER</code></pre>
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> (append inside your <code>TestGuardrailNode</code> class)</p>
+  <pre><code>    def test_continue_after_guardrail_missing_result_rejects(self, test_context):
+        """A missing guardrail result must fail closed."""
+        state: AgentState = {"messages": [], "retrieval_attempts": 0, "guardrail_result": None}
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+
+        assert continue_after_guardrail(state, runtime) == "out_of_scope"</code></pre>
+  <p class="file"><b>tests/unit/services/agents/test_nodes.py</b> (new class)</p>
+  <pre><code>class TestVerifyAnswerNode:
+    """Tests for the answer verification node."""
+
+    @staticmethod
+    def _state(draft: str, documents) -&gt; AgentState:
+        return {
+            "messages": [HumanMessage(content="What are transformers?"), AIMessage(content=draft)],
+            "relevant_documents": documents,
+            "relevant_sources": to_source_items(documents),
+        }
+
+    @staticmethod
+    def _runtime(test_context):
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+        return runtime
+
+    @pytest.mark.asyncio
+    async def test_grounded_answer_is_kept_and_fake_citations_removed(
+        self, test_context, llm_returns, sample_documents
+    ):
+        llm_returns(GroundednessCheck(binary_score="yes", reasoning="Supported"))
+        draft = "Transformers use self-attention [arXiv:1706.03762] [arXiv:2304.06476]."
+
+        result = await ainvoke_verify_answer_step(self._state(draft, sample_documents), self._runtime(test_context))
+
+        assert result["answer_grounded"] is True
+        assert result["removed_citations"] == ["2304.06476"]
+        assert result["messages"][0].content == "Transformers use self-attention [arXiv:1706.03762]."
+
+    @pytest.mark.asyncio
+    async def test_ungrounded_answer_is_withheld(self, test_context, llm_returns, sample_documents):
+        llm_returns(GroundednessCheck(binary_score="no", reasoning="Claims a 99% accuracy not in sources"))
+
+        result = await ainvoke_verify_answer_step(
+            self._state("Transformers reach 99% accuracy.", sample_documents), self._runtime(test_context)
+        )
+
+        answer = result["messages"][0].content
+        assert result["answer_grounded"] is False
+        assert answer.startswith(UNVERIFIED_ANSWER)
+        assert "99%" not in answer
+        assert "https://arxiv.org/pdf/1706.03762.pdf" in answer
+
+    @pytest.mark.asyncio
+    async def test_unknown_author_citation_withholds_answer_without_llm(
+        self, test_context, llm_returns, sample_documents
+    ):
+        invoke = llm_returns()
+        draft = "Vaswani et al. introduced transformers, later extended by Rasmussen et al. (2025)."
+
+        result = await ainvoke_verify_answer_step(self._state(draft, sample_documents), self._runtime(test_context))
+
+        assert result["answer_grounded"] is False
+        assert result["messages"][0].content.startswith(UNVERIFIED_ANSWER)
+        invoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_check_withholds_answer(self, test_context, llm_returns, sample_documents):
+        llm_returns(RuntimeError("model unavailable"))
+
+        result = await ainvoke_verify_answer_step(
+            self._state("Transformers use self-attention.", sample_documents), self._runtime(test_context)
+        )
+
+        assert result["answer_grounded"] is False
+        assert result["messages"][0].content.startswith(UNVERIFIED_ANSWER)
+
+    @pytest.mark.asyncio
+    async def test_no_documents_leaves_refusal_untouched(self, test_context, llm_returns):
+        invoke = llm_returns()
+
+        result = await ainvoke_verify_answer_step(self._state(NO_CONTEXT_ANSWER, []), self._runtime(test_context))
+
+        assert "messages" not in result
+        assert result["answer_grounded"] is None
+        invoke.assert_not_called()</code></pre>
+  <p>In <code>tests/unit/services/agents/test_agentic_rag.py</code>, add one line to your Module 7 mermaid test,
+    <code>assert "generate_answer --&gt; verify_answer" in mermaid</code>, and add this class (it uses the <code>test_service</code> fixture from Module 7;
+    add <code>GuardrailScoring</code>, <code>AsyncMock</code>, <code>AIMessage</code>, <code>HumanMessage</code> to the imports if missing):</p>
+  <p class="file"><b>tests/unit/services/agents/test_agentic_rag.py</b></p>
+  <pre><code>class TestAgenticRAGResult:
+    """Tests for the result returned by ask()."""
+
+    @pytest.mark.asyncio
+    async def test_result_reports_sources_and_verification(self, test_service, sample_documents):
+        from src.services.agents.models import GradingResult
+        from src.services.agents.nodes.utils import to_source_items
+
+        test_service.graph.ainvoke = AsyncMock(
+            return_value={
+                "messages": [HumanMessage(content="What are transformers?"), AIMessage(content="Verified answer")],
+                "retrieval_attempts": 1,
+                "guardrail_result": GuardrailScoring(score=90, reason="Research question"),
+                "grading_results": [
+                    GradingResult(document_id="1706.03762", is_relevant=True),
+                    GradingResult(document_id="1810.04805", is_relevant=False),
+                ],
+                "relevant_documents": sample_documents[:1],
+                "relevant_sources": to_source_items(sample_documents[:1]),
+                "removed_citations": ["2304.06476"],
+                "answer_grounded": True,
+            }
+        )
+
+        result = await test_service.ask(query="What are transformers?")
+
+        assert result["answer"] == "Verified answer"
+        assert result["sources"] == ["https://arxiv.org/pdf/1706.03762.pdf"]
+        assert result["chunks_used"] == 1
+        assert result["removed_citations"] == ["2304.06476"]
+        assert result["answer_grounded"] is True
+        assert "Graded 2 chunks individually (1 relevant)" in result["reasoning_steps"]
+        assert "Verified answer is supported by the sources" in result["reasoning_steps"]</code></pre>
+  <p>
+    Replacing <code>test_service.graph.ainvoke</code> with an <code>AsyncMock</code> skips the graph entirely and returns a hand-written final state.
+    That isolates the question "does <code>ask()</code> turn a final state into the right result?" from the nodes, which you tested separately.
+  </p>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/services/agents -q -k "VerifyAnswer or missing_result or AgenticRAGResult or mermaid"
+uv run pytest tests/unit/services/agents -q</code></pre>
+  <p>
+    The first command should show <code>8 passed</code> (5 verify tests, the guardrail test, the result test, and your mermaid test). The second must
+    be all green. Then rebuild and ask the agent a question (expect about 6 minutes on CPU, since it now makes one more LLM call):
+  </p>
+  <pre><code>docker compose up -d --build api
+'{"query": "What techniques reduce hallucination in language models?", "model": "llama3.2:1b"}' | Out-File -Encoding ascii body.json
+curl.exe -s -m 900 -X POST http://localhost:18000/api/v1/ask-agentic -H "Content-Type: application/json" --data-binary "@body.json"</code></pre>
+  <p>
+    The response must contain <code>removed_citations</code>, <code>answer_grounded</code> (<code>true</code>, <code>false</code>, or <code>null</code>) and
+    <code>rewritten_query</code>; <code>sources</code> must be PDF URLs; <code>chunks_used</code> must be at most <code>top_k</code> and match the graded-relevant
+    count in <code>reasoning_steps</code>. With the 1B model, <code>answer_grounded: false</code> and the "I won't guess" refusal is a common and correct outcome.
+  </p>
+  <pre><code>git add -A
+git commit -m "Module 8 day 3: verify_answer node, fail-closed guardrail, honest API fields"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m8-day3" /><span>Day 3 checkpoint passed and committed</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Swap the order: run the LLM check first and the author check only if the LLM says yes. All tests still pass, because the mock "LLM" does what
+      you tell it. Now reread the story callout: the real judge said yes to invented authors. Tests with mocks prove your logic, not the model's
+      judgement; that's why order matters in the design, and why Day 4 measures the real thing.</li>
+    <li>Delete the <code>verify_answer &rarr; END</code> edge. Nothing complains: <code>compile()</code> succeeds and a run simply stops after
+      <code>verify_answer</code>, because LangGraph ends a run when no edge leads anywhere. Now instead change <code>generate_answer &rarr; verify_answer</code>
+      back to <code>generate_answer &rarr; END</code>. Your node tests still pass, but the mermaid assertion fails and live answers come back with
+      <code>answer_grounded: null</code>. Wiring mistakes are silent, which is why the graph-level test exists.</li>
+    <li>Revert the router to <code>agentic_rag.ask(query=request.query)</code> and send <code>"model": "llama3.2:3b"</code>. Check the API logs
+      (<code>docker compose logs api</code>): the "Model:" line shows the default. Silent parameter drops are hard to spot without logs.</li>
+    <li>In the guardrail, return <code>"continue"</code> again for a missing result. <code>test_continue_after_guardrail_missing_result_rejects</code> fails.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DAY 4                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="day4"><span class="day">Day 4</span>Measuring hallucination, and the price of safety</h2>
+
+  <h3>1. Why this matters</h3>
+  <p>
+    Every safeguard you added makes the system refuse more. A system that refuses everything never hallucinates and is useless. The only way to
+    know where you are on that trade-off is to run the same questions through both endpoints and count. In an interview, "I measured it, and here is
+    what I found, including what got worse" is far stronger than "I added guardrails".
+  </p>
+
+  <h3>2. Concepts</h3>
+  <h4>What an evaluation needs</h4>
+  <ul>
+    <li><b>A fixed question set</b> that includes questions the system <i>should</i> answer (in scope) and questions it <i>should refuse</i> (out of scope).</li>
+    <li><b>Metrics you can compute automatically</b>: answered versus refused, fabricated citations removed, latency.</li>
+    <li><b>Honest limits</b>: five questions and string matching for refusals are a smoke test, not a benchmark. Proper evaluation would add labelled
+      answers, human review of a sample, and many more questions. Say that out loud before someone else does.</li>
+  </ul>
+  <h4>Precision versus coverage</h4>
+  <p>
+    Think of two numbers: how often the answers you <i>do</i> give are trustworthy, and how often you give an answer at all. Hardening raises the first and
+    lowers the second. A bigger model (llama3.2:3b) follows instructions better, so more of its drafts survive verification, at the cost of slower CPU
+    inference and more RAM.
+  </p>
+
+  <h3>3. Walkthrough: real code</h3>
+  <p class="file"><b>scripts/eval_hallucination.py</b> &middot; new file</p>
+  <table class="walk">
+    <tr><td><pre><code>QUESTIONS = [
+    ("in_scope", "What are recent advances in retrieval-augmented generation?"),
+    ("in_scope", "How do large language model agents manage long-term memory?"),
+    ("in_scope", "What techniques reduce hallucination in language models?"),
+    ("out_of_scope", "What is the capital of France?"),
+    ("out_of_scope", "How do I bake sourdough bread?"),
+]</code></pre></td>
+      <td>Three questions the papers can answer, two they can't. Each tuple carries its expected kind.</td></tr>
+    <tr><td><pre><code>ENDPOINTS = {"plain": "/api/v1/ask", "agentic": "/api/v1/ask-agentic"}</code></pre></td>
+      <td>The same questions go to both, so the comparison is fair.</td></tr>
+    <tr><td><pre><code>REFUSAL_MARKERS = (
+    "I can only help with questions about academic research papers",
+    "so I won't guess",
+    "couldn't find relevant research papers",
+    "couldn't find passages",
+    ...
+)
+
+def is_refusal(answer: str) -&gt; bool:
+    return any(marker in answer for marker in REFUSAL_MARKERS)</code></pre></td>
+      <td>Refusals are detected by phrases from the fixed refusal messages (out-of-scope, <code>NO_CONTEXT_ANSWER</code>, <code>UNVERIFIED_ANSWER</code>, the
+        retrieve fallback). This is why those messages are constants: change their wording and the metric silently breaks. The last two markers in the reference
+        belong to the separate on-demand-ingestion feature; you can leave them out.</td></tr>
+    <tr><td><pre><code>    with httpx.Client(base_url=base_url, timeout=timeout) as client:
+        for name in endpoints:
+            for kind, question in QUESTIONS:
+                start = time.time()
+                response = client.post(ENDPOINTS[name], json={"query": question})
+                response.raise_for_status()
+                data = response.json()</code></pre></td>
+      <td>A synchronous client is fine for a script that runs one request at a time. The default timeout is 900 s because CPU inference is slow; remember
+        the Gradio 60-second timeout incident.</td></tr>
+    <tr><td><pre><code>                result = {
+                    "endpoint": name, "kind": kind, "question": question,
+                    "refused": is_refusal(data["answer"]),
+                    "removed_citations": data.get("removed_citations", []),
+                    "answer_grounded": data.get("answer_grounded"),
+                    "sources": len(data.get("sources", [])),
+                    "seconds": round(time.time() - start, 1),
+                    "answer": data["answer"],
+                }</code></pre></td>
+      <td>One row per question and endpoint. <code>.get</code> with defaults because <code>/ask</code> has no <code>answer_grounded</code>.</td></tr>
+    <tr><td><pre><code>        print(
+            f"  {name:7}  in-scope answered {sum(not r['refused'] for r in in_scope)}/{len(in_scope)}"
+            f" | out-of-scope refused {sum(r['refused'] for r in out_scope)}/{len(out_scope)}"
+            f" | fabricated citations removed {sum(len(r['removed_citations']) for r in rows)}"
+            f" | avg {sum(r['seconds'] for r in rows) / len(rows):.0f}s"
+        )</code></pre></td>
+      <td>The summary line per endpoint: coverage on in-scope questions, correct refusals on out-of-scope ones, citations caught, and average latency.
+        <code>sum</code> over booleans counts the <code>True</code>s.</td></tr>
+    <tr><td><pre><code>    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--endpoints", nargs="+", choices=list(ENDPOINTS), default=list(ENDPOINTS))
+    parser.add_argument("--timeout", type=float, default=900.0, ...)
+    parser.add_argument("--out", help="Optional path to write the full results as JSON")</code></pre></td>
+      <td><code>argparse</code> turns command-line flags into <code>args.base_url</code> etc. Your stack is on port 18000, so you'll pass <code>--base-url</code>.</td></tr>
+  </table>
+
+  <h3>4. Build</h3>
+  <ol>
+    <li>Write <code>scripts/eval_hallucination.py</code> with the same structure: <code>QUESTIONS</code>, <code>ENDPOINTS</code>, <code>REFUSAL_MARKERS</code>,
+      <code>is_refusal</code>, <code>run(base_url, endpoints, timeout) -&gt; list[dict]</code>, <code>summarize(results)</code>, and <code>main()</code> with the four flags.</li>
+    <li>Add a unit test so the refusal detector stays in sync with your refusal constants.</li>
+  </ol>
+  <p class="file"><b>tests/unit/scripts/test_eval_hallucination.py</b> (learner-only; the reference has no test for the script)</p>
+  <pre><code>from scripts.eval_hallucination import is_refusal
+from src.services.agents.nodes.generate_answer_node import NO_CONTEXT_ANSWER
+from src.services.agents.nodes.verify_answer_node import UNVERIFIED_ANSWER
+
+
+def test_refusal_constants_are_detected():
+    assert is_refusal(NO_CONTEXT_ANSWER)
+    assert is_refusal(UNVERIFIED_ANSWER + "\n- Some paper (https://arxiv.org/pdf/1706.03762.pdf)")
+
+
+def test_real_answer_is_not_a_refusal():
+    assert not is_refusal("Transformers use self-attention [arXiv:1706.03762].")</code></pre>
+  <details class="hint"><summary>Hint: importing from <code>scripts</code></summary>
+    <p>Create an empty <code>scripts/__init__.py</code> (and <code>tests/unit/scripts/__init__.py</code> if your other test folders have one). Because
+      <code>pythonpath = ["."]</code> is set in <code>pyproject.toml</code>, <code>scripts</code> is then importable from tests. Keep the HTTP code inside
+      functions so importing the module does not send requests.</p></details>
+
+  <h3>5. Checkpoint</h3>
+  <pre><code>uv run pytest tests/unit/scripts -q
+uv run python scripts/eval_hallucination.py --base-url http://localhost:18000 --out eval-1b.json</code></pre>
+  <p>
+    The tests should show <code>2 passed</code>. The evaluation makes ten requests; on CPU expect roughly 30&ndash;60 minutes (plain answers take 2&ndash;4 minutes,
+    agentic ones about 6; out-of-scope agentic questions are fast because the guardrail stops them early). You'll see one line per question, then a summary with
+    one line per endpoint in the form <code>plain  in-scope answered X/3 | out-of-scope refused Y/2 | fabricated citations removed Z | avg Ns</code>.
+    The exact numbers depend on your index and the model's mood. What to expect with llama3.2:1b: plain <code>/ask</code> answers most in-scope questions but
+    does not refuse out-of-scope ones (it has no guardrail), while the agent refuses the out-of-scope questions and also refuses many in-scope ones.
+  </p>
+  <p>Now try the bigger model, if you have the RAM and time:</p>
+  <pre><code>docker exec curator-ollama ollama pull llama3.2:3b</code></pre>
+  <p>
+    The script sends only <code>query</code>, so the model comes from the defaults. Either temporarily change the <code>json=</code> body in <code>run</code> to include
+    <code>"model": "llama3.2:3b"</code>, or set <code>OLLAMA_MODEL=llama3.2:3b</code> in your <code>.env</code> and restart the API. Run with
+    <code>--endpoints agentic --out eval-3b.json</code> and compare the summaries. Write the two summary lines into your notes: they become an interview story.
+  </p>
+  <div class="callout story"><b>The trade-off, as observed this week</b>
+    With llama3.2:1b the hardened agent often refused: the per-chunk grader rejected chunks, or the verifier withheld the draft. That is the intended
+    behaviour when the model can't produce a verifiable answer, but it's also a usability cost. The honest summary: "the agent now refuses rather than
+    invents; to get more answers back, use a larger model, which is slower on CPU."</div>
+  <pre><code>git add -A
+git commit -m "Module 8 day 4: hallucination evaluation script"</code></pre>
+  <ul class="checklist"><li><input type="checkbox" data-id="m8-day4" /><span>Day 4 checkpoint passed and committed, and both eval summaries saved in your notes</span></li></ul>
+
+  <h3>6. Break it</h3>
+  <ol>
+    <li>Change one word in <code>UNVERIFIED_ANSWER</code> (for example "won't" to "will not"). <code>test_refusal_constants_are_detected</code> fails: without
+      that test, the eval would now count every refusal as an answer, and your metric would lie.</li>
+    <li>Run the eval with <code>--timeout 60</code>. You get <code>httpx.ReadTimeout</code> on the first agentic question: the same failure as the old
+      Gradio client, now in your own tool.</li>
+    <li>Set the answer prompt back to the original "Cite specific papers when making claims (use paper titles or arxiv IDs)" and rerun the agentic eval.
+      Count how often <code>answer_grounded</code> is false because of author citations (check the API logs for "cites authors not in the retrieved papers").
+      Prompt wording and deterministic checks work as a pair.</li>
+  </ol>
+
+  <!-- ================================================================== -->
+  <!-- DRILL                                                              -->
+  <!-- ================================================================== -->
+  <h2 id="drill">Interview drill</h2>
+  <p>
+    Answer each question out loud or in writing <b>before</b> opening the model answer. Then message me
+    "Drill me on Module 8" and I'll ask them in a different order, with follow-ups.
+  </p>
+
+  <details class="drill"><summary>1. If RAG puts real documents in the prompt, why does it still hallucinate?</summary>
+    <div class="answer">Retrieval gives the model the right material but doesn't force it to use only that material. The model also has everything it learned in
+      training, and small models especially fill gaps with plausible-sounding recall. In this project, plain <code>/ask</code> retrieved two papers and cited two
+      different, unretrieved IDs.</div></details>
+
+  <details class="drill"><summary>2. Walk me through every safeguard a question passes in your hardened agent.</summary>
+    <div class="answer">Guardrail (fails closed if it has no result) &rarr; retrieval &rarr; each chunk graded separately, failures excluded &rarr; generation from
+      relevant chunks only, or a fixed refusal with no LLM call if none &rarr; verify: strip unretrieved arXiv IDs, reject unknown "et al." authors, then an LLM
+      groundedness check, and withhold the answer (listing the source URLs) if any check fails.</div></details>
+
+  <details class="drill"><summary>3. Why run deterministic checks before an LLM judge?</summary>
+    <div class="answer">They're instant, free, repeatable, and can't be persuaded. An LLM judge is slow, costs a call, and can be wrong: this week it passed an
+      answer citing invented authors. So code handles what code can verify exactly (IDs, author names), and the judge handles meaning. If a cheap check fails, you
+      skip the expensive one entirely.</div></details>
+
+  <details class="drill"><summary>4. What does "fail closed" mean? Give three places you applied it.</summary>
+    <div class="answer">When a safety check itself errors, choose the safe outcome. A chunk whose grading throws is excluded (the original admitted it if it had more than
+      50 characters); a failed groundedness check withholds the answer; a missing guardrail result routes to out_of_scope (the original continued).</div></details>
+
+  <details class="drill"><summary>5. What is <code>response_format="content_and_artifact"</code> and why did you need it?</summary>
+    <div class="answer">The tool returns a tuple: text for the LLM and a Python object for the code. <code>ToolNode</code> stores them as <code>ToolMessage.content</code>
+      and <code>.artifact</code>. Without it, documents were flattened to a string, so the grader couldn't grade per chunk and the service couldn't list sources.
+      Caveat: the artifact only appears when the tool is invoked with a full tool call, which is why the tests invoke it that way.</div></details>
+
+  <details class="drill"><summary>6. Why grade chunks individually instead of all at once?</summary>
+    <div class="answer">With one verdict for the whole context, a single relevant chunk admits the irrelevant ones, and they all reach the answer prompt as material
+      to misuse. Per-chunk grading gives a verdict per paper, lets you generate from survivors only, gives a real <code>chunks_used</code>, and gives a sources list.
+      Cost: one LLM call per chunk instead of one in total.</div></details>
+
+  <details class="drill"><summary>7. You grade with <code>asyncio.gather</code>. What happens if one grading call raises?</summary>
+    <div class="answer">By default <code>gather</code> propagates the first exception and the node would crash. Here each call is wrapped in
+      <code>_grade_document</code>, which catches the exception and returns a "not relevant" result, so the others still count. Results come back in argument order,
+      which is what makes <code>zip(documents, results)</code> correct.</div></details>
+
+  <details class="drill"><summary>8. How does <code>strip_unverified_citations</code> work, and what are its limits?</summary>
+    <div class="answer">A regex finds arXiv IDs (optional prefix and version); any ID not in the version-less set of retrieved IDs is deleted and recorded, then empty
+      brackets and stray separators are tidied. Limits: it only understands arXiv-ID citations, it may match look-alike numbers, and it checks that a cited paper was
+      retrieved, not that the paper says what the sentence claims. That last part is the groundedness check's job.</div></details>
+
+  <details class="drill"><summary>9. Why does the author check withhold the whole answer instead of deleting the bad citation?</summary>
+    <div class="answer">An arXiv ID in brackets can be removed and the sentence still reads. "Rasmussen et al. showed X" is a claim built around a fake source;
+      deleting the name leaves a claim with no support. Withholding and listing the real papers is safer than editing prose you can't trust.</div></details>
+
+  <details class="drill"><summary>10. How do you handle citation checking in a streaming endpoint?</summary>
+    <div class="answer">You can't check a citation until the answer is complete, and the pieces have already been sent. So the final <code>done</code> event carries the
+      cleaned answer and <code>removed_citations</code>, the client should replace its text with it, and only the cleaned version is cached. Alternatives: buffer
+      the whole answer (loses streaming) or buffer sentence by sentence (complex). It's a real trade-off.</div></details>
+
+  <details class="drill"><summary>11. How do you unit-test LangGraph nodes that call an LLM?</summary>
+    <div class="answer">Mock the Ollama client. The <code>llm_returns</code> fixture sets an <code>AsyncMock</code> with a list of <code>side_effect</code> responses on both
+      <code>llm.ainvoke</code> and <code>llm.with_structured_output(...).ainvoke</code>; exceptions in the list are raised. Tests can then assert on routing, on
+      the exact prompt (<code>invoke.call_args</code>), and that no LLM call happened (<code>assert_not_called</code>). This tests my logic, not the model's judgement.</div></details>
+
+  <details class="drill"><summary>12. What did you measure, and what got worse?</summary>
+    <div class="answer">An eval script sends three in-scope and two out-of-scope questions to both endpoints and reports in-scope answered, out-of-scope refused,
+      fabricated citations removed, and average latency. The agent refuses out-of-scope questions and removes fake citations, but with llama3.2:1b it also refuses
+      many in-scope questions, and each answer takes one more LLM call. A 3B model answers more but is slower on CPU. Five questions is a smoke test, not a benchmark.</div></details>
+
+  <details class="drill"><summary>13. Name two bugs you fixed that weren't hallucinations.</summary>
+    <div class="answer">The agentic router ignored the requested <code>model</code> (it never passed <code>request.model</code> to <code>ask()</code>), and it reported
+      <code>chunks_used = top_k</code> and never returned <code>rewritten_query</code>. The response now reports real values and PDF URLs as sources.</div></details>
+
+  <ul class="checklist"><li><input type="checkbox" data-id="m8-drill" /><span>Drill passed with me in chat</span></li></ul>
+
+  <!-- ================================================================== -->
+  <h2 id="done">Before you start Module 9</h2>
+  <ul class="checklist">
+    <li><input type="checkbox" data-id="m8-tests" /><span><code>uv run pytest tests/unit -q</code> is all green, including <code>test_citations.py</code>, the agent tests, and the eval-script tests</span></li>
+    <li><input type="checkbox" data-id="m8-live" /><span>A live <code>/ask-agentic</code> response shows <code>answer_grounded</code>, <code>removed_citations</code>, URL <code>sources</code> and a real <code>chunks_used</code></span></li>
+    <li><input type="checkbox" data-id="m8-eval" /><span>You have at least one saved eval summary and can explain every number in it</span></li>
+    <li><input type="checkbox" data-id="m8-break" /><span>You can explain every "Break it" result without looking it up</span></li>
+  </ul>
+  <p>
+    Then send me "Module 8 passed". Module 9 turns everything into interview readiness: test strategy, CI, system design questions, and your debugging
+    stories, with this module's fabricated-citation incident as a headline example.
+  </p>
+  <p><a href="module-09-testing-interview.html">Next: Module 9, Testing and interview prep &rarr;</a></p>
+
+  <footer><a href="index.html">&larr; Back to the roadmap</a></footer>
+</div>
+<script src="assets/guide.js"></script>
+</body>
+</html>
